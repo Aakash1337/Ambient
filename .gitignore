@@ -1,0 +1,11 @@
+# Environment
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Session recordings: transcripts of real private conversations (interviews,
+# calls). They stay local by default -- delete these two lines if you decide
+# you want history backed up to the private repo.
+logs/
+*.jsonl

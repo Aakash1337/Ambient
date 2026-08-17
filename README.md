@@ -4,6 +4,18 @@ Ambient Q&A is a passive Windows side pane that listens to the microphone and sy
 transcribes speech locally, identifies real questions, and answers only those questions. It never
 prompts or interrupts you.
 
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| This README | Usage, tuning, configuration reference, troubleshooting |
+| [SPEC.md](SPEC.md) | The implementation spec — verified environment facts and stage-by-stage requirements |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Deep dive: every module, the concurrency model, and *why* each design decision was forced — with all measured facts consolidated in one table (§15) |
+| [docs/REBUILD-GUIDE.md](docs/REBUILD-GUIDE.md) | Staged guide to building the whole system from scratch, the traps at each stage, a porting checklist for a new machine, and standalone learning exercises |
+
+Moving development to a new machine? Follow the porting checklist at the end of
+[docs/REBUILD-GUIDE.md](docs/REBUILD-GUIDE.md).
+
 ## Quickstart
 
 Requirements: Windows 11, Python 3.11 through the Python launcher, Ollama with `gemma4:e2b`,
@@ -290,7 +302,25 @@ workflow outside the TUI:
 ```
 
 Every completed utterance is appended to `logs/session-<timestamp>.jsonl` with its channel,
-transcript, gate decision, reason, answer, and measured stage latencies.
+transcript, gate decision, reason, answer, and measured stage latencies. Records are written
+live, one line per utterance as it completes — nothing is buffered until session end, so the
+log survives a crash and can be tailed from another terminal while a session runs.
+
+## Session replay
+
+Render any session log into a self-contained HTML page styled like the live pane — dim
+timestamped transcript lines, orange Q&A cards, per-answer timing, and badges for forced
+answers, web lookups, and errors:
+
+```powershell
+python scripts\render_session.py
+```
+
+With no argument it renders the newest session; pass a `logs\session-*.jsonl` path for a
+specific one, and `-o` to choose the output location (default: the `.html` next to the
+`.jsonl`). Run it from the project root — the no-argument form looks for `logs\` relative to
+the working directory. The replay also shows what the live pane never had room for: every
+rejection reason, which is where gate-tuning signal comes from.
 
 ## Configuration reference
 
