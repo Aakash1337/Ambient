@@ -1,0 +1,11 @@
+pyaudiowpatch
+soxr
+numpy
+silero-vad
+onnxruntime
+faster-whisper
+textual
+tomli
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+pytest

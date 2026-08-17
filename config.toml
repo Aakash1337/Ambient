@@ -1,0 +1,123 @@
+# Ambient Q&A default configuration.
+# Device names are case-insensitive substrings; leave blank to use Windows defaults.
+[audio]
+mic_device = "USB Advanced Audio Device"
+# Leave BLANK (recommended). Blank opens every loopback endpoint at once and
+# follows whichever one is actually carrying speech, so it does not matter
+# whether today's call plays through the headset, the monitor or the speakers.
+# Naming one endpoint pins it: if the call plays anywhere else the loopback opens
+# perfectly happily on silence and the other speaker is never heard at all.
+output_device = ""
+# The VAD and Whisper pipeline requires 16 kHz mono audio.
+sample_rate = 16000
+# Capture frames must remain in the 20–30 ms range.
+frame_ms = 25
+queue_size = 256
+# Utterance segmentation settings. Raising silence_ms further reduces splitting
+# during thinking pauses, at the cost of delaying answers.
+silence_ms = 900
+pre_roll_ms = 300
+min_utterance_ms = 400
+max_utterance_s = 20.0
+# Flag a capture source in the status bar once it has been open but inaudible
+# this long. This is the tripwire for a loopback pointed at the wrong endpoint.
+silent_source_warn_s = 45.0
+
+[stt]
+model = "large-v3-turbo"
+device = "cuda"
+compute_type = "float16"
+cpu_compute_type = "int8"
+queue_size = 12
+# Empty means automatic language detection.
+language = ""
+# Exact normalized phrases to discard as common silence hallucinations.
+hallucination_blocklist = [
+  "Thank you.",
+  "Thanks for watching!",
+  "Please subscribe",
+  "Subtitles by",
+  "Captioning by",
+]
+
+[context]
+# Standing domain context is optional. Set enabled = false to ignore it globally.
+enabled = true
+# Empty disables profiles. Relative paths are resolved from this config file.
+profile = "profiles/genai-engineer-interview.md"
+
+[gate]
+model = "gemma4:e2b"
+ollama_url = "http://127.0.0.1:11434/api/chat"
+# strict, balanced, or eager
+mode = "balanced"
+# How freely the gate may treat each channel. "sys" is the other side of the
+# call; "mic" is you. Both are always transcribed and always feed context.
+#   "full"     = heuristics + semantic gate; it may rewrite indirect requests.
+#   "explicit" = only speech actually shaped like a question (a well-formed
+#                interrogative, or anything ending in "?"). Statements never
+#                reach the semantic gate, so narration cannot be rewritten into
+#                a question -- but a real question you ask aloud is answered
+#                instantly, with no LLM call at all.
+#   "off"      = context only, never answered.
+# Set mic = "full" to answer your narration too (this floods the pane), or
+# mic = "off" to never answer yourself. Press `a` to force-answer regardless.
+channel_policy = { mic = "explicit", sys = "full" }
+# Utterances judged at once. Gating is a ~900ms call; running it inline made
+# every later utterance wait behind it, so a follow-up question could not start
+# answering until the previous one had been judged.
+max_concurrent = 3
+min_words = 3
+context_turns = 6
+dedupe_window_s = 300.0
+dedupe_ratio = 0.85
+echo_window_s = 2.0
+echo_ratio = 0.85
+# Reading a recent answer back aloud (rehearsing it) is not a new question.
+# Ratio = fraction of the utterance's content words that came from a recent
+# answer. Set answer_echo_ratio = 0 to disable.
+answer_echo_window_s = 300.0
+answer_echo_ratio = 0.5
+queue_size = 24
+request_timeout_s = 8.0
+
+[merge]
+# Hold probable mid-sentence fragments and gate only the coalesced thought.
+enabled = true
+# Maximum audio-time gap between same-channel fragments.
+merge_gap_s = 4.5
+# How long an open thought waits for another fragment.
+merge_window_s = 9.0
+# Safety caps prevent indefinite merging during long or noisy speech.
+max_merge_parts = 5
+max_merge_s = 25.0
+
+[answer]
+answer_model = "claude-sonnet-5"
+# Stream output from each fresh one-shot Claude process as it is generated.
+# Set false to restore the buffered stdout path.
+stream = true
+# "cue"       = a sayable opening line plus keyword prompts. Built to be read in
+#               one glance while you are already speaking.
+# "interview" = a spoken answer you could say aloud in a technical interview.
+# "terse"     = one or two compressed sentences.
+style = "cue"
+max_words = 45
+# Questions answered simultaneously; each is its own `claude -p` process.
+max_concurrent = 4
+# "off" | "auto" | "always" -- look facts up instead of recalling them.
+# A lookup costs ~17s against ~3.5s from memory, so "always" is unusable live.
+# "auto" searches only questions whose answer has moved since training (names,
+# versions, pricing, availability): 0.5% of all recorded questions. On those the
+# model is not unsure, it is confidently wrong -- asked what Vertex AI is called
+# now it said it had not been renamed, when it is now the Gemini Enterprise
+# Agent Platform. Merely permitting the tool was not enough; it must be told.
+web_lookup = "auto"
+answer_timeout_s = 45.0
+context_turns = 6
+queue_size = 16
+
+[ui]
+show_transcripts = true
+log_dir = "logs"
+status_interval_s = 0.5
