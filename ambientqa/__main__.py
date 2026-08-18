@@ -28,6 +28,7 @@ from .config_write import set_audio_device, set_context_profile
 from .continuity import ContinuityMerger
 from .context import TranscriptContext, token_set_ratio
 from .gate import QuestionGate
+from .instances import InstanceRegistry
 from .logging_ import SessionLogger
 from .profile import Profile, load_profile
 from .segmenter import UtteranceSegmenter, segment_worker
@@ -118,6 +119,7 @@ class AmbientController:
             delta_callback=self._answer_delta,
         )
         self.profile: Profile | None = None
+        self.instances = InstanceRegistry()
         self.logger = SessionLogger(config.ui.log_dir)
         self.app = AmbientQAApp(
             self,
@@ -423,9 +425,16 @@ class AmbientController:
         )
         warning = f"  ⚠ {self.warnings[-1]}" if self.warnings else ""
         profile_name = self.profile.name if self.profile is not None else "none"
+        # Doubles as the heartbeat: the status bar refreshes every tick anyway,
+        # so counting here keeps liveness and display on the same cadence.
+        instance_count = self.instances.heartbeat_and_count()
+        # instances sits BEFORE the variable-length profile name: on a narrow
+        # terminal the line truncates from the right, and the counter exists
+        # to be seen.
         return (
             f"{listening}  mic:{mic} sys:{loopback}  whisper:{self.transcriber.device}  "
-            f"gate:{self.config.gate.mode}  profile:{profile_name}  queues:{queues}  "
+            f"gate:{self.config.gate.mode}  instances:{instance_count}  "
+            f"profile:{profile_name}  queues:{queues}  "
             f"answers:{self.answerer.in_flight} active/{self.answer_count} done  "
             f"~tokens:{self.estimated_tokens}{warning}"
         )
@@ -936,6 +945,7 @@ class AmbientController:
                 )
             for transcript in self.continuity.flush_all():
                 await self._log_rejection(transcript, "shutdown_before_merge_window")
+            self.instances.close()
 
 
 async def _main() -> None:
