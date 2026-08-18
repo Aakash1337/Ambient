@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import threading
 import time
@@ -14,10 +15,13 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from textual._context import active_app
 
 from .answer import ClaudeAnswerer
 from .audio import AudioCapture
-from .audio_devices import AudioDevice, AudioDeviceSession, MeterSession
+from .audio_devices import AudioDeviceSession, MeterSession
+from .backends import get_backend
+from .backends.base import CaptureDevice
 from .bus import AnswerResult, AudioFrame, DropOldestQueue, Transcript, Utterance
 from .config import Config, load_config
 from .config_write import set_audio_device, set_context_profile
@@ -55,6 +59,22 @@ class _PendingSystem:
     transcript: Transcript
 
 
+def _close_abandoned_meter_session(task: asyncio.Task[MeterSession]) -> None:
+    """Close a meter session whose awaiting coroutine was cancelled mid-open.
+
+    session.close() joins reader threads and reaps subprocesses, so it runs on
+    its own thread rather than the event loop this callback fires on.
+    """
+    if task.cancelled() or task.exception() is not None:
+        return
+    session = task.result()
+    threading.Thread(
+        target=session.close,
+        name="ambientqa-abandoned-meter-close",
+        daemon=True,
+    ).start()
+
+
 class AmbientController:
     def __init__(
         self,
@@ -86,7 +106,10 @@ class AmbientController:
         self.status_note = "initializing"
         self._loop_thread_id: int | None = None
         self._ignore_before = 0.0
-        self.capture = AudioCapture(config.audio, self._report)
+        # Built once and shared: capture and the device picker must agree on
+        # which platform stack they are talking to.
+        self.backend = get_backend(config.audio)
+        self.capture = AudioCapture(config.audio, self._report, backend=self.backend)
         self.transcriber = WhisperTranscriber(config.stt, self._report)
         self.gate = QuestionGate(config.gate, self._report)
         self.answerer = ClaudeAnswerer(
@@ -100,6 +123,8 @@ class AmbientController:
             self,
             config.ui.show_transcripts,
             config.ui.status_interval_s,
+            feed_direction=config.ui.feed_direction,
+            log_dir=config.ui.log_dir,
         )
         if config.context.enabled and config.context.profile:
             self._apply_profile(
@@ -117,8 +142,24 @@ class AmbientController:
         self._device_lock = asyncio.Lock()
         self._capture_loop: asyncio.AbstractEventLoop | None = None
         self._pending_system: deque[_PendingSystem] = deque()
+        # Completed (query, answer) pairs, oldest first. This -- not the raw
+        # transcript -- is what lets a follow-up like "elaborate on the second
+        # method" resolve: the methods exist only in the answer prose.
+        # maxlen=0 (history_turns = 0) drops every append: history disabled.
+        self._qa_history: deque[tuple[str, str]] = deque(
+            maxlen=config.answer.history_turns
+        )
         self._open_answer_jobs: dict[str, _AnswerJob] = {}
         self._gate_tasks: set[asyncio.Task[Any]] = set()
+        self._verify_tasks: set[asyncio.Task[Any]] = set()
+        # Rejections from the JUDGMENT stages only (policy shape-check and the
+        # semantic gate). Mechanical rejections -- filler, dedupe, echo, tags,
+        # pause -- are not misses and never enter the sweep.
+        self._recent_rejections: deque[Transcript] = deque(maxlen=24)
+        # Audits run strictly after their answer is on screen, and never more
+        # than one at a time: they must not compete with primary answers for
+        # the CLI process budget.
+        self._verify_semaphore = asyncio.Semaphore(1)
         self._gate_semaphore = asyncio.Semaphore(config.gate.max_concurrent)
         # The sys hold exists so a matching mic copy can win the echo contest,
         # whichever STT finishes first. It costs ~2.5s on EVERY question from the
@@ -215,11 +256,17 @@ class AmbientController:
     async def _restart_capture(self) -> None:
         loop = self._capture_loop or asyncio.get_running_loop()
         self._capture_loop = loop
-        await asyncio.to_thread(
-            self.capture.start,
-            loop,
-            self.frames,
-            enabled=not self.paused,
+        # Shielded: a worker cancellation arriving while the executor call is
+        # still queued would otherwise silently discard the restart and leave
+        # capture off. The start itself is serialised by the capture's own
+        # lifecycle lock, so letting it finish unobserved is always safe.
+        await asyncio.shield(
+            asyncio.to_thread(
+                self.capture.start,
+                loop,
+                self.frames,
+                enabled=not self.paused,
+            )
         )
 
     async def open_audio_devices(self) -> MeterSession:
@@ -239,11 +286,25 @@ class AmbientController:
             self.frames.drain()
             self.utterances.drain()
             self.segmenter.reset_all()
-            return await asyncio.to_thread(
-                AudioDeviceSession.open,
-                active_mic=active_mic,
-                active_loopback=active_loopback,
+            # The open spawns a live meter stream per endpoint on an executor
+            # thread, and cancelling this coroutine cannot cancel that thread:
+            # unshielded, the finished session's return value is simply
+            # discarded and its streams meter forever with no owner. Shielding
+            # lets the thread finish either way; if this coroutine has already
+            # been cancelled, the completed session is closed instead of kept.
+            opening = asyncio.ensure_future(
+                asyncio.to_thread(
+                    AudioDeviceSession.open,
+                    self.backend,
+                    active_mic=active_mic,
+                    active_loopback=active_loopback,
+                )
             )
+            try:
+                return await asyncio.shield(opening)
+            except BaseException:
+                opening.add_done_callback(_close_abandoned_meter_session)
+                raise
         except BaseException:
             try:
                 await self._restart_capture()
@@ -254,7 +315,7 @@ class AmbientController:
     async def close_audio_devices(
         self,
         session: MeterSession,
-        selected: AudioDevice | None,
+        selected: CaptureDevice | None,
     ) -> None:
         try:
             if selected is not None:
@@ -269,7 +330,11 @@ class AmbientController:
                 self._report(f"Audio device selected: {selected.name}")
         finally:
             try:
-                await asyncio.to_thread(session.close)
+                # Shielded for the same reason as the open side: a cancellation
+                # landing while close is still queued on the executor would
+                # skip it entirely, leaving every meter stream (a live parec
+                # child per endpoint) capturing for the life of the process.
+                await asyncio.shield(asyncio.to_thread(session.close))
             finally:
                 try:
                     await self._restart_capture()
@@ -376,7 +441,17 @@ class AmbientController:
             "text": transcript.text,
         }
 
+    # Reasons meaning "this reached judgment and got voted down" -- the only
+    # rejections a wrongly-dropped question can hide behind. Both live misses
+    # so far were exactly these: an ollama_reject on a real question and a
+    # not_a_direct_question on a command-form ask.
+    _SWEEP_REASONS = frozenset(
+        {"not_a_direct_question", "ollama_reject", "ollama_unavailable"}
+    )
+
     async def _log_rejection(self, transcript: Transcript, reason: str) -> None:
+        if reason in self._SWEEP_REASONS:
+            self._recent_rejections.append(transcript)
         record = self._base_record(transcript)
         record.update(
             {
@@ -397,6 +472,11 @@ class AmbientController:
             # Remember the answer prose too: the user rehearsing it aloud would
             # otherwise be gated as a fresh question and answered again.
             self.gate.mark_answer_text(result.answer, now)
+            self._qa_history.append((job.query, result.answer))
+            if self.config.answer.verify == "always":
+                task = asyncio.create_task(self._verify_answer(job, result))
+                self._verify_tasks.add(task)
+                task.add_done_callback(self._verify_tasks.discard)
         try:
             self.app.resolve_answer(result)
         except Exception as exc:
@@ -422,6 +502,121 @@ class AmbientController:
         self.logger.append(record)
         self._open_answer_jobs.pop(job.transcript.utterance_id, None)
 
+    def _replace_history_answer(self, query: str, revision: str) -> None:
+        # Follow-ups resolve against the history, so a revised answer must
+        # replace the wrong one there -- otherwise "elaborate on that" expands
+        # the answer the audit just retracted.
+        for index in range(len(self._qa_history) - 1, -1, -1):
+            if self._qa_history[index][0] == query:
+                self._qa_history[index] = (query, revision)
+                return
+
+    async def _verify_answer(self, job: _AnswerJob, result: AnswerResult) -> None:
+        try:
+            async with self._verify_semaphore:
+                started = time.perf_counter()
+                revision = await self.answerer.verify(
+                    job.transcript.utterance_id,
+                    job.transcript.text,
+                    job.query,
+                    result.answer,
+                    # A fresh, wider context snapshot: catching what the fast
+                    # path missed is the audit's entire purpose.
+                    self.context.rendered(self.config.answer.verify_context_turns),
+                    list(self._qa_history),
+                    channel=job.transcript.channel,
+                )
+            if revision is None:
+                return
+            latency = (time.perf_counter() - started) * 1000
+            now = time.time()
+            self.gate.mark_answer_text(revision, now)
+            self._replace_history_answer(job.query, revision)
+            try:
+                self.app.resolve_answer(
+                    AnswerResult(
+                        job.transcript.utterance_id,
+                        job.query,
+                        revision,
+                        "revised",
+                        latency,
+                    )
+                )
+            except Exception as exc:
+                self._report(f"Unable to update revised answer card: {exc}")
+            record = self._base_record(job.transcript)
+            record.update(
+                {
+                    "gate": True,
+                    "gate_reason": "verify_revision",
+                    "query": job.query,
+                    "answer": revision,
+                    "answer_status": "revised",
+                    "latencies_ms": {"verify": latency},
+                }
+            )
+            await self._log(record)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Detached task: best-effort by design, but never silently broken.
+            log.exception("Answer verification failed")
+            self._report(f"Answer verification failed: {exc}")
+
+    async def _sweep_worker(self) -> None:
+        """Detection second pass: recover questions the gate wrongly rejected."""
+        while not self.stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self.stop.wait(), timeout=self.config.answer.sweep_interval_s
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            if self.paused or not self._recent_rejections:
+                continue
+            candidates = list(self._recent_rejections)
+            self._recent_rejections.clear()
+            try:
+                answered = [query for query, _answer in self._qa_history] + [
+                    job.query for job in self._open_answer_jobs.values()
+                ]
+                missed = await self.answerer.detect_missed(
+                    [(t.channel, t.text) for t in candidates],
+                    self.context.rendered(self.config.answer.verify_context_turns),
+                    answered,
+                )
+                for index, question in missed:
+                    original = candidates[index]
+                    recovered_id = f"{original.utterance_id}-recovered"
+                    recovered = Transcript(
+                        original.channel,
+                        original.text,
+                        original.timestamp,
+                        recovered_id,
+                        original.latency_ms,
+                    )
+                    try:
+                        await self.app.add_question(recovered_id, question)
+                    except Exception as exc:
+                        self._report(f"Unable to add recovered answer card: {exc}")
+                    await self._enqueue_answer(
+                        _AnswerJob(
+                            recovered,
+                            question,
+                            self.context.rendered(
+                                self.config.answer.context_turns
+                            ),
+                            "second_pass_recovery",
+                            0.0,
+                        )
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.exception("Missed-question sweep failed")
+                self._report(f"Missed-question sweep failed: {exc}")
+
     async def _answer_worker(self) -> None:
         while not self.stop.is_set():
             try:
@@ -429,8 +624,15 @@ class AmbientController:
             except asyncio.TimeoutError:
                 continue
             try:
+                # History is read here, at answer time, not when the job was
+                # queued: a follow-up asked seconds after an answer completes
+                # must see that answer even if it was enqueued first.
                 result = await self.answerer.answer(
-                    job.transcript.utterance_id, job.query, job.context
+                    job.transcript.utterance_id,
+                    job.query,
+                    job.context,
+                    history=list(self._qa_history),
+                    channel=job.transcript.channel,
                 )
                 await self._complete_answer(job, result)
             except asyncio.CancelledError:
@@ -652,6 +854,15 @@ class AmbientController:
                 self._ui_tasks.discard(task)
 
     async def run(self) -> None:
+        # Textual resolves the running app through the active_app ContextVar,
+        # including inside every Timer it starts. The controller's tasks are
+        # NOT descendants of Textual's message pump, so a widget method they
+        # await (QACard.append_answer's flush throttle, via the answer-delta
+        # callback) creates a timer whose task cannot resolve active_app: it
+        # dies instantly with LookupError, and shutdown re-raises it when it
+        # awaits dead timers -- crashing quit. Seeding the var here makes every
+        # task created below inherit a context in which Textual timers work.
+        active_app.set(self.app)
         loop = asyncio.get_running_loop()
         self._capture_loop = loop
         self._loop_thread_id = threading.get_ident()
@@ -678,6 +889,8 @@ class AmbientController:
             asyncio.create_task(self._answer_worker())
             for _ in range(self.config.answer.max_concurrent)
         )
+        if self.config.answer.sweep == "always":
+            self._tasks.append(asyncio.create_task(self._sweep_worker()))
         try:
             await self.app.run_async()
         finally:
@@ -689,10 +902,13 @@ class AmbientController:
                 task.cancel()
             for task in list(self._gate_tasks):
                 task.cancel()
+            for task in list(self._verify_tasks):
+                task.cancel()
             await asyncio.gather(
                 *self._tasks,
                 *self._ui_tasks,
                 *list(self._gate_tasks),
+                *list(self._verify_tasks),
                 return_exceptions=True,
             )
             # Preserve exactly one final JSONL record for every confirmed but
@@ -725,6 +941,20 @@ class AmbientController:
 async def _main() -> None:
     config_path = Path("config.toml")
     config = load_config(config_path)
+    # Once Textual owns the terminal, anything logged to stderr is painted raw
+    # over the UI -- one component's traceback makes the whole app look dead.
+    # Root logging moves to a file next to the session logs; the UI surfaces
+    # what matters through the status bar and warning toasts.
+    log_dir = Path(config.ui.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(log_dir / "ambientqa.log", encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    root = logging.getLogger()
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    root.addHandler(handler)
     controller = AmbientController(config, config_path)
     loop = asyncio.get_running_loop()
     with suppress(NotImplementedError):
@@ -737,6 +967,22 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if os.name == "posix":
+        # Whisper's lazy model load (huggingface_hub -> tqdm) creates a
+        # multiprocessing lock at FIRST TRANSCRIPTION, which spawns the POSIX
+        # resource-tracker process and passes sys.stderr.fileno() to it. By
+        # then Textual has replaced stderr with a capture whose fileno() is -1,
+        # the spawn dies with "bad value(s) in fds_to_keep", and every
+        # transcription fails -- CUDA and the CPU fallback alike. Start the
+        # tracker NOW, while stderr is still the real terminal; later lock
+        # creation only writes to the already-running tracker's pipe.
+        from multiprocessing import resource_tracker
+
+        resource_tracker.ensure_running()
+    # Inside a TUI a download progress bar could only render into Textual's
+    # stdout capture as garbage; this also skips most of the tqdm machinery
+    # that needed the multiprocessing lock in the first place.
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     asyncio.run(_main())
 
 

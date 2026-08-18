@@ -38,10 +38,61 @@ def test_keeps_question_punctuation_and_disables_previous_text() -> None:
     assert transcriber.model.kwargs["condition_on_previous_text"] is False
 
 
-def test_blocks_variable_subtitle_credit_suffix() -> None:
+# --- regression: the hallucination blocklist is exact-match only ---
+# Whisper's silence hallucinations ("Thank you.", "Thanks for watching!") are
+# whole-utterance artifacts. A prefix match ate real speech: an interviewer's
+# courteous opener made the whole question vanish before gating, with no log
+# record at all.
+
+
+def test_exact_hallucination_phrase_is_dropped() -> None:
+    transcriber = WhisperTranscriber(STTConfig())
+    transcriber.model = FakeWhisper(" Thank you. ")
+    assert transcriber._transcribe_sync(utterance()) is None
+
+
+def test_courteous_opener_before_real_question_survives() -> None:
+    transcriber = WhisperTranscriber(STTConfig())
+    transcriber.model = FakeWhisper(
+        "Thank you. So, tell me about your experience with Kubernetes."
+    )
+    result = transcriber._transcribe_sync(utterance())
+    assert result is not None
+    assert "Kubernetes" in result.text
+
+
+@pytest.mark.parametrize(
+    "hallucination",
+    [
+        # The canonical whole-utterance silence hallucinations. Exact matching
+        # made the old prefix stems ("subtitles by") dead entries, so the
+        # defaults must carry the full forms Whisper actually emits.
+        "Subtitles by the Amara.org community.",
+        "Thank you very much.",
+        "Thank you for watching.",
+        "Thanks for watching!",
+    ],
+)
+def test_default_blocklist_covers_canonical_whole_utterances(
+    hallucination: str,
+) -> None:
+    transcriber = WhisperTranscriber(STTConfig())
+    transcriber.model = FakeWhisper(hallucination)
+    assert transcriber._transcribe_sync(utterance()) is None
+
+
+def test_blocked_phrase_matches_whole_utterance_not_prefix() -> None:
+    # An unlisted credit line passes through untouched -- matching is exact,
+    # never by prefix -- and blocking it takes its own whole-utterance entry.
     transcriber = WhisperTranscriber(STTConfig())
     transcriber.model = FakeWhisper("Subtitles by Example Studio")
-    assert transcriber._transcribe_sync(utterance()) is None
+    assert transcriber._transcribe_sync(utterance()) is not None
+
+    exact = WhisperTranscriber(
+        STTConfig(hallucination_blocklist=["Subtitles by Example Studio"])
+    )
+    exact.model = FakeWhisper("Subtitles by Example Studio")
+    assert exact._transcribe_sync(utterance()) is None
 
 
 def test_drops_pure_punctuation() -> None:

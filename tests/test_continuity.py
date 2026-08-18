@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from ambientqa.__main__ import AmbientController
 from ambientqa.bus import Transcript
 from ambientqa.config import MergeConfig
@@ -81,9 +83,10 @@ def test_complete_question_gates_immediately_without_hold() -> None:
 
 
 def test_continuation_after_merge_gap_does_not_merge() -> None:
-    merger = ContinuityMerger(MergeConfig(merge_window_s=10.0))
+    merger = ContinuityMerger(MergeConfig(merge_window_s=15.0))
     first = transcript("connect knowledge base", start=0.0, end=1.0)
-    second = transcript("and add to it.", start=6.0, end=7.0)
+    # Starts past merge_gap_s (default 6.5) after the first fragment ended.
+    second = transcript("and add to it.", start=9.0, end=10.0)
     assert merger.push(first, now=0.0) == []
     emitted = merger.push(second, now=1.0)
     assert [item.text for item in emitted] == [
@@ -169,6 +172,33 @@ def test_open_detection_ignores_whisper_period_after_trailing_word() -> None:
     assert not is_open_utterance("How does this work?")
 
 
+# --- regression: a terminal '?' or '!' outranks a stranded preposition ---
+# English questions legitimately end on TRAILING_FRAGMENT_WORDS ("What are you
+# working on?"); classifying them open parked a finished question in the merge
+# window for the whole hold, or glued it onto the next sentence and destroyed
+# the gate's '?' fast-accept. Only '.' stays untrusted: Whisper invents a
+# period at every VAD boundary.
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "What are you working on?",
+        "Come on!",
+        'He asked "what are you working on?"',
+    ],
+)
+def test_terminal_question_or_exclamation_closes_the_thought(text: str) -> None:
+    assert not is_open_utterance(text)
+
+
+def test_preposition_ending_question_gates_immediately_without_hold() -> None:
+    merger = ContinuityMerger(MergeConfig())
+    question = transcript("What are you working on?", start=0.0, end=1.0)
+    assert merger.push(question, now=10.0) == [question]
+    assert merger.flush_all() == []
+
+
 def test_controller_processes_only_the_merged_transcript() -> None:
     controller = AmbientController.__new__(AmbientController)
     controller.continuity = ContinuityMerger(MergeConfig())
@@ -190,3 +220,33 @@ def test_controller_processes_only_the_merged_transcript() -> None:
     assert [item.text for item in processed] == [
         "connect knowledge base and add to it."
     ]
+
+
+def test_trailed_off_setup_merges_with_its_question_after_a_think_pause() -> None:
+    # Measured live miss at gap 4.5/window 9: the speaker stated a scenario,
+    # trailed off, thought for ~5s, then asked -- and the gate saw only the
+    # question half. Default knobs must cover a think-pause of that length.
+    merger = ContinuityMerger(MergeConfig())
+    held = merger.push(
+        transcript(
+            "So, if you have the main content you're searching to answer things changing…",
+            start=47.0,
+            end=52.0,
+        ),
+        now=52.0,
+    )
+    assert held == []
+    ready = merger.push(
+        transcript(
+            "Which method would you use? Would you use RAG, multi-agent orchestration, or prompt engineering?",
+            start=57.0,
+            end=62.0,
+        ),
+        now=62.3,
+    )
+    assert len(ready) == 1
+    merged = ready[0].text
+    assert "content you're searching" in merged
+    assert merged.endswith("?")
+    # The artificial trailing-off ellipsis must not survive the join.
+    assert "…" not in merged

@@ -158,10 +158,13 @@ class WhisperTranscriber:
         if not text or not REAL_CONTENT_RE.search(text):
             return None
         normalised = normalise_phrase(text)
-        if any(
-            normalised == blocked or normalised.startswith(blocked + " ")
-            for blocked in self._blocked
-        ):
+        # Exact match only. Whisper's silence hallucinations ("Thank you.",
+        # "Thanks for watching!") are whole-utterance artifacts, so equality is
+        # the right test. A prefix match would eat real speech: interviewers
+        # routinely open with a courtesy -- "Thank you. So, tell me about your
+        # experience with Kubernetes." -- and the entire question would vanish
+        # here, before gating, with no log record at all.
+        if normalised in self._blocked:
             return None
         return Transcript(
             channel=utterance.channel,

@@ -15,13 +15,9 @@ from typing import Any
 import numpy as np
 import pytest
 
-from ambientqa.audio import (
-    SIGNAL_RMS,
-    LoopbackArbiter,
-    SourceState,
-    _find_loopback,
-    _loopback_candidates,
-)
+from ambientqa.audio import SIGNAL_RMS, LoopbackArbiter, SourceState
+from ambientqa.backends.base import CaptureDevice
+from ambientqa.backends.windows import _find_loopback, _loopback_candidates
 
 LOUD = SIGNAL_RMS * 10
 QUIET = SIGNAL_RMS / 10
@@ -141,17 +137,25 @@ def test_arbiter_keeps_incumbent_through_pauses_in_its_own_speech() -> None:
 
 
 class FakeStream:
-    """Delivers `native_frames` of near-silent stereo float32, then blocks."""
+    """Delivers `native_frames` of near-silent interleaved float32, then blocks."""
 
     def __init__(self, frames: int, channels: int, stop: "threading.Event") -> None:
-        self.payload = np.full(frames * channels, 1e-6, dtype=np.float32).tobytes()
+        self.rate = 16000
+        self.channels = channels
+        self.payload = np.full(frames * channels, 1e-6, dtype=np.float32)
         self._stop = stop
 
-    def read(self, _frames: int, exception_on_overflow: bool = False) -> bytes:
+    def read(self, _frames: int) -> np.ndarray:
         if self._stop.is_set():
             raise RuntimeError("stopped")
         time.sleep(0.001)
         return self.payload
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def close(self) -> None:
+        pass
 
 
 def test_a_winning_loopback_endpoint_never_mutes_the_microphone() -> None:
@@ -172,12 +176,7 @@ def test_a_winning_loopback_endpoint_never_mutes_the_microphone() -> None:
     arbiter.observe(32, LOUD, 1.0)  # a loopback endpoint holds the channel
     assert arbiter.winner == 32
 
-    info = {
-        "index": 28,
-        "name": "Microphone (USB)",
-        "defaultSampleRate": 16000,
-        "maxInputChannels": 2,
-    }
+    device = CaptureDevice("28", "Microphone (USB)", "mic", 2, 16000)
 
     async def drive() -> list[str]:
         queue: DropOldestQueue = DropOldestQueue(256)
@@ -185,7 +184,7 @@ def test_a_winning_loopback_endpoint_never_mutes_the_microphone() -> None:
         stream = FakeStream(400, 2, capture._stop)
         thread = threading.Thread(
             target=capture._capture_source,
-            args=("mic", info, stream, loop, queue, arbiter),
+            args=("mic", device, stream, loop, queue, arbiter, capture._generation),
             daemon=True,
         )
         thread.start()

@@ -18,8 +18,9 @@ Moving development to a new machine? Follow the porting checklist at the end of
 
 ## Quickstart
 
-Requirements: Windows 11, Python 3.11 through the Python launcher, Ollama with `gemma4:e2b`,
-the Claude CLI signed in, and an NVIDIA GPU for the preferred Whisper configuration.
+Requirements: Windows 11, Python 3.11 through the Python launcher, Ollama with the model named
+in `[gate] model` pulled (`gemma4:e2b` by default; any small instruct model such as `qwen2.5:3b`
+works), the Claude CLI signed in, and an NVIDIA GPU for the preferred Whisper configuration.
 
 ```powershell
 .\setup.ps1
@@ -27,13 +28,24 @@ the Claude CLI signed in, and an NVIDIA GPU for the preferred Whisper configurat
 python -m ambientqa
 ```
 
+On Linux the same repo runs first-class through PipeWire (`pactl`/`parec`) — microphone
+**and** system audio, since every output's *monitor* source is PipeWire's equivalent of
+WASAPI loopback. `./run.sh` bootstraps its own environment (`.venv-linux`; the Windows-only
+`pyaudiowpatch` is skipped by its requirements marker) on first run, starts Ollama if it is
+down, and launches the pane:
+
+```bash
+./run.sh
+```
+
 `setup.ps1` deliberately uses `py -3.11`; do not use the unrelated `python` environment already
 on `PATH`. The first Ollama warmup can take about 67 seconds. Once warm, question classification
 is normally well under a second.
 
-Use `python scripts/list_devices.py` to see input and WASAPI loopback endpoint names. Set
-`audio.mic_device` or `audio.output_device` to a unique, case-insensitive substring when the
-Windows default is not the desired source.
+Use `python scripts/list_devices.py` to see input and system-audio endpoint names (WASAPI
+loopback on Windows, PipeWire monitor sources on Linux). Set `audio.mic_device` or
+`audio.output_device` to a unique, case-insensitive substring when the platform default is
+not the desired source.
 
 Run the test suite with:
 
@@ -75,9 +87,10 @@ Two rules do the heavy lifting and are easy to break:
 
 ## Hearing the other speaker
 
-`audio.output_device` should normally be **blank**. Blank opens *every* WASAPI loopback endpoint at
-once and forwards whichever one is actually carrying speech, so it does not matter whether today's
-call plays through the headset, the monitor or the desktop speakers.
+`audio.output_device` should normally be **blank**. Blank opens *every* system-audio endpoint at
+once (WASAPI loopback endpoints on Windows, PipeWire monitor sources on Linux) and forwards
+whichever one is actually carrying speech, so it does not matter whether today's call plays
+through the headset, the monitor or the desktop speakers.
 
 Naming an endpoint pins it, and that is how a whole conversation gets lost. A loopback opened on an
 endpoint the call is not playing through does not error — it opens perfectly happily and captures
@@ -273,10 +286,11 @@ Suppression happens *before* the Ollama call, so it also saves ~700ms per rehear
 
 ## How it works
 
-Two non-blocking PyAudioWPatch capture threads feed per-channel Silero VAD segmenters. One
+Non-blocking capture threads — one per open stream, over WASAPI (PyAudioWPatch) on Windows or
+PipeWire (`parec`) on Linux — feed per-channel Silero VAD segmenters. One
 faster-whisper worker transcribes utterances serially. Free heuristics reject obvious
 non-questions and fast-accept explicit interrogatives; remaining speech goes to the local
-`gemma4:e2b` Ollama gate. Confirmed questions each launch their own bounded, one-shot
+Ollama gate model (`[gate] model`). Confirmed questions each launch their own bounded, one-shot
 `claude -p` process and stream output into that question's card as it is generated. There is
 intentionally no persistent Claude stream session.
 
@@ -285,14 +299,15 @@ Keys:
 - `p` — pause or resume listening
 - `c` — clear the visible feed
 - `t` — show or hide raw transcript lines
+- `l` — browse recorded session logs and open one read-only over the live pane
 - `a` — force-answer the most recent utterance
 - `s` — cycle strict, balanced, and eager gate modes
 - `x` — choose or disable a standing context profile
 - `d` — compare every microphone and loopback endpoint with live meters, then select one
 - `q` — quit
 
-The audio-device picker pauses the main capture streams while it is open, probes every WASAPI
-endpoint in shared mode, and restarts capture immediately when it closes. Devices held by another
+The audio-device picker pauses the main capture streams while it is open, probes every
+endpoint concurrently in shared mode, and restarts capture immediately when it closes. Devices held by another
 application remain visible as unavailable without affecting the other meters. For the same
 workflow outside the TUI:
 
@@ -344,6 +359,7 @@ All settings are in the fully commented `config.toml`.
 | | `max_concurrent` | Utterances judged at once, off the ordered consumer path |
 | | `mode` | `strict`, `balanced`, or `eager` prompt policy |
 | | `min_words`, `context_turns` | Heuristic minimum and semantic context |
+| | `reask_cooldown_s` | Near-duplicate dedupe horizon: inside it a repeat is a mechanical duplicate and is dropped; past it, re-asking an already-answered question gets a fresh answer |
 | | `dedupe_window_s`, `dedupe_ratio` | Recent answered-question suppression |
 | | `echo_window_s`, `echo_ratio` | Cross-channel transcript echo suppression |
 | | `queue_size` | Bounded transcript queue |
@@ -356,8 +372,12 @@ All settings are in the fully commented `config.toml`.
 | | `stream` | Stream partial output per one-shot process; `false` restores buffering |
 | | `max_concurrent`, `answer_timeout_s` | Process semaphore and per-answer timeout |
 | | `context_turns`, `queue_size` | Background context and configured capacity |
+| | `history_turns` | Completed Q&A pairs carried into each new answer so follow-ups ("elaborate on the second method") resolve against what was actually answered; 0 disables |
+| | `verify`, `verify_context_turns` | Second-pass audit of each delivered answer with a wider transcript window: replaces the card (marked "revised") only when the answer was materially wrong — missed constraint, misheard question, dropped enumeration item. `"always"` or `"off"` |
+| | `sweep`, `sweep_interval_s`, `sweep_model` | Detection second pass: periodically re-judges the gate's judgment-stage rejections against wide context and answers genuine asks it wrongly dropped, as late cards. `"always"` or `"off"`; small model by default |
 | `ui` | `show_transcripts` | Initial raw-transcript visibility |
 | | `log_dir`, `status_interval_s` | Session output directory and status refresh |
+| | `feed_direction` | `"top"` shows the newest entry first (default); `"bottom"` appends chronologically |
 
 All bounded queues drop the oldest item on overflow. Capture producers never wait on a consumer.
 The default `audio.silence_ms` is 900 ms. Raising it further can reduce splitting during longer
@@ -422,11 +442,12 @@ Set `audio.mic_device` in `config.toml` to any case-insensitive substring of the
 `int8`. Check the NVIDIA driver and the installed `nvidia-cublas-cu12`/`nvidia-cudnn-cu12`
 packages. The status bar deliberately makes this fallback prominent because it is slower.
 
-**Ollama is not running:** start Ollama, confirm `ollama list` includes `gemma4:e2b`, then restart
+**Ollama is not running:** start Ollama, confirm `ollama list` includes the model named in
+`[gate] model` (a model that is configured but not pulled fails the same way), then restart
 the app. Until the local gate is available, fast heuristic accepts still work and uncertain
 utterances are rejected safely.
 
-**Gate responses are empty:** `gemma4:e2b` is a reasoning model. Every Ollama request must contain
+**Gate responses are empty:** `gemma4:e2b` (the default gate model) is a reasoning model. Every Ollama request must contain
 top-level `"think": false`; otherwise `message.content` can be empty. Both application requests
 and the PowerShell warmup include it. If you put Ollama behind a proxy, ensure that field is not
 removed.

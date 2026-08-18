@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from rich.text import Text
@@ -16,7 +18,7 @@ from textual.containers import Container, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Label, ListItem, ListView, Static
 
-from .audio_devices import AudioDevice, MeterReading, MeterSession
+from .audio_devices import CaptureDevice, MeterReading, MeterSession
 from .bus import AnswerResult, Transcript
 
 _FENCE_BLOCK_RE = re.compile(r"```[^\n]*\n(.*?)(?:^\s*```\s*$|\Z)", re.DOTALL | re.MULTILINE)
@@ -75,13 +77,13 @@ class UIController(Protocol):
     async def close_audio_devices(
         self,
         session: MeterSession,
-        selected: AudioDevice | None,
+        selected: CaptureDevice | None,
     ) -> None: ...
     def profile_choices(self) -> tuple[list[str], str]: ...
     async def select_profile(self, value: str) -> str: ...
 
 
-def _matches_active(device: AudioDevice, active_name: str) -> bool:
+def _matches_active(device: CaptureDevice, active_name: str) -> bool:
     if not active_name:
         return False
     device_name = device.name.casefold()
@@ -92,7 +94,7 @@ def _matches_active(device: AudioDevice, active_name: str) -> bool:
 class DeviceRow(ListItem):
     def __init__(
         self,
-        device: AudioDevice,
+        device: CaptureDevice,
         active: bool,
     ) -> None:
         super().__init__(Label(""))
@@ -114,7 +116,7 @@ class DeviceRow(ListItem):
         self.query_one(Label).update(Text.assemble((name, "bold"), "\n", meter))
 
 
-class AudioDevicesScreen(ModalScreen[AudioDevice | None]):
+class AudioDevicesScreen(ModalScreen[CaptureDevice | None]):
     """Modal picker whose every row is metered at the same time."""
 
     DEFAULT_CSS = """
@@ -315,6 +317,243 @@ class ProfilesScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+def load_session_records(path: Path) -> list[dict[str, Any]]:
+    """Parse a session JSONL, ordered by timestamp.
+
+    Unparseable lines are skipped rather than failing the whole file: the
+    live session's own log is a valid pick, and its last line may be
+    mid-write at the moment it is read.
+    """
+    records: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    records.sort(key=lambda record: record.get("timestamp") or 0)
+    return records
+
+
+def _session_label(path: Path) -> str:
+    try:
+        stamp = datetime.strptime(path.stem, "session-%Y%m%d-%H%M%S")
+    except ValueError:
+        return path.stem
+    return stamp.strftime("%Y-%m-%d %H:%M:%S")
+
+
+class SessionRow(ListItem):
+    def __init__(self, path: Path) -> None:
+        super().__init__(Label(_session_label(path)))
+        self.path = path
+
+
+class SessionsScreen(ModalScreen[Path | None]):
+    """Pick a recorded session log, newest first."""
+
+    DEFAULT_CSS = """
+    SessionsScreen {
+        align: center middle;
+        background: $background 75%;
+    }
+    SessionsScreen > #session-pick-dialog {
+        width: 72%;
+        max-width: 90;
+        height: auto;
+        max-height: 80%;
+        border: round $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    SessionsScreen #session-pick-title {
+        height: 2;
+        text-style: bold;
+        color: $accent;
+    }
+    SessionsScreen #session-pick-help {
+        height: 2;
+        color: $text-muted;
+    }
+    SessionsScreen ListView {
+        height: auto;
+        max-height: 20;
+    }
+    SessionsScreen ListItem {
+        height: 1;
+        padding: 0 1;
+    }
+    """
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("l", "cancel", "Cancel", priority=True),
+        Binding("j", "down", "Down", show=False, priority=True),
+        Binding("k", "up", "Up", show=False, priority=True),
+        Binding("enter", "choose", "Select", priority=True),
+    ]
+
+    def __init__(self, paths: list[Path]) -> None:
+        super().__init__()
+        self.rows = [SessionRow(path) for path in paths]
+
+    def on_mount(self) -> None:
+        if self.rows:
+            self.query_one("#session-pick-list", ListView).index = 0
+
+    def compose(self) -> ComposeResult:
+        with Container(id="session-pick-dialog"):
+            yield Label("Recorded sessions", id="session-pick-title")
+            yield Label(
+                "↑/↓ or j/k move · Enter opens read-only · Esc/l cancels",
+                id="session-pick-help",
+            )
+            yield ListView(*self.rows, id="session-pick-list")
+
+    def action_down(self) -> None:
+        self.query_one("#session-pick-list", ListView).action_cursor_down()
+
+    def action_up(self) -> None:
+        self.query_one("#session-pick-list", ListView).action_cursor_up()
+
+    def action_choose(self) -> None:
+        session_list = self.query_one("#session-pick-list", ListView)
+        if session_list.index is None:
+            return
+        row = session_list.children[session_list.index]
+        if isinstance(row, SessionRow):
+            self.dismiss(row.path)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SessionCard(Static):
+    """Answered question from a recorded session, styled like a live QACard."""
+
+    DEFAULT_CSS = """
+    SessionCard {
+        border: round $accent;
+        margin: 1 1;
+        padding: 0 1;
+        height: auto;
+    }
+    SessionCard .question { color: $accent; text-style: bold; height: auto; }
+    SessionCard .answer { color: $text; height: auto; margin-top: 1; }
+    """
+
+    def __init__(self, record: dict[str, Any], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.record = record
+
+    def compose(self) -> ComposeResult:
+        record = self.record
+        stamp = datetime.fromtimestamp(record.get("timestamp") or 0).strftime(
+            "%H:%M:%S"
+        )
+        question = str(record.get("query") or record.get("text") or "")
+        suffix = "  · web lookup" if record.get("web_lookup") else ""
+        yield Label(f"Q  {question}  ·  {stamp}{suffix}", classes="question")
+        status = str(record.get("answer_status") or "ok")
+        prefix = "A  " if status == "ok" else f"{status.replace('_', ' ')}  "
+        yield Static(
+            prefix + plain_text(str(record.get("answer") or "")), classes="answer"
+        )
+
+
+class SessionViewerScreen(ModalScreen[None]):
+    """Read-only replay of a recorded session over the live pane.
+
+    The live pipeline keeps running untouched underneath; closing the modal
+    returns to it exactly as it was.
+    """
+
+    DEFAULT_CSS = """
+    SessionViewerScreen {
+        align: center middle;
+        background: $background 75%;
+    }
+    SessionViewerScreen > #session-dialog {
+        width: 96%;
+        height: 88%;
+        border: round $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    SessionViewerScreen #session-title {
+        height: 2;
+        text-style: bold;
+        color: $accent;
+    }
+    SessionViewerScreen #session-feed {
+        height: 1fr;
+        scrollbar-gutter: stable;
+    }
+    SessionViewerScreen .transcript {
+        color: $text-muted;
+        height: auto;
+        margin: 0 1;
+    }
+    """
+    BINDINGS = [
+        Binding("escape", "close", "Close", priority=True),
+        Binding("l", "close", "Close", priority=True),
+        Binding("j", "down", "Down", show=False, priority=True),
+        Binding("k", "up", "Up", show=False, priority=True),
+    ]
+
+    def __init__(
+        self,
+        title: str,
+        records: list[dict[str, Any]],
+        newest_first: bool,
+    ) -> None:
+        super().__init__()
+        self._title = title
+        self._records = list(reversed(records)) if newest_first else records
+
+    def compose(self) -> ComposeResult:
+        answered = sum(1 for record in self._records if record.get("gate"))
+        with Container(id="session-dialog"):
+            yield Label(
+                f"Session {self._title} — {len(self._records)} utterances, "
+                f"{answered} answered  ·  read-only  ·  Esc/l closes",
+                id="session-title",
+            )
+            with VerticalScroll(id="session-feed"):
+                for record in self._records:
+                    if record.get("gate"):
+                        yield SessionCard(record)
+                    else:
+                        stamp = datetime.fromtimestamp(
+                            record.get("timestamp") or 0
+                        ).strftime("%H:%M:%S")
+                        channel = record.get("channel", "?")
+                        yield Static(
+                            Text(
+                                f"{stamp}  [{channel}]  {record.get('text', '')}",
+                                style="dim",
+                            ),
+                            classes="transcript",
+                        )
+
+    def action_down(self) -> None:
+        self.query_one("#session-feed", VerticalScroll).scroll_relative(
+            y=3, animate=False
+        )
+
+    def action_up(self) -> None:
+        self.query_one("#session-feed", VerticalScroll).scroll_relative(
+            y=-3, animate=False
+        )
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class QACard(Static):
     DEFAULT_CSS = """
     QACard {
@@ -462,6 +701,7 @@ class AmbientQAApp(App[None]):
         ("p", "pause", "Pause"),
         ("c", "clear", "Clear"),
         ("t", "transcripts", "Transcripts"),
+        ("l", "sessions", "Sessions"),
         ("a", "force_answer", "Answer last"),
         ("s", "strictness", "Strictness"),
         ("x", "profiles", "Context profile"),
@@ -474,11 +714,15 @@ class AmbientQAApp(App[None]):
         controller: UIController,
         show_transcripts: bool = True,
         status_interval_s: float = 0.5,
+        feed_direction: str = "top",
+        log_dir: str | Path = "logs",
     ) -> None:
         super().__init__()
         self.controller = controller
         self.show_transcripts = show_transcripts
         self.status_interval_s = status_interval_s
+        self.feed_direction = feed_direction
+        self.log_dir = Path(log_dir)
         self._cards: dict[str, QACard] = {}
         self._transcript_rows: dict[str, Static] = {}
 
@@ -507,12 +751,28 @@ class AmbientQAApp(App[None]):
         self.query_one("#status", Static).update(self.controller.status_text())
         self._apply_paused()
 
+    def _following(self, feed: VerticalScroll) -> bool:
+        """Whether the view sits at the edge where new entries appear: the top
+        in "top" mode (newest first), the bottom in "bottom" mode."""
+        if self.feed_direction == "top":
+            return feed.scroll_y <= 0
+        return feed.scroll_y >= max(0, feed.max_scroll_y - 1)
+
+    def _follow(self, feed: VerticalScroll) -> None:
+        if self.feed_direction == "top":
+            feed.scroll_home(animate=False)
+        else:
+            feed.scroll_end(animate=False)
+
     async def _mount_following(self, widget: Static) -> None:
         feed = self.query_one("#feed", VerticalScroll)
-        was_following = feed.scroll_y >= max(0, feed.max_scroll_y - 1)
-        await feed.mount(widget)
+        was_following = self._following(feed)
+        if self.feed_direction == "top" and feed.children:
+            await feed.mount(widget, before=feed.children[0])
+        else:
+            await feed.mount(widget)
         if was_following:
-            feed.scroll_end(animate=False)
+            self._follow(feed)
 
     async def add_transcript(self, transcript: Transcript) -> None:
         if not self.show_transcripts:
@@ -523,10 +783,10 @@ class AmbientQAApp(App[None]):
         existing = self._transcript_rows.get(transcript.utterance_id)
         if existing is not None and existing.is_mounted:
             feed = self.query_one("#feed", VerticalScroll)
-            was_following = feed.scroll_y >= max(0, feed.max_scroll_y - 1)
+            was_following = self._following(feed)
             existing.update(content)
             if was_following:
-                self.call_after_refresh(feed.scroll_end, animate=False)
+                self.call_after_refresh(self._follow, feed)
             return
         row = Static(content, classes="transcript")
         self._transcript_rows[transcript.utterance_id] = row
@@ -543,9 +803,8 @@ class AmbientQAApp(App[None]):
 
     def _answer_card_rendered(self) -> None:
         feed = self.query_one("#feed", VerticalScroll)
-        was_following = feed.scroll_y >= max(0, feed.max_scroll_y - 1)
-        if was_following:
-            self.call_after_refresh(feed.scroll_end, animate=False)
+        if self._following(feed):
+            self.call_after_refresh(self._follow, feed)
 
     def append_answer_delta(self, question_id: str, delta: str) -> None:
         card = self._cards.get(question_id)
@@ -586,10 +845,13 @@ class AmbientQAApp(App[None]):
         mode = self.controller.cycle_gate_mode()
         self.notify(f"Gate mode: {mode}")
 
-    @work(exclusive=True)
+    # Own worker group (as below): in the shared default group, pressing x
+    # while the picker is stopping/restarting capture would cancel this worker
+    # mid-flight and strand the capture restart.
+    @work(exclusive=True, group="devices")
     async def action_devices(self) -> None:
         session: MeterSession | None = None
-        selected: AudioDevice | None = None
+        selected: CaptureDevice | None = None
         try:
             session = await self.controller.open_audio_devices()
             try:
@@ -604,7 +866,35 @@ class AmbientQAApp(App[None]):
         except Exception as exc:
             self.add_warning(f"Unable to change audio device: {exc}")
 
-    @work(exclusive=True)
+    def _session_paths(self) -> list[Path]:
+        if not self.log_dir.is_dir():
+            return []
+        return sorted(self.log_dir.glob("session-*.jsonl"), reverse=True)
+
+    # Own worker group: sharing the default exclusive group would let this
+    # action and the device/profile pickers silently cancel each other.
+    @work(exclusive=True, group="sessions")
+    async def action_sessions(self) -> None:
+        try:
+            paths = await asyncio.to_thread(self._session_paths)
+            if not paths:
+                self.notify(f"No recorded sessions in {self.log_dir}")
+                return
+            selected = await self.push_screen_wait(SessionsScreen(paths))
+            if selected is None:
+                return
+            records = await asyncio.to_thread(load_session_records, selected)
+            await self.push_screen_wait(
+                SessionViewerScreen(
+                    selected.stem, records, self.feed_direction == "top"
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.add_warning(f"Unable to open session log: {exc}")
+
+    @work(exclusive=True, group="profiles")
     async def action_profiles(self) -> None:
         try:
             choices, active = self.controller.profile_choices()

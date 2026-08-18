@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -54,7 +55,45 @@ INTERROGATIVES = {
     "can", "could", "would", "should", "do", "does", "did", "is", "are",
     "was", "were", "will", "have", "has", "am", "may", "might", "shall",
 }
-QUESTION_PREFIXES = {"so", "well", "okay", "ok", "then", "and", "but"}
+# Discourse markers and acknowledgment lead-ins that interviewers habitually
+# attach before the actual question ("Great, could you walk me through your
+# project?"). Stripped before the interrogative-start test, so the fast-accept
+# still fires; also the reason these first tokens are never treated as names by
+# the vocative check.
+QUESTION_PREFIXES = {
+    "so", "well", "okay", "ok", "then", "and", "but",
+    "great", "alright", "right", "sure", "now", "yes", "yeah", "cool",
+    "perfect", "good", "nice", "fine",
+}
+# Command-form asks. "Evaluation metrics. Talk about them." carries no
+# question mark and no interrogative, yet is as explicit as a request gets --
+# and interviewers open with imperatives constantly ("Tell me about
+# yourself."). A sentence beginning with one of these verbs is a direct ask.
+REQUEST_VERBS = {
+    "explain", "describe", "talk", "tell", "walk", "give", "list", "compare",
+    "elaborate", "define", "discuss", "summarize", "summarise", "outline",
+}
+# Everyday idioms that share the shape but request nothing. Matched against
+# the whole compacted utterance (punctuation-stripped): precision matters
+# here because the imperative accept skips the semantic gate entirely.
+_IMPERATIVE_IDIOMS = {
+    "tell me about it",
+    "give me a second",
+    "give me a sec",
+    "give me a minute",
+    "give me a moment",
+    "give me a break",
+}
+# Words that turn "talk about X" from a request into a narrated plan --
+# "we'll talk about that later" asks nothing. WORD_RE keeps contractions
+# whole, so those need their own entries.
+_PLAN_MARKERS = {
+    "i", "we", "i'll", "we'll", "i'm", "we're", "gonna", "going",
+    "later", "tomorrow",
+}
+_REQUEST_BIGRAMS = (("talk", "about"), ("tell", "me"), ("walk", "me"))
+_SENTENCE_SPLIT_RE = re.compile(r"[.?!;:]+")
+
 TAG_PATTERNS = (
     re.compile(r"(?:^|\W)right\?$"),
     re.compile(r"(?:^|\W)you know\?$"),
@@ -107,13 +146,73 @@ def _is_vocative(text: str) -> bool:
     # "Hey Sarah, ..." / "Hey Sarah can you ..."
     if re.match(r"^(?i:hey)\s+[A-Z][A-Za-z'-]+\b", stripped):
         return True
-    # "Sarah, can you ..." (capitalized token in explicit vocative position).
-    return bool(
-        re.match(
-            r"^[A-Z][A-Za-z'-]+\s*,\s*(?i:can|could|would|will|do|did|are|have)\s+(?i:you)\b",
-            stripped,
-        )
+    # "Sarah, can you ..." / "Sarah, tell me ..." (capitalized token in
+    # explicit vocative position, followed by a modal-you or an imperative).
+    match = re.match(
+        r"^([A-Z][A-Za-z'-]+)\s*,\s*"
+        r"(?:(?i:can|could|would|will|do|did|are|have)\s+(?i:you)\b"
+        r"|(?i:please\s+)?(?i:tell|talk|explain|walk|describe|give)\b)",
+        stripped,
     )
+    if match is None:
+        return False
+    # Whisper capitalizes every sentence start, so a leading discourse marker
+    # ("Okay, can you explain the CAP theorem.") is indistinguishable here from
+    # a name in vocative position. Known question lead-ins are never names --
+    # let those fall through so the semantic gate judges them instead.
+    return match.group(1).casefold() not in QUESTION_PREFIXES
+
+
+def _is_imperative_request(text: str, compact: str) -> bool:
+    """Whether the utterance is a command-form ask ("Talk about X.")."""
+    if compact.rstrip(".?! ") in _IMPERATIVE_IDIOMS:
+        return False
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        tokens = [token.lower() for token in words(sentence)]
+        start = 0
+        while start < len(tokens) and (
+            tokens[start] in QUESTION_PREFIXES or tokens[start] == "please"
+        ):
+            start += 1
+        if start < len(tokens) and tokens[start] in REQUEST_VERBS:
+            return True
+    # Whisper often drops the boundary entirely ("Evaluation matrix talk
+    # about them"), leaving the request verb mid-stream. A request bigram is
+    # a strong signal there -- unless a plan marker shows the speaker is
+    # narrating an intention rather than asking.
+    tokens = [token.lower() for token in words(text)]
+    if any(token in _PLAN_MARKERS for token in tokens):
+        return False
+    return any(
+        tokens[i : i + 2] == list(bigram)
+        for bigram in _REQUEST_BIGRAMS
+        for i in range(len(tokens) - 1)
+    )
+
+
+def _is_tag_question(compact: str) -> bool:
+    """Whether the utterance is a tag/rhetorical ask, not a real question.
+
+    The tag words themselves ("right?", "okay?") legitimately end genuine
+    interrogatives -- "Is my understanding of the GIL right?" -- so matching a
+    TAG_PATTERN alone is not enough. What separates the rhetorical form is
+    what precedes the tag: either a finished statement set off by a comma
+    ("Should we deploy on Friday, okay?"), or nothing of substance at all
+    ("Am I right?", "Do you know what I mean?" -- pure function words).
+    """
+    for pattern in TAG_PATTERNS:
+        match = pattern.search(compact)
+        if match is None:
+            continue
+        remainder = compact[: match.start()].rstrip()
+        if remainder.endswith(","):
+            return True
+        if all(
+            token in STOPWORDS or token in FILLERS or token in INTERROGATIVES
+            for token in words(remainder)
+        ):
+            return True
+    return False
 
 
 def heuristic_decision(
@@ -128,17 +227,30 @@ def heuristic_decision(
         return StageADecision("reject", "too_few_words")
     if lowered and all(token in FILLERS for token in lowered):
         return StageADecision("reject", "filler_only")
-    compact = re.sub(r"\s+", " ", text.strip().lower())
-    if any(pattern.search(compact) for pattern in TAG_PATTERNS):
-        return StageADecision("reject", "tag_or_rhetorical")
-    if _is_vocative(text):
-        return StageADecision("reject", "human_vocative")
+    # Dedupe MUST stay ahead of the fast-accept below: the fast-accept is
+    # deliberately exempt from answer-echo suppression but NOT from verbatim
+    # re-ask dedupe, so a re-asked question has to be caught here first.
     for previous in recent_answered:
         if token_set_ratio(text, previous) >= dedupe_ratio:
             return StageADecision("reject", "near_duplicate")
-    # This MUST precede the content-word rule. A well-formed short question such
-    # as "How are you?" or "What is it?" is almost entirely stopwords, and would
-    # otherwise be discarded as contentless.
+    # Tags are judged before the fast-accept: a pure tag ("Am I right?",
+    # "Do you know what I mean?") is interrogative-shaped and would sail
+    # through it, yet answering the interviewer's rhetorical check-in is
+    # exactly the noise this rule exists to stop. _is_tag_question exempts
+    # real questions that merely END in a tag word, so nothing the
+    # fast-accept should take is lost to it.
+    compact = re.sub(r"\s+", " ", text.strip().lower())
+    if _is_tag_question(compact):
+        return StageADecision("reject", "tag_or_rhetorical")
+    # The fast-accept precedes the vocative reject and the content-word rule.
+    # The vocative check keys on the first token, so "Okay, can you explain
+    # the CAP theorem?" would otherwise be rejected without ever reading the
+    # question -- and a short question such as "How are you?" or "What is
+    # it?" is almost entirely stopwords, and would be discarded as
+    # contentless. The _is_vocative guard keeps names that casefold into
+    # INTERROGATIVES from slipping through: "Will, can you review this?" is
+    # addressed to Will, not to the assistant, and must reach the vocative
+    # handling below whatever the first word looks like.
     question_start = 0
     while (
         question_start < len(lowered)
@@ -149,8 +261,25 @@ def heuristic_decision(
         text.rstrip().endswith("?")
         and question_start < len(lowered)
         and lowered[question_start] in INTERROGATIVES
+        and not _is_vocative(text)
     ):
         return StageADecision("accept", "explicit_interrogative")
+    # Command-form asks carry no '?' and no interrogative, so on an
+    # "explicit"-policy channel they were structurally unanswerable -- yet
+    # "Talk about evaluation metrics." is as direct as a request gets, and a
+    # deliberate re-articulation of one ("Evaluation metrics. Talk about
+    # them.") must not die the same death twice. A trailing fragment word
+    # disqualifies it: "So, tell me about" is a request CUT OFF mid-sentence,
+    # and accepting the stub would answer a question with no object -- the
+    # merge layer holds it until the rest arrives.
+    if (
+        lowered[-1] not in TRAILING_FRAGMENT_WORDS
+        and not _is_vocative(text)
+        and _is_imperative_request(text, compact)
+    ):
+        return StageADecision("accept", "imperative_request")
+    if _is_vocative(text):
+        return StageADecision("reject", "human_vocative")
     # A dangling function word means the speaker was cut off mid-thought
     # ("so tell me about", "how you manage context in"). Never gate these on
     # their own -- they belong to the utterance that follows.
@@ -257,10 +386,36 @@ class AnsweredQuestions:
         self._prune(now)
         self._items.append((now, text))
 
-    def texts(self, timestamp: float | None = None) -> list[str]:
+    def texts(
+        self,
+        timestamp: float | None = None,
+        within: float | None = None,
+    ) -> list[str]:
         now = time.time() if timestamp is None else timestamp
         self._prune(now)
-        return [text for _, text in self._items]
+        return [
+            text
+            for ts, text in self._items
+            if within is None or now - ts <= within
+        ]
+
+    def best_ratio(
+        self,
+        text: str,
+        timestamp: float | None = None,
+        within: float | None = None,
+    ) -> float:
+        """Highest similarity between *text* and a recently answered question."""
+        now = time.time() if timestamp is None else timestamp
+        self._prune(now)
+        return max(
+            (
+                token_set_ratio(text, answered)
+                for ts, answered in self._items
+                if within is None or now - ts <= within
+            ),
+            default=0.0,
+        )
 
 
 class OllamaGate:
@@ -358,10 +513,38 @@ class OllamaGate:
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": "Classify: hello there"},
         ]
+        # The verified first model load takes about 67 seconds. Normal gate
+        # requests retain the short configurable timeout; startup warmup does
+        # not. That long request must NOT run via to_thread: Task.cancel cannot
+        # interrupt a running executor future, and asyncio.run joins the default
+        # executor on exit, so quitting during a cold Ollama load would keep the
+        # process alive for up to the full 90s after the UI is gone. A daemon
+        # thread signalling back into the loop keeps this await cancellable, and
+        # a daemon cannot block interpreter exit.
+        loop = asyncio.get_running_loop()
+        done = asyncio.Event()
+        failures: list[BaseException] = []
+
+        def _request() -> None:
+            try:
+                self._post(self._body(messages), 90.0)
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                try:
+                    loop.call_soon_threadsafe(done.set)
+                except RuntimeError:
+                    # Loop already closed: warmup was cancelled and the process
+                    # is exiting. Nobody is waiting on this result any more.
+                    pass
+
         try:
-            # The verified first model load takes about 67 seconds. Normal gate
-            # requests retain the short configurable timeout; startup warmup does not.
-            await asyncio.to_thread(self._post, self._body(messages), 90.0)
+            threading.Thread(
+                target=_request, name="ollama-warmup", daemon=True
+            ).start()
+            await done.wait()
+            if failures:
+                raise failures[0]
             self.available = True
             return True
         except (OSError, urllib.error.URLError, TimeoutError, ValueError) as exc:
@@ -415,6 +598,16 @@ class OllamaGate:
             return False, ""
 
 
+# A statement overlapping a question answered this recently is treated as a
+# RETRY of it, not narration. The horizon is generous (read the bad answer,
+# sigh, rephrase) but bounded: resemblance to something answered minutes ago
+# is topical overlap, not a retry. The ratio is deliberately much lower than
+# dedupe_ratio -- a retry rephrases and corrects, and the correction is the
+# part that differs ("prompt engineering" for "prompt injection").
+REASK_HORIZON_S = 90.0
+REASK_RATIO = 0.5
+
+
 class QuestionGate:
     def __init__(
         self,
@@ -435,6 +628,21 @@ class QuestionGate:
     def set_profile(self, profile: Profile | None) -> None:
         self.ollama.set_profile(profile)
 
+    async def _semantic(
+        self, transcript: Transcript, context: list[str]
+    ) -> tuple[bool, str, StageADecision]:
+        accepted, query = await self.ollama.classify(transcript.text, context)
+        return (
+            accepted,
+            query,
+            StageADecision(
+                "accept" if accepted else "reject",
+                "ollama_accept"
+                if accepted
+                else ("ollama_reject" if self.ollama.available else "ollama_unavailable"),
+            ),
+        )
+
     async def evaluate(
         self,
         transcript: Transcript,
@@ -447,10 +655,29 @@ class QuestionGate:
         stage_a = heuristic_decision(
             transcript.text,
             self.config.min_words,
-            self.answered.texts(transcript.timestamp),
+            # Only questions answered within the cooldown count as duplicates:
+            # past it, an almost-identical question is a deliberate re-ask
+            # (the first answer missed) and deserves a fresh answer.
+            self.answered.texts(
+                transcript.timestamp, within=self.config.reask_cooldown_s
+            ),
             self.config.dedupe_ratio,
         )
-        if stage_a.outcome == "reject":
+        if (
+            stage_a.outcome == "reject"
+            and stage_a.reason == "human_vocative"
+            and policy == "full"
+        ):
+            # On a full-policy channel a vocative is usually the interviewer
+            # addressing the CANDIDATE by name -- "Aakash, can you explain
+            # decorators?" is the exact question this tool exists to answer, so
+            # a hard reject here would eat the core scenario. Consult the
+            # semantic gate instead: its prompt already returns FALSE for
+            # questions aimed at another human. On the mic channel the hard
+            # reject stands, because the user hailing someone by name is
+            # definitionally talking to another human.
+            accepted, query, stage_a = await self._semantic(transcript, context)
+        elif stage_a.outcome == "reject":
             accepted, query = False, ""
         elif stage_a.outcome == "accept":
             # An explicit interrogative is deliberately exempt: if the user really
@@ -458,11 +685,30 @@ class QuestionGate:
             # Verbatim re-asking is already caught by near-duplicate dedupe.
             accepted, query = True, transcript.text
         elif policy == "explicit" and not is_question_shaped(transcript.text):
-            # Never let the semantic gate rewrite a statement on this channel.
-            # Stage A already passed anything shaped like a real interrogative,
-            # so what reaches here is declarative -- narration, not an ask.
-            accepted, query = False, ""
-            stage_a = StageADecision("reject", "not_a_direct_question")
+            if (
+                self.answered.best_ratio(
+                    transcript.text, transcript.timestamp, within=REASK_HORIZON_S
+                )
+                >= REASK_RATIO
+            ):
+                # A statement that substantially overlaps a question answered
+                # moments ago is the user RE-ASKING -- the first answer missed
+                # (a mishearing, the wrong angle) and retries rarely carry
+                # fresh question intonation ("no, prompt engineering...").
+                # Accepted OUTRIGHT rather than sent to the semantic gate: a
+                # retry is usually phrased as a correction or a plan, which the
+                # gate prompt is trained to call narration and reject. The
+                # answerer sees the prior exchange through its Q&A history and
+                # is the judge that can actually resolve what changed.
+                accepted, query = True, transcript.text
+                stage_a = StageADecision("accept", "reask_of_recent")
+            else:
+                # Never let the semantic gate rewrite a statement on this
+                # channel. Stage A already passed anything shaped like a real
+                # interrogative, so what reaches here is declarative --
+                # narration, not an ask.
+                accepted, query = False, ""
+                stage_a = StageADecision("reject", "not_a_direct_question")
         elif (
             self.config.answer_echo_ratio > 0
             and not has_need_marker(transcript.text)
@@ -474,13 +720,7 @@ class QuestionGate:
             accepted, query = False, ""
             stage_a = StageADecision("reject", "answer_echo")
         else:
-            accepted, query = await self.ollama.classify(transcript.text, context)
-            stage_a = StageADecision(
-                "accept" if accepted else "reject",
-                "ollama_accept"
-                if accepted
-                else ("ollama_reject" if self.ollama.available else "ollama_unavailable"),
-            )
+            accepted, query, stage_a = await self._semantic(transcript, context)
         latency = (time.perf_counter() - started) * 1000
         return GateResult(transcript, accepted, stage_a.reason, query, latency)
 

@@ -1,38 +1,37 @@
-"""WASAPI device discovery and low-cost, concurrent level probes."""
+"""Backend-neutral device discovery and low-cost, concurrent level probes."""
 
 from __future__ import annotations
 
 import math
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Literal, Protocol
+from typing import Callable, Protocol
 
 import numpy as np
 from numpy.typing import NDArray
 
-from .audio import _pyaudio_module
+from .backends.base import (
+    AudioBackend,
+    BackendSession,
+    CaptureDevice,
+    DeviceKind,
+    SourceStream,
+)
 
-DeviceKind = Literal["mic", "loopback"]
-
-
-@dataclass(frozen=True, slots=True)
-class AudioDevice:
-    index: int
-    name: str
-    kind: DeviceKind
-    channels: int
-    sample_rate: int
-
-    @property
-    def key(self) -> tuple[DeviceKind, int]:
-        return self.kind, self.index
-
-    @property
-    def display_name(self) -> str:
-        if self.kind == "mic" and "nvidia broadcast" in self.name.casefold():
-            return f"{self.name} (NVIDIA Broadcast - noise removal)"
-        return self.name
+__all__ = [
+    "AudioDeviceSession",
+    "CaptureDevice",
+    "DeviceKind",
+    "DeviceMeterPool",
+    "MeterReading",
+    "MeterSession",
+    "amplitude_to_db",
+    "calculate_levels",
+    "level_to_bar",
+    "short_error",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,60 +51,12 @@ class MeterReading:
 
 
 class MeterSession(Protocol):
-    devices: list[AudioDevice]
+    devices: list[CaptureDevice]
     active_mic: str
     active_loopback: str
 
-    def snapshot(self, width: int = 18) -> dict[tuple[DeviceKind, int], MeterReading]: ...
+    def snapshot(self, width: int = 18) -> dict[tuple[str, str], MeterReading]: ...
     def close(self) -> None: ...
-
-
-def classify_capture_devices(
-    raw_devices: Iterable[dict[str, Any]],
-    wasapi_host_index: int,
-) -> list[AudioDevice]:
-    """Return WASAPI non-loopback inputs followed by loopback endpoints."""
-
-    microphones: list[AudioDevice] = []
-    loopbacks: list[AudioDevice] = []
-    seen: set[tuple[DeviceKind, int]] = set()
-    for raw in raw_devices:
-        if int(raw.get("hostApi", -1)) != wasapi_host_index:
-            continue
-        is_loopback = bool(raw.get("isLoopbackDevice", False))
-        channels = int(raw.get("maxInputChannels", 0))
-        if not is_loopback and channels <= 0:
-            continue
-        kind: DeviceKind = "loopback" if is_loopback else "mic"
-        device = AudioDevice(
-            index=int(raw["index"]),
-            name=str(raw.get("name", f"Device {raw['index']}")),
-            kind=kind,
-            channels=max(1, channels),
-            sample_rate=max(1, int(float(raw.get("defaultSampleRate", 48000)))),
-        )
-        if device.key in seen:
-            continue
-        seen.add(device.key)
-        (loopbacks if is_loopback else microphones).append(device)
-    return microphones + loopbacks
-
-
-def list_wasapi_capture_devices(
-    audio_factory: Callable[[], Any] | None = None,
-) -> list[AudioDevice]:
-    pyaudio = _pyaudio_module()
-    audio = (audio_factory or pyaudio.PyAudio)()
-    try:
-        wasapi = dict(audio.get_host_api_info_by_type(pyaudio.paWASAPI))
-        raw_devices = []
-        for index in range(audio.get_device_count()):
-            item = dict(audio.get_device_info_by_index(index))
-            item["index"] = index
-            raw_devices.append(item)
-        return classify_capture_devices(raw_devices, int(wasapi["index"]))
-    finally:
-        audio.terminate()
 
 
 def calculate_levels(samples: NDArray[np.float32]) -> tuple[float, float]:
@@ -132,13 +83,17 @@ def level_to_bar(amplitude: float, width: int = 18, floor_db: float = -60.0) -> 
 
 
 def short_error(error: BaseException, limit: int = 72) -> str:
-    message = str(error).splitlines()[0].strip() or error.__class__.__name__
+    # splitlines() on an empty message is [], not [""]; exceptions raised with
+    # no args must still fall through to the class name instead of crashing
+    # the very error path this exists to describe.
+    lines = str(error).splitlines()
+    message = (lines[0].strip() if lines else "") or error.__class__.__name__
     return message if len(message) <= limit else message[: limit - 1] + "…"
 
 
 @dataclass(slots=True)
 class _ProbeState:
-    stream: Any | None = None
+    stream: SourceStream | None = None
     pending_peak: float = 0.0
     latest_rms: float = 0.0
     held_peak: float = 0.0
@@ -147,21 +102,20 @@ class _ProbeState:
 
 
 class DeviceMeterPool:
-    """Open and meter every endpoint concurrently using ordinary shared streams."""
+    """Open and meter every endpoint concurrently through one backend session."""
 
     def __init__(
         self,
-        devices: list[AudioDevice],
+        devices: list[CaptureDevice],
+        session: BackendSession,
         *,
-        audio_factory: Callable[[], Any] | None = None,
         frames_per_buffer: int = 480,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.devices = devices
+        self.session = session
         self.frames_per_buffer = frames_per_buffer
-        self._audio_factory = audio_factory
         self._clock = clock
-        self._audio: Any | None = None
         self._states = {device.key: _ProbeState() for device in devices}
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
@@ -169,52 +123,47 @@ class DeviceMeterPool:
 
     def start(self) -> None:
         self._stop.clear()
-        try:
-            pyaudio = _pyaudio_module()
-            factory = self._audio_factory or pyaudio.PyAudio
-            self._audio = factory()
-        except Exception as exc:
-            reason = short_error(exc)
-            for state in self._states.values():
-                state.unavailable = reason
-            return
-
         for device in self.devices:
             state = self._states[device.key]
             try:
-                # No host-API stream-info is supplied: WASAPI therefore stays in
-                # shared mode and coexists with NVIDIA Broadcast and other apps.
-                state.stream = self._audio.open(
-                    format=pyaudio.paFloat32,
-                    channels=device.channels,
-                    rate=device.sample_rate,
-                    input=True,
-                    input_device_index=device.index,
-                    frames_per_buffer=self.frames_per_buffer,
-                )
+                state.stream = self.session.open(device)
             except Exception as exc:
                 state.unavailable = short_error(exc)
                 continue
-            thread = threading.Thread(
-                target=self._read_device,
-                args=(device, state),
-                name=f"ambientqa-meter-{device.index}",
-                daemon=True,
-            )
-            thread.start()
+            try:
+                thread = threading.Thread(
+                    target=self._read_device,
+                    args=(device, state),
+                    name=f"ambientqa-meter-{device.id}",
+                    daemon=True,
+                )
+                thread.start()
+            except Exception as exc:
+                # Thread creation failing (resource exhaustion) must not
+                # propagate: the caller would never receive the pool, so
+                # close() -- the only path that releases the streams already
+                # opened above -- would be unreachable and every one of them
+                # (a live parec child per device on Linux) would leak.
+                state.unavailable = short_error(exc)
+                with suppress(Exception):
+                    state.stream.stop()
+                with suppress(Exception):
+                    state.stream.close()
+                state.stream = None
+                continue
             self._threads.append(thread)
 
-    def _read_device(self, device: AudioDevice, state: _ProbeState) -> None:
-        assert state.stream is not None
+    def _read_device(self, device: CaptureDevice, state: _ProbeState) -> None:
+        stream = state.stream
+        assert stream is not None
         try:
             while not self._stop.is_set():
-                raw = state.stream.read(
-                    self.frames_per_buffer, exception_on_overflow=False
-                )
-                samples = np.frombuffer(raw, dtype=np.float32)
-                if device.channels > 1:
-                    complete = samples.size - samples.size % device.channels
-                    samples = samples[:complete].reshape(-1, device.channels).mean(axis=1)
+                samples = stream.read(self.frames_per_buffer)
+                if stream.channels > 1:
+                    complete = samples.size - samples.size % stream.channels
+                    samples = (
+                        samples[:complete].reshape(-1, stream.channels).mean(axis=1)
+                    )
                 peak, rms = calculate_levels(samples)
                 with self._lock:
                     state.pending_peak = max(state.pending_peak, peak)
@@ -226,9 +175,9 @@ class DeviceMeterPool:
 
     def snapshot(
         self, width: int = 18
-    ) -> dict[tuple[DeviceKind, int], MeterReading]:
+    ) -> dict[tuple[str, str], MeterReading]:
         now = self._clock()
-        readings: dict[tuple[DeviceKind, int], MeterReading] = {}
+        readings: dict[tuple[str, str], MeterReading] = {}
         with self._lock:
             for key, state in self._states.items():
                 if state.unavailable is not None:
@@ -251,7 +200,7 @@ class DeviceMeterPool:
         for state in self._states.values():
             if state.stream is not None:
                 try:
-                    state.stream.stop_stream()
+                    state.stream.stop()
                 except Exception:
                     pass
         for thread in self._threads:
@@ -264,17 +213,16 @@ class DeviceMeterPool:
                 except Exception:
                     pass
                 state.stream = None
-        if self._audio is not None:
-            try:
-                self._audio.terminate()
-            finally:
-                self._audio = None
+        try:
+            self.session.close()
+        except Exception:
+            pass
 
 
 class AudioDeviceSession:
     def __init__(
         self,
-        devices: list[AudioDevice],
+        devices: list[CaptureDevice],
         meter: DeviceMeterPool,
         *,
         active_mic: str = "",
@@ -288,12 +236,13 @@ class AudioDeviceSession:
     @classmethod
     def open(
         cls,
+        backend: AudioBackend,
         *,
         active_mic: str = "",
         active_loopback: str = "",
     ) -> AudioDeviceSession:
-        devices = list_wasapi_capture_devices()
-        meter = DeviceMeterPool(devices)
+        devices = backend.list_devices()
+        meter = DeviceMeterPool(devices, backend.open_session())
         meter.start()
         return cls(
             devices,
@@ -304,7 +253,7 @@ class AudioDeviceSession:
 
     def snapshot(
         self, width: int = 18
-    ) -> dict[tuple[DeviceKind, int], MeterReading]:
+    ) -> dict[tuple[str, str], MeterReading]:
         return self.meter.snapshot(width)
 
     def close(self) -> None:

@@ -14,6 +14,12 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
 
 @dataclass(slots=True)
 class AudioConfig:
+    # Which capture stack feeds the pipeline. "auto" picks the platform's
+    # native one -- WASAPI (pyaudiowpatch) on Windows, PipeWire (pactl/parec)
+    # elsewhere. Explicit values exist for the odd setup (e.g. PipeWire's
+    # pulse compatibility on a system this never auto-detects), not for
+    # day-to-day use.
+    backend: str = "auto"
     mic_device: str = ""
     output_device: str = ""
     sample_rate: int = 16000
@@ -41,15 +47,19 @@ class STTConfig:
     hallucination_blocklist: list[str] | None = None
 
     def __post_init__(self) -> None:
+        # Matched EXACTLY against the normalised whole transcript, never by
+        # prefix -- prefix matching silently ate real speech ("Thank you. So,
+        # tell me about..."), so every entry must be the full utterance
+        # Whisper hallucinates on silence.
         if self.hallucination_blocklist is None:
             self.hallucination_blocklist = [
                 "thank you",
-                "thank you.",
+                "thank you very much",
+                "thank you so much",
+                "thank you for watching",
                 "thanks for watching",
-                "thanks for watching!",
                 "please subscribe",
-                "subtitles by",
-                "captioning by",
+                "subtitles by the amara org community",
             ]
 
 
@@ -68,6 +78,13 @@ class GateConfig:
     context_turns: int = 6
     dedupe_window_s: float = 300.0
     dedupe_ratio: float = 0.85
+    # A near-duplicate of an already-answered question inside this window is a
+    # mechanical duplicate (Whisper re-emission, a merge artifact) and is
+    # dropped. Beyond it, an almost-identical question is a human deliberately
+    # re-asking -- usually because the first answer missed (mishearing, wrong
+    # angle) -- and must be ANSWERED, not deduped. Mechanical dupes arrive
+    # within ~5s; a human needs a few seconds to read an answer and try again.
+    reask_cooldown_s: float = 8.0
     echo_window_s: float = 2.0
     echo_ratio: float = 0.85
     # Reading a recent answer back aloud (rehearsing it) must not be treated as a
@@ -108,13 +125,16 @@ class MergeConfig:
     # People pause for longer than feels intuitive when thinking mid-sentence.
     # These only delay utterances that look UNFINISHED; a complete question is
     # still gated immediately, so raising them costs nothing in the common case.
-    merge_gap_s: float = 4.5
+    # Measured miss at 4.5/9.0: a trailed-off premise ("So if the content
+    # you're searching keeps changing...") followed ~5s later by its question
+    # stayed unmerged, so the gate saw only the second half.
+    merge_gap_s: float = 6.5
     # How long to HOLD an unfinished utterance in wall-clock time. This must
     # outlast merge_gap_s PLUS the spoken length of the continuation PLUS its
     # transcription latency -- otherwise the hold expires before the continuation
     # is even transcribed. A 3.5s pause really costs ~4.2s of wall clock, so a
     # window merely equal to the gap silently never merges.
-    merge_window_s: float = 9.0
+    merge_window_s: float = 13.0
     max_merge_parts: int = 5
     max_merge_s: float = 25.0
 
@@ -144,6 +164,33 @@ class AnswerConfig:
     web_lookup: str = "auto"
     answer_timeout_s: float = 45.0
     context_turns: int = 6
+    # Completed question/answer pairs carried into every new answer prompt, so
+    # follow-ups resolve against what was actually said: "elaborate on the
+    # second method" needs the answer that listed the methods, which the raw
+    # transcript never contains. 0 disables the history block entirely.
+    history_turns: int = 8
+    # Second pass over every delivered answer: an auditor with a wider
+    # transcript window and the full Q&A history re-reads it AFTER it is on
+    # screen (the first answer's latency is untouched) and replaces it on the
+    # card only when it is materially wrong -- a missed constraint, a
+    # misheard question, a dropped enumeration item. Style is never grounds:
+    # a correction that lands ~8s late is only worth the distraction when the
+    # first answer would have misled. "always" | "off".
+    verify: str = "always"
+    # The auditor sees more transcript than the first pass deliberately: what
+    # it exists to catch is context the fast path missed.
+    verify_context_turns: int = 18
+    # The verify audit above only reviews answers that EXIST. A question the
+    # gate wrongly rejected produces nothing to audit, so a sweeper
+    # periodically hands the recent judgment-stage rejections plus wide
+    # transcript context to a model and asks which were genuine asks; the
+    # catches come back as late answer cards through the normal answer path
+    # (streaming, audit and all). "always" | "off".
+    sweep: str = "always"
+    sweep_interval_s: float = 25.0
+    # The sweep is a small classification, so a fast cheap model is the right
+    # default; empty falls back to answer_model.
+    sweep_model: str = "claude-haiku-4-5"
     queue_size: int = 16
 
 
@@ -152,6 +199,9 @@ class UIConfig:
     show_transcripts: bool = True
     log_dir: str = "logs"
     status_interval_s: float = 0.5
+    # "top" mounts each new entry above the rest and pins the view to it;
+    # "bottom" appends chronologically like a chat log.
+    feed_direction: str = "top"
 
 
 @dataclass(slots=True)
@@ -177,6 +227,8 @@ def _section(cls: type[T], values: dict[str, Any], name: str) -> T:
 
 
 def validate_config(config: Config) -> Config:
+    if config.audio.backend not in {"auto", "wasapi", "pipewire"}:
+        raise ValueError('audio.backend must be "auto", "wasapi", or "pipewire"')
     if config.audio.sample_rate != 16000:
         raise ValueError("audio.sample_rate must be 16000 for Silero VAD and Whisper")
     if not 20 <= config.audio.frame_ms <= 30:
@@ -212,6 +264,18 @@ def validate_config(config: Config) -> Config:
             raise ValueError(f"{name} must be at least 1")
     if config.gate.min_words < 1:
         raise ValueError("gate.min_words must be at least 1")
+    if config.answer.history_turns < 0:
+        raise ValueError("answer.history_turns must be at least 0")
+    if config.answer.verify not in {"off", "always"}:
+        raise ValueError('answer.verify must be "off" or "always"')
+    if config.answer.verify_context_turns < 1:
+        raise ValueError("answer.verify_context_turns must be at least 1")
+    if config.answer.sweep not in {"off", "always"}:
+        raise ValueError('answer.sweep must be "off" or "always"')
+    if config.answer.sweep_interval_s <= 0:
+        raise ValueError("answer.sweep_interval_s must be greater than 0")
+    if config.gate.reask_cooldown_s < 0:
+        raise ValueError("gate.reask_cooldown_s must be at least 0")
     if not 0 <= config.gate.dedupe_ratio <= 1:
         raise ValueError("gate.dedupe_ratio must be between 0 and 1")
     if config.merge.merge_gap_s < 0:
@@ -228,6 +292,8 @@ def validate_config(config: Config) -> Config:
         raise ValueError('answer.web_lookup must be "off", "auto", or "always"')
     if config.audio.silent_source_warn_s <= 0:
         raise ValueError("audio.silent_source_warn_s must be greater than 0")
+    if config.ui.feed_direction not in {"top", "bottom"}:
+        raise ValueError('ui.feed_direction must be "top" or "bottom"')
     return config
 
 

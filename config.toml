@@ -1,13 +1,26 @@
 # Ambient Q&A default configuration.
 # Device names are case-insensitive substrings; leave blank to use Windows defaults.
 [audio]
-mic_device = "USB Advanced Audio Device"
+# Case-insensitive substring of the microphone to pin, matched against the
+# device description (and on Linux also the PipeWire source name, e.g.
+# "alsa_input...."). Leave BLANK (recommended): blank opens the platform's
+# default source first and falls back through the rest, so an unplugged headset
+# never kills capture. A pinned name that matches nothing is a hard error —
+# guessing a microphone records the wrong room. Capture goes through PipeWire's
+# multiplexed sources on Linux, so the mic stays available to every other app.
+#
+# "ec_mic" is the WebRTC-processed source run.sh loads (noise suppression +
+# automatic gain control over the USB mic). The raw source runs hot enough to
+# clip loud speech, which is what garbled transcription; if ec_mic is ever
+# missing, the app reports the mic unavailable -- press d and pick the raw
+# device, or rerun run.sh to reload the module.
+mic_device = "Echo-cancelled_Microphone"
 # Leave BLANK (recommended). Blank opens every loopback endpoint at once and
 # follows whichever one is actually carrying speech, so it does not matter
 # whether today's call plays through the headset, the monitor or the speakers.
 # Naming one endpoint pins it: if the call plays anywhere else the loopback opens
 # perfectly happily on silence and the other speaker is never heard at all.
-output_device = ""
+output_device = "Monitor of Starship/Matisse HD Audio Controller Analog Stereo"
 # The VAD and Whisper pipeline requires 16 kHz mono audio.
 sample_rate = 16000
 # Capture frames must remain in the 20–30 ms range.
@@ -31,13 +44,17 @@ cpu_compute_type = "int8"
 queue_size = 12
 # Empty means automatic language detection.
 language = ""
-# Exact normalized phrases to discard as common silence hallucinations.
+# Discarded when the normalized transcript EXACTLY equals an entry (never a
+# prefix -- prefix matching ate real openers like "Thank you. So, tell me...").
+# List the full utterances Whisper hallucinates on silence.
 hallucination_blocklist = [
   "Thank you.",
+  "Thank you very much.",
+  "Thank you so much.",
+  "Thank you for watching.",
   "Thanks for watching!",
   "Please subscribe",
-  "Subtitles by",
-  "Captioning by",
+  "Subtitles by the Amara.org community",
 ]
 
 [context]
@@ -47,6 +64,10 @@ enabled = true
 profile = "profiles/genai-engineer-interview.md"
 
 [gate]
+# The gate prompt was engineered against gemma4:e2b; qwen2.5:3b (the earlier
+# stand-in) measurably flips on real questions when the transcript context
+# block is present. Warm latency here: ~600ms. First load is ~67s -- startup
+# warmup covers it.
 model = "gemma4:e2b"
 ollama_url = "http://127.0.0.1:11434/api/chat"
 # strict, balanced, or eager
@@ -84,10 +105,11 @@ request_timeout_s = 8.0
 [merge]
 # Hold probable mid-sentence fragments and gate only the coalesced thought.
 enabled = true
-# Maximum audio-time gap between same-channel fragments.
-merge_gap_s = 4.5
+# Maximum audio-time gap between same-channel fragments. People pause ~5s to
+# think between a trailed-off setup and the question that continues it.
+merge_gap_s = 6.5
 # How long an open thought waits for another fragment.
-merge_window_s = 9.0
+merge_window_s = 13.0
 # Safety caps prevent indefinite merging during long or noisy speech.
 max_merge_parts = 5
 max_merge_s = 25.0
@@ -121,3 +143,6 @@ queue_size = 16
 show_transcripts = true
 log_dir = "logs"
 status_interval_s = 0.5
+# "top" shows the newest entry first and pins the view to it; "bottom" appends
+# chronologically like a chat log.
+feed_direction = "top"

@@ -26,10 +26,19 @@ def is_open_utterance(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return False
+    probe = stripped.rstrip(_CLOSING_MARKS).rstrip()
+    # A terminal '?' or '!' means the thought is finished no matter what the
+    # last word is: English questions legitimately strand a preposition ("What
+    # are you working on?"), and treating those as open parked a complete
+    # question in the merge window for the whole hold -- or glued it onto the
+    # interviewer's next sentence, destroying the '?' fast-accept downstream.
+    # '.' earns no such trust: Whisper invents a period at every VAD boundary,
+    # so "so tell me about." must stay open.
+    if probe.endswith(("?", "!")):
+        return False
     tokens = words(stripped)
     if tokens and tokens[-1].lower() in TRAILING_FRAGMENT_WORDS:
         return True
-    probe = stripped.rstrip(_CLOSING_MARKS).rstrip()
     if probe.endswith(",") or probe.endswith(tuple(_OPEN_DASHES)):
         return True
     return not probe.endswith(tuple(_TERMINAL_PUNCTUATION))
@@ -55,10 +64,11 @@ def join_fragments(left: str, right: str) -> str:
     if not right_clean:
         return left_clean
 
-    # Whisper commonly invents a full stop at every VAD boundary. A pending
-    # fragment has already been identified as open, so that stop is not semantic.
-    left_clean = re.sub(r"\.+$", "", left_clean).rstrip()
-    right_clean = re.sub(r"^\.+\s*", "", right_clean)
+    # Whisper commonly invents a full stop -- or a trailing-off ellipsis -- at
+    # every VAD boundary. A pending fragment has already been identified as
+    # open, so that punctuation is not semantic.
+    left_clean = re.sub(r"[.…]+$", "", left_clean).rstrip()
+    right_clean = re.sub(r"^[.…]+\s*", "", right_clean)
     if not left_clean:
         return right_clean
     if not right_clean:

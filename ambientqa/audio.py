@@ -1,4 +1,4 @@
-"""Non-blocking microphone and WASAPI loopback capture."""
+"""Non-blocking microphone and system-audio capture over a platform backend."""
 
 from __future__ import annotations
 
@@ -7,139 +7,16 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator
+from typing import Callable
 
 import numpy as np
 
+from .backends import get_backend
+from .backends.base import AudioBackend, BackendSession, CaptureDevice, SourceStream
 from .bus import AudioFrame, DropOldestQueue, put_threadsafe
 from .config import AudioConfig
 
 log = logging.getLogger(__name__)
-
-
-def _pyaudio_module() -> Any:
-    try:
-        import pyaudiowpatch as pyaudio
-        return pyaudio
-    except ImportError as exc:
-        raise RuntimeError("pyaudiowpatch is not installed") from exc
-
-
-def iter_devices() -> Iterator[dict[str, Any]]:
-    pyaudio = _pyaudio_module()
-    audio = pyaudio.PyAudio()
-    try:
-        for index in range(audio.get_device_count()):
-            info = dict(audio.get_device_info_by_index(index))
-            info["index"] = index
-            yield info
-    finally:
-        audio.terminate()
-
-
-def list_capture_devices() -> list[dict[str, Any]]:
-    """Return normal input devices plus WASAPI loopback endpoints."""
-    devices = []
-    for info in iter_devices():
-        is_input = int(info.get("maxInputChannels", 0)) > 0
-        is_loopback = bool(info.get("isLoopbackDevice", False))
-        if is_input or is_loopback:
-            info["kind"] = "loopback" if is_loopback else "input"
-            devices.append(info)
-    return devices
-
-
-def _find_input(audio: Any, substring: str) -> dict[str, Any]:
-    pyaudio = _pyaudio_module()
-    wasapi = dict(audio.get_host_api_info_by_type(pyaudio.paWASAPI))
-    if not substring:
-        default_index = int(wasapi.get("defaultInputDevice", -1))
-        if default_index >= 0:
-            return dict(audio.get_device_info_by_index(default_index))
-        return dict(audio.get_default_input_device_info())
-    wanted = substring.casefold()
-    matches = [
-        dict(audio.get_device_info_by_index(index))
-        for index in range(audio.get_device_count())
-        if wanted in str(audio.get_device_info_by_index(index).get("name", "")).casefold()
-        and int(audio.get_device_info_by_index(index).get("maxInputChannels", 0)) > 0
-        and not bool(audio.get_device_info_by_index(index).get("isLoopbackDevice", False))
-    ]
-    if not matches:
-        raise RuntimeError(f"No input device name contains {substring!r}")
-    # Prefer the WASAPI duplicate so both capture sources use the intended host API.
-    wasapi_matches = [
-        item for item in matches if int(item.get("hostApi", -1)) == int(wasapi["index"])
-    ]
-    return (wasapi_matches or matches)[0]
-
-
-def _input_candidates(audio: Any, substring: str) -> list[dict[str, Any]]:
-    selected = _find_input(audio, substring)
-    if substring:
-        return [selected]
-    pyaudio = _pyaudio_module()
-    wasapi = dict(audio.get_host_api_info_by_type(pyaudio.paWASAPI))
-    candidates = [selected]
-    for index in range(audio.get_device_count()):
-        item = dict(audio.get_device_info_by_index(index))
-        if (
-            int(item.get("hostApi", -1)) == int(wasapi["index"])
-            and int(item.get("maxInputChannels", 0)) > 0
-            and not bool(item.get("isLoopbackDevice", False))
-            and int(item["index"]) != int(selected["index"])
-        ):
-            candidates.append(item)
-    return candidates
-
-
-def _default_loopback(audio: Any, loopbacks: list[dict[str, Any]]) -> dict[str, Any]:
-    try:
-        return dict(audio.get_default_wasapi_loopback())
-    except Exception:
-        pass
-    try:
-        output = dict(audio.get_default_output_device_info())
-    except Exception:
-        output = {}
-    name = str(output.get("name", "")).casefold()
-    if name:
-        for item in loopbacks:
-            loop_name = str(item.get("name", "")).casefold()
-            if name in loop_name or loop_name in name:
-                return item
-    if loopbacks:
-        return loopbacks[0]
-    raise RuntimeError("No WASAPI loopback endpoint is available")
-
-
-def _loopback_candidates(
-    audio: Any,
-    substring: str,
-    on_warn: Callable[[str], None] | None = None,
-) -> list[dict[str, Any]]:
-    """Loopback endpoints to open, most likely to carry the call first.
-
-    With no pinned substring this returns EVERY endpoint rather than just the
-    Windows default. Which endpoint a call plays through is not knowable ahead of
-    time -- it moves between headset and speakers, and an app may render to a
-    non-default device regardless of what Windows reports as default. Pinning one
-    guess is how an entire conversation gets captured with the other speaker
-    missing. Opening an idle endpoint costs almost nothing: it delivers silence,
-    and the arbiter forwards only whichever endpoint actually has speech on it.
-    """
-    loopbacks = [dict(item) for item in audio.get_loopback_device_info_generator()]
-    if not loopbacks:
-        raise RuntimeError("No WASAPI loopback endpoint is available")
-    if substring:
-        return [_find_loopback(audio, substring, on_warn)]
-    preferred = _default_loopback(audio, loopbacks)
-    rest = [
-        item
-        for item in loopbacks
-        if int(item.get("index", -1)) != int(preferred.get("index", -1))
-    ]
-    return [preferred, *rest]
 
 
 class LoopbackArbiter:
@@ -158,15 +35,15 @@ class LoopbackArbiter:
     def __init__(self, hold_s: float = 1.5) -> None:
         self.hold_s = hold_s
         self._lock = threading.Lock()
-        self._winner: int | None = None
+        self._winner: str | int | None = None
         self._winner_signal_at = 0.0
 
     @property
-    def winner(self) -> int | None:
+    def winner(self) -> str | int | None:
         with self._lock:
             return self._winner
 
-    def observe(self, source_id: int, rms: float, now: float) -> bool:
+    def observe(self, source_id: str | int, rms: float, now: float) -> bool:
         """Record one endpoint's level; return whether its frames should be used."""
         with self._lock:
             if rms > SIGNAL_RMS:
@@ -179,34 +56,6 @@ class LoopbackArbiter:
             # Before anything has ever spoken every endpoint is forwarding
             # silence, which is harmless and keeps the first word from being lost.
             return self._winner is None or source_id == self._winner
-
-
-def _find_loopback(
-    audio: Any,
-    substring: str,
-    on_warn: Callable[[str], None] | None = None,
-) -> dict[str, Any]:
-    loopbacks = [dict(item) for item in audio.get_loopback_device_info_generator()]
-    if not substring:
-        return _default_loopback(audio, loopbacks)
-    wanted = substring.casefold()
-    matches = [
-        item for item in loopbacks if wanted in str(item.get("name", "")).casefold()
-    ]
-    if matches:
-        return matches[0]
-    # A stale pinned name in config is the most common way this breaks: headsets
-    # and monitors come and go, and the configured endpoint stops existing.
-    # Falling back to the current default output beats raising, because raising
-    # means mic-only, which silently loses the other half of the conversation --
-    # exactly the half worth answering.
-    fallback = _default_loopback(audio, loopbacks)
-    if on_warn is not None:
-        on_warn(
-            f"No loopback device matches {substring!r}; "
-            f"falling back to {fallback.get('name', 'default')!r}"
-        )
-    return fallback
 
 
 # RMS below this is room tone or a muted endpoint, not speech. Chosen well under
@@ -239,25 +88,42 @@ class AudioCapture:
         self,
         config: AudioConfig,
         status_callback: Callable[[str], None] | None = None,
+        backend: AudioBackend | None = None,
     ) -> None:
         self.config = config
         self.status_callback = status_callback or (lambda _message: None)
+        self.backend = backend or get_backend(config)
         self.mic = SourceState("mic")
         self.loopback = SourceState("loopback")
         self._stop = threading.Event()
         self._enabled = threading.Event()
         self._enabled.set()
         self._threads: list[threading.Thread] = []
-        self._audio: Any | None = None
-        self._streams: list[Any] = []
+        self._session: BackendSession | None = None
+        self._streams: list[SourceStream] = []
         self._arbiter: LoopbackArbiter | None = None
         # Several threads share one SourceState when many endpoints feed `sys`.
         # Without a count, the first thread to exit marks the whole channel dead.
         self._runners: dict[str, int] = {}
         self._runner_lock = threading.Lock()
+        # Bumped by every start() and stop(). A capture thread that outlives
+        # stop()'s join timeout would otherwise error out of its stale stream
+        # AFTER the next start() and decrement the NEW session's runner count,
+        # falsely marking a healthy channel dead with a stale error.
+        self._generation = 0
+        # start() and stop() run on executor threads and the callers cannot
+        # guarantee ordering: cancelling the device-picker worker abandons a
+        # stop() that keeps running while the recovery path immediately calls
+        # start(). Unserialised, the abandoned stop() closes the NEW session's
+        # streams under their readers and its generation bump lands after the
+        # new start()'s, deadening the fresh session's accounting. Held for
+        # the whole of either call so overlaps become strict sequences.
+        self._lifecycle_lock = threading.Lock()
 
-    def _enter_source(self, state: SourceState, detail: str) -> None:
+    def _enter_source(self, state: SourceState, detail: str, generation: int) -> bool:
         with self._runner_lock:
+            if generation != self._generation:
+                return False
             count = self._runners.get(state.name, 0)
             self._runners[state.name] = count + 1
             if count == 0:
@@ -265,9 +131,18 @@ class AudioCapture:
                 state.last_signal_at = 0.0
                 state.detail = detail
             state.active = True
+            return True
 
-    def _exit_source(self, state: SourceState, detail: str | None = None) -> None:
+    def _exit_source(
+        self,
+        state: SourceState,
+        detail: str | None = None,
+        *,
+        generation: int,
+    ) -> None:
         with self._runner_lock:
+            if generation != self._generation:
+                return
             count = max(0, self._runners.get(state.name, 1) - 1)
             self._runners[state.name] = count
             if count == 0:
@@ -282,61 +157,61 @@ class AudioCapture:
         *,
         enabled: bool = True,
     ) -> None:
+        with self._lifecycle_lock:
+            self._start_locked(loop, output, enabled=enabled)
+
+    def _start_locked(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        output: DropOldestQueue[AudioFrame],
+        *,
+        enabled: bool = True,
+    ) -> None:
         self._stop.clear()
         self.set_enabled(enabled)
+        with self._runner_lock:
+            self._generation += 1
+            generation = self._generation
         try:
-            pyaudio = _pyaudio_module()
-            self._audio = pyaudio.PyAudio()
+            self._session = self.backend.open_session()
         except Exception as exc:
             self.status_callback(f"Audio capture unavailable: {exc}")
             return
-        sources: list[tuple[str, dict[str, Any], Any]] = []
+        sources: list[tuple[str, CaptureDevice, SourceStream]] = []
         for channel in ("mic", "sys"):
             try:
                 if channel == "mic":
-                    candidates = _input_candidates(self._audio, self.config.mic_device)
+                    candidates = self._session.mic_candidates(
+                        self.config.mic_device, self.status_callback
+                    )
                     # Only one microphone can be the speaker's; the rest are
                     # fallbacks tried in order until one opens.
                     keep_all = False
                 else:
-                    candidates = _loopback_candidates(
-                        self._audio,
-                        self.config.output_device,
-                        self.status_callback,
+                    candidates = self._session.loopback_candidates(
+                        self.config.output_device, self.status_callback
                     )
                     keep_all = len(candidates) > 1
-                opened: list[tuple[dict[str, Any], Any]] = []
+                opened: list[tuple[CaptureDevice, SourceStream]] = []
                 last_error: Exception | None = None
-                for info in candidates:
+                for device in candidates:
                     try:
-                        rate = int(info["defaultSampleRate"])
-                        channels = int(info["maxInputChannels"])
-                        native_frames = max(
-                            1, int(rate * self.config.frame_ms / 1000)
-                        )
-                        stream = self._audio.open(
-                            format=pyaudio.paFloat32,
-                            channels=channels,
-                            rate=rate,
-                            input=True,
-                            input_device_index=int(info["index"]),
-                            frames_per_buffer=native_frames,
-                        )
+                        stream = self._session.open(device)
                     except Exception as exc:
                         # One dead endpoint among many is normal (virtual devices
                         # from Steam, NVIDIA and the like refuse to open). Only a
                         # total failure is worth reporting.
                         last_error = exc
-                        log.debug("Could not open %s device %s: %s", channel, info.get("name"), exc)
+                        log.debug("Could not open %s device %s: %s", channel, device.name, exc)
                         continue
-                    opened.append((info, stream))
+                    opened.append((device, stream))
                     if not keep_all:
                         break
                 if not opened:
                     raise last_error or RuntimeError(f"No usable {channel} device")
-                for info, stream in opened:
+                for device, stream in opened:
                     self._streams.append(stream)
-                    sources.append((channel, info, stream))
+                    sources.append((channel, device, stream))
             except Exception as exc:
                 if channel == "sys":
                     message = f"Loopback unavailable; continuing mic-only: {exc}"
@@ -353,41 +228,62 @@ class AudioCapture:
             self.status_callback(
                 f"sys active: watching {len(loopback_sources)} output endpoints"
             )
-        for channel, info, stream in sources:
+        for channel, device, stream in sources:
             thread = threading.Thread(
                 target=self._capture_source,
-                args=(channel, info, stream, loop, output, self._arbiter),
-                name=f"ambientqa-{channel}-{info.get('index')}",
+                args=(channel, device, stream, loop, output, self._arbiter, generation),
+                name=f"ambientqa-{channel}-{device.id}",
                 daemon=True,
             )
             thread.start()
             self._threads.append(thread)
 
     def stop(self) -> None:
+        # _stop is set before taking the lifecycle lock so that a stop racing a
+        # long start() begins winding the new session down the moment start()
+        # releases the lock, rather than letting its capture run on.
         self._stop.set()
+        with self._lifecycle_lock:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
+        self._stop.set()
+        # Stop every stream FIRST: a thread wedged in a blocking read() never
+        # observes _stop on its own, and closing a stream (or tearing down the
+        # backend) under a live reader is a native use-after-free. stop() is
+        # safe from any thread and makes the blocked read return or raise.
+        for stream in self._streams:
+            try:
+                stream.stop()
+            except Exception as exc:
+                log.debug("Error while stopping audio stream: %s", exc)
         for thread in self._threads:
             thread.join(timeout=2.0)
         self._threads.clear()
         for stream in self._streams:
             try:
-                stream.stop_stream()
                 stream.close()
             except Exception as exc:
                 log.debug("Error while closing audio stream: %s", exc)
         self._streams.clear()
         self._arbiter = None
         with self._runner_lock:
+            # Invalidate outstanding threads: one still blocked past the join
+            # timeout must not touch the runner counts or status of whatever
+            # session runs next.
+            self._generation += 1
             self._runners.clear()
-            # A capture thread can still be blocked in stream.read() past the
-            # join timeout, so its own exit cannot be relied on to clear this.
             # After stop() the sources ARE stopped; say so rather than leaving
             # the status bar reporting a channel that is no longer running.
             for state in (self.mic, self.loopback):
                 state.active = False
                 state.detail = "stopped"
-        if self._audio is not None:
-            self._audio.terminate()
-            self._audio = None
+        if self._session is not None:
+            try:
+                self._session.close()
+            except Exception as exc:
+                log.debug("Error while closing audio session: %s", exc)
+            self._session = None
 
     def set_enabled(self, enabled: bool) -> None:
         if enabled:
@@ -398,15 +294,16 @@ class AudioCapture:
     def _capture_source(
         self,
         channel: str,
-        info: dict[str, Any],
-        stream: Any,
+        device: CaptureDevice,
+        stream: SourceStream,
         loop: asyncio.AbstractEventLoop,
         output: DropOldestQueue[AudioFrame],
-        arbiter: LoopbackArbiter | None = None,
+        arbiter: LoopbackArbiter | None,
+        generation: int,
     ) -> None:
         state = self.mic if channel == "mic" else self.loopback
-        name = str(info.get("name", channel))
-        source_id = int(info.get("index", -1))
+        name = device.name
+        source_id = device.id
         entered = False
         if channel != "sys":
             # The arbiter picks between competing LOOPBACK endpoints. Letting it
@@ -414,27 +311,32 @@ class AudioCapture:
             # outright -- the mic loses every contest it was never entered in.
             arbiter = None
         try:
-            import soxr
-
-            rate = int(info["defaultSampleRate"])
-            channels = int(info["maxInputChannels"])
+            rate = int(stream.rate)
+            channels = int(stream.channels)
             native_frames = max(1, int(rate * self.config.frame_ms / 1000))
-            self._enter_source(state, name)
-            entered = True
-            if arbiter is None:
+            # False means this thread belongs to a superseded session: stay
+            # silent and die, announcing nothing over the live generation.
+            entered = self._enter_source(state, name, generation)
+            if entered and arbiter is None:
                 self.status_callback(f"{channel} active: {name}")
             output_buffer = np.empty(0, dtype=np.float32)
             target_frames = int(16000 * self.config.frame_ms / 1000)
-            resampler = (
-                soxr.ResampleStream(
+            resampler = None
+            if rate != 16000:
+                # Imported here, not at module top: soxr is only needed when a
+                # stream arrives off-rate, and never on backends (parec) that
+                # already deliver 16kHz.
+                import soxr
+
+                resampler = soxr.ResampleStream(
                     rate, 16000, 1, dtype="float32", quality="LQ"
                 )
-                if rate != 16000
-                else None
-            )
-            while not self._stop.is_set():
-                raw = stream.read(native_frames, exception_on_overflow=False)
-                samples = np.frombuffer(raw, dtype=np.float32)
+            # The generation test matters when this thread survived a stop()
+            # whose stream teardown failed silently: the next start() clears
+            # _stop, and without the check the zombie would resume pushing its
+            # stale device's frames into the live session's queue.
+            while entered and not self._stop.is_set() and generation == self._generation:
+                samples = stream.read(native_frames)
                 if channels > 1:
                     samples = samples.reshape(-1, channels).mean(axis=1)
                 # Measured pre-resample and regardless of the pause state: this
@@ -478,7 +380,16 @@ class AudioCapture:
                     output_buffer = output_buffer[target_frames:]
                     put_threadsafe(loop, output, AudioFrame(channel, frame, time.time()))
         except Exception as exc:
-            if channel == "sys" and arbiter is not None:
+            if self._stop.is_set() or generation != self._generation:
+                # stop() unblocks readers by stopping their streams, so a read
+                # error here IS the shutdown, not a device failure; warning
+                # about it would cry wolf on every restart. A stale generation
+                # is the same situation seen late: the next start() has already
+                # cleared _stop, and a zombie announcing "Microphone
+                # unavailable" would be reporting its long-dead stream over a
+                # healthy session.
+                log.debug("Capture thread for %s exited on stop: %s", name, exc)
+            elif channel == "sys" and arbiter is not None:
                 # One endpoint of many dying is not a channel outage; the others
                 # keep watching. Reporting it as "continuing mic-only" would be
                 # a lie that trains the user to ignore the warning that matters.
@@ -492,6 +403,6 @@ class AudioCapture:
                 log.error(message)
                 self.status_callback(message)
             if entered:
-                self._exit_source(state, str(exc))
+                self._exit_source(state, str(exc), generation=generation)
         else:
-            self._exit_source(state)
+            self._exit_source(state, generation=generation)

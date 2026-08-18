@@ -8,13 +8,14 @@ import numpy as np
 import pytest
 
 from ambientqa.audio_devices import (
-    AudioDevice,
+    CaptureDevice,
     DeviceMeterPool,
     amplitude_to_db,
     calculate_levels,
-    classify_capture_devices,
     level_to_bar,
+    short_error,
 )
+from ambientqa.backends.windows import WasapiBackend, classify_capture_devices
 
 
 def test_device_grouping_keeps_only_wasapi_capture_endpoints() -> None:
@@ -50,9 +51,9 @@ def test_device_grouping_keeps_only_wasapi_capture_endpoints() -> None:
         },
     ]
     devices = classify_capture_devices(raw, wasapi_host_index=2)
-    assert [(device.kind, device.index) for device in devices] == [
-        ("mic", 4),
-        ("loopback", 7),
+    assert [(device.kind, device.id) for device in devices] == [
+        ("mic", "4"),
+        ("loopback", "7"),
     ]
     assert "noise removal" in devices[0].display_name
 
@@ -73,6 +74,13 @@ def test_level_math_reports_peak_and_rms() -> None:
     peak, rms = calculate_levels(samples)
     assert peak == 1.0
     assert rms == pytest.approx(2**-0.5)
+
+
+def test_short_error_survives_exceptions_with_empty_messages() -> None:
+    """An error raised with no args must still describe itself, not IndexError."""
+    assert short_error(OSError()) == "OSError"
+    assert short_error(ValueError("")) == "ValueError"
+    assert short_error(RuntimeError("device is busy")) == "device is busy"
 
 
 class _FakeStream:
@@ -112,11 +120,12 @@ class _FakeAudio:
 
 def test_failing_device_becomes_unavailable_and_others_keep_metering() -> None:
     devices = [
-        AudioDevice(1, "Working mic", "mic", 1, 48000),
-        AudioDevice(2, "Busy physical mic", "mic", 1, 48000),
+        CaptureDevice("1", "Working mic", "mic", 1, 48000),
+        CaptureDevice("2", "Busy physical mic", "mic", 1, 48000),
     ]
     audio = _FakeAudio()
-    pool = DeviceMeterPool(devices, audio_factory=lambda: audio)
+    session = WasapiBackend(audio_factory=lambda: audio).open_session()
+    pool = DeviceMeterPool(devices, session)
     pool.start()
     try:
         time.sleep(0.01)

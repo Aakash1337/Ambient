@@ -5,7 +5,7 @@ from pathlib import Path
 
 from ambientqa.__main__ import AmbientController
 from ambientqa.audio import SourceState
-from ambientqa.audio_devices import AudioDevice, MeterReading
+from ambientqa.audio_devices import CaptureDevice, MeterReading
 from ambientqa.bus import DropOldestQueue
 from ambientqa.config import default_config, load_config
 from ambientqa.ui import AmbientQAApp, AudioDevicesScreen
@@ -14,15 +14,15 @@ from ambientqa.ui import AmbientQAApp, AudioDevicesScreen
 class _FakeSession:
     def __init__(self) -> None:
         self.devices = [
-            AudioDevice(1, "First microphone", "mic", 1, 48000),
-            AudioDevice(2, "Second microphone", "mic", 1, 48000),
-            AudioDevice(3, "Speaker loopback", "loopback", 2, 48000),
+            CaptureDevice("1", "First microphone", "mic", 1, 48000),
+            CaptureDevice("2", "Second microphone", "mic", 1, 48000),
+            CaptureDevice("3", "Speaker loopback", "loopback", 2, 48000),
         ]
         self.active_mic = "First microphone"
         self.active_loopback = "Speaker loopback"
         self.closed = False
 
-    def snapshot(self, width: int = 18) -> dict[tuple[str, int], MeterReading]:
+    def snapshot(self, width: int = 18) -> dict[tuple[str, str], MeterReading]:
         return {device.key: MeterReading() for device in self.devices}
 
     def close(self) -> None:
@@ -73,6 +73,7 @@ def test_modal_select_updates_config_and_restarts_capture(
     controller.paused = False
     controller.frames = DropOldestQueue(8)
     controller.utterances = DropOldestQueue(8)
+    controller.backend = object()
     controller.capture = _FakeCapture()
     controller.segmenter = _FakeSegmenter()
     controller._capture_loop = None
@@ -82,7 +83,7 @@ def test_modal_select_updates_config_and_restarts_capture(
     session = _FakeSession()
     monkeypatch.setattr(
         "ambientqa.__main__.AudioDeviceSession.open",
-        lambda **_kwargs: session,
+        lambda *_args, **_kwargs: session,
     )
     app = AmbientQAApp(controller, status_interval_s=60)
 

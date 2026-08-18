@@ -10,10 +10,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ambientqa.audio_devices import (  # noqa: E402
-    AudioDevice,
     AudioDeviceSession,
+    CaptureDevice,
     MeterReading,
 )
+from ambientqa.backends import get_backend  # noqa: E402
 from ambientqa.config import load_config  # noqa: E402
 from ambientqa.config_write import set_audio_device  # noqa: E402
 
@@ -31,8 +32,8 @@ def _meter_text(reading: MeterReading) -> str:
 
 
 def _print_devices(
-    devices: list[AudioDevice],
-    readings: dict[tuple[str, int], MeterReading],
+    devices: list[CaptureDevice],
+    readings: dict[tuple[str, str], MeterReading],
     *,
     numbered: bool,
 ) -> None:
@@ -55,9 +56,9 @@ def _meter_for(
     seconds: float,
     *,
     live: bool,
-) -> dict[tuple[str, int], MeterReading]:
+) -> dict[tuple[str, str], MeterReading]:
     deadline = time.monotonic() + seconds
-    maxima: dict[tuple[str, int], MeterReading] = {}
+    maxima: dict[tuple[str, str], MeterReading] = {}
     first = True
     while first or time.monotonic() < deadline:
         first = False
@@ -78,7 +79,7 @@ def _meter_for(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare live WASAPI capture levels and choose an Ambient Q&A device."
+        description="Compare live capture levels and choose an Ambient Q&A device."
     )
     parser.add_argument(
         "--seconds",
@@ -102,6 +103,7 @@ def main() -> int:
     try:
         config = load_config(CONFIG_PATH)
         session = AudioDeviceSession.open(
+            get_backend(config.audio),
             active_mic=config.audio.mic_device,
             active_loopback=config.audio.output_device,
         )
@@ -111,7 +113,7 @@ def main() -> int:
 
     try:
         if not session.devices:
-            print("No WASAPI microphone or loopback endpoints found.")
+            print("No microphone or system-audio endpoints found.")
             return 0
         maxima = _meter_for(session, args.seconds, live=not args.list)
         if args.list:
