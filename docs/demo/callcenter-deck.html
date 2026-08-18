@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ambient Q&A — Call-Center Agent Assist</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #16161d; --panel: #1e1e28; --ink: #e8e6e0; --dim: #9a97a3;
+    --accent: #e8a33d; --accent2: #7cc7a5; --line: #34323e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: var(--bg); color: var(--ink);
+    font: 400 clamp(16px, 2.2vh, 22px)/1.55 "Iosevka", "JetBrains Mono", "Cascadia Code", ui-monospace, monospace; }
+  .slide { display: none; height: 100vh; padding: 7vh 9vw; flex-direction: column; justify-content: center; }
+  .slide.active { display: flex; }
+  h1 { font-size: 2.4em; line-height: 1.15; color: var(--accent); font-weight: 600; margin-bottom: .5em; }
+  h2 { font-size: 1.7em; color: var(--accent); font-weight: 600; margin-bottom: .9em; }
+  h3 { color: var(--accent2); margin: 1.1em 0 .35em; font-size: 1.05em; }
+  p  { margin-bottom: .8em; max-width: 62ch; }
+  .sub { color: var(--dim); font-size: 1.05em; max-width: 60ch; }
+  ul { list-style: none; max-width: 68ch; }
+  li { padding: .34em 0 .34em 1.6em; position: relative; }
+  li::before { content: "•"; color: var(--accent); position: absolute; left: .4em; }
+  li b { color: var(--accent2); font-weight: 600; }
+  .card { background: var(--panel); border: 1px solid var(--accent); border-radius: 6px;
+    padding: 1em 1.3em; margin: 1em 0; max-width: 62ch; }
+  .card .q { color: var(--accent); font-weight: 600; }
+  .card .a { margin-top: .5em; }
+  .card ul { margin-top: .5em; } .card li { padding: .12em 0 .12em 1.4em; }
+  .dim { color: var(--dim); }
+  table { border-collapse: collapse; margin-top: .8em; }
+  td, th { padding: .38em 1.4em .38em 0; text-align: left; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 400; }
+  td:last-child { color: var(--accent2); }
+  .flow { display: flex; gap: .6em; align-items: center; flex-wrap: wrap; margin: 1.2em 0; }
+  .flow span { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: .5em .9em; white-space: nowrap; }
+  .flow em { color: var(--accent); font-style: normal; }
+  .foot { position: fixed; bottom: 2.2vh; right: 9vw; color: var(--dim); font-size: .75em; }
+  .tag { color: var(--dim); letter-spacing: .12em; text-transform: uppercase; font-size: .72em; margin-bottom: 1.4em; }
+  .statusbar { background: #100f14; border: 1px solid var(--line); border-radius: 6px;
+    padding: .55em .9em; font-size: .85em; color: var(--dim); margin-top: 1.2em; white-space: nowrap; overflow: hidden; }
+  .statusbar b { color: var(--accent2); font-weight: 400; }
+  kbd { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: .05em .45em; font-size: .9em; }
+</style>
+</head>
+<body>
+
+<section class="slide active">
+  <div class="tag">prototype demo</div>
+  <h1>Ambient Q&A</h1>
+  <p class="sub">Real-time agent assist for live calls. It hears both sides, ignores
+  everything that isn't a real question, and puts a glanceable answer in front of
+  the agent about four seconds after the customer finishes asking.</p>
+  <div class="statusbar">● listening&nbsp;&nbsp;mic:<b>on</b> sys:<b>on</b>&nbsp;&nbsp;whisper:<b>cuda</b>&nbsp;&nbsp;gate:<b>balanced</b>&nbsp;&nbsp;instances:<b>1</b>&nbsp;&nbsp;profile:<b>support-queue</b></div>
+</section>
+
+<section class="slide">
+  <h2>The problem</h2>
+  <ul>
+    <li>Agents put customers <b>on hold to search the knowledge base</b> — the single biggest dead-air driver.</li>
+    <li>New agents take <b>months to ramp</b>; product knowledge lives in a few veterans' heads.</li>
+    <li>Existing "agent assist" tools transcribe everything and suggest constantly — <b>a firehose the agent learns to ignore</b>.</li>
+  </ul>
+  <p class="dim" style="margin-top:1.4em">The scarce resource isn't answers. It's the agent's attention, mid-sentence.</p>
+</section>
+
+<section class="slide">
+  <h2>What it does</h2>
+  <div class="flow">
+    <span>customer + agent audio</span> →
+    <span>local transcription <em>~0.3&thinsp;s</em></span> →
+    <span>question gate <em>filters noise</em></span> →
+    <span>answer card <em>~4&thinsp;s</em></span> →
+    <span>self-audit <em>revises if wrong</em></span>
+  </div>
+  <ul>
+    <li><b>Passive.</b> It never prompts, never interrupts, never needs a click during a call.</li>
+    <li><b>Selective.</b> Statements, small talk and rhetoric produce nothing. Only real questions become cards.</li>
+    <li><b>Private.</b> All speech processing runs on the agent's machine. Call audio never leaves it.</li>
+  </ul>
+</section>
+
+<section class="slide">
+  <h2>Hears both sides — no telephony integration</h2>
+  <ul>
+    <li>The customer is <b>whatever the machine plays</b>: any softphone, WebRTC dialer, or embedded CRM caller. Captured from the OS audio layer (PipeWire monitors / WASAPI loopback).</li>
+    <li>The agent is the microphone — with <b>noise suppression and auto-gain</b> in front of transcription.</li>
+    <li>Every output endpoint is watched at once; the one carrying speech <b>wins automatically</b> when the call moves between headset and speakers.</li>
+    <li>A channel that goes deaf shows <b>SILENT ⚠</b> instead of pretending to work.</li>
+  </ul>
+  <p class="dim" style="margin-top:1.2em">Prototype-grade integration cost: zero. It works with the dialer you already have.</p>
+</section>
+
+<section class="slide">
+  <h2>The question gate is the product</h2>
+  <ul>
+    <li>Free heuristics answer explicit questions <b>instantly</b> and drop filler, rhetorical tags ("…right?"), and talk aimed at someone else.</li>
+    <li>Uncertain speech goes to a <b>local LLM judge</b> (~0.5&thinsp;s) that catches indirect asks: <span class="dim">"I was wondering whether my plan covers roaming."</span></li>
+    <li>Command-form asks count: <span class="dim">"Talk me through the cancellation policy."</span></li>
+    <li>Per-channel rules: the <b>customer channel is mined freely</b>; the agent's own narration is never mined.</li>
+  </ul>
+  <table>
+    <tr><th>Labelled eval set (balanced mode)</th><td>26 / 26 correct</td></tr>
+    <tr><th>False positives</th><td>0 — an unasked answer is treated as the worst failure</td></tr>
+  </table>
+</section>
+
+<section class="slide">
+  <h2>Answers built for glancing</h2>
+  <div class="card">
+    <div class="q">Q&nbsp; Does the premium plan include international roaming?</div>
+    <div class="a">A&nbsp; Yes — Premium includes roaming in 48 countries at no extra charge; data is capped at 5&thinsp;GB per trip.</div>
+    <ul>
+      <li>48 countries, no add-on needed</li>
+      <li>5&thinsp;GB roaming cap per trip</li>
+      <li>Cap raise: +$10 → 15&thinsp;GB</li>
+    </ul>
+  </div>
+  <ul>
+    <li>First line is <b>sayable verbatim</b>; bullets are keyword prompts, not paragraphs.</li>
+    <li>Streams in word by word, <b>~4&thinsp;s</b> after the question ends.</li>
+    <li>Follow-ups resolve against earlier answers: <span class="dim">"and the second option?"</span> A scenario stated before the question <b>constrains the answer</b>.</li>
+    <li>Pricing/version questions trigger a <b>live lookup</b> instead of trusting model memory.</li>
+  </ul>
+</section>
+
+<section class="slide">
+  <h2>It checks its own work</h2>
+  <h3>Answer audit — runs behind every card</h3>
+  <ul>
+    <li>A second pass with a wider context window re-reads each delivered answer.</li>
+    <li>Replaces the card (marked <b>revised</b>) only when materially wrong — missed constraint, misheard question, factual error. Correct cards never flicker.</li>
+  </ul>
+  <h3>Missed-question sweeper — every 25&thinsp;s</h3>
+  <ul>
+    <li>Everything the gate rejected gets a second look with full context.</li>
+    <li>Genuine asks come back as late cards. <b>Nothing the customer asks stays silently dropped.</b></li>
+  </ul>
+</section>
+
+<section class="slide">
+  <h2>Privacy &amp; compliance posture</h2>
+  <ul>
+    <li><b>Transcription: local.</b> Whisper on the agent's GPU (~0.3&thinsp;s/utterance).</li>
+    <li><b>Question gating: local.</b> Small LLM via Ollama, on-box.</li>
+    <li><b>Answer generation:</b> the only external call — receives the gated question plus a short text window, <b>never audio</b>. The endpoint is swappable for an approved one.</li>
+    <li><b>Session logs stay local</b>, are replayable inside the app for QA review and coaching, and record the reason behind every decision — including every rejection.</li>
+  </ul>
+</section>
+
+<section class="slide">
+  <h2>Measured, not promised</h2>
+  <table>
+    <tr><th>Transcription (warm, GPU)</th><td>~0.2–0.3 s per utterance</td></tr>
+    <tr><th>Question gate (LLM stage)</th><td>~0.5–0.6 s</td></tr>
+    <tr><th>Question → readable card</th><td>~3.5–4.5 s</td></tr>
+    <tr><th>Audit correction, when needed</th><td>~8 s behind the card</td></tr>
+    <tr><th>Missed-question recovery</th><td>≤ 25 s</td></tr>
+    <tr><th>Automated tests</th><td>345 passing, gate eval fails CI on any false positive</td></tr>
+  </table>
+  <p class="dim" style="margin-top:1.2em">Runs on Windows and Linux from one codebase. Multiple concurrent instances supported — the status bar counts them live.</p>
+</section>
+
+<section class="slide">
+  <h2>From prototype to production</h2>
+  <ul>
+    <li><b>Knowledge:</b> per-queue profiles today → retrieval over the real KB and policy docs.</li>
+    <li><b>Workflow:</b> answer cards today → push to CRM/ticket, disposition suggestions, wrap-up summaries from the session log.</li>
+    <li><b>Audio:</b> desktop capture today → SIP/CTI taps for hard-phone floors; speaker diarization for speakerphone.</li>
+    <li><b>Models:</b> answer endpoint is one config line — point it at the approved deployment.</li>
+  </ul>
+  <p style="margin-top:1.4em">The hard parts — hearing both sides, deciding what deserves an answer, and correcting itself — <b>are the parts already built and measured.</b></p>
+</section>
+
+<section class="slide">
+  <h1>Live demo</h1>
+  <p class="sub">One machine, one launcher script, a real call playing through the speakers.</p>
+  <ul style="margin-top:1em">
+    <li>Watch the agent talk — <b>nothing happens</b>. The gate is the product.</li>
+    <li>Watch the customer ask — <b>a card appears in ~4 seconds</b>.</li>
+    <li><kbd>a</kbd> force-answer &nbsp; <kbd>p</kbd> pause &nbsp; <kbd>x</kbd> switch knowledge profile &nbsp; <kbd>l</kbd> replay a past call</li>
+  </ul>
+</section>
+
+<div class="foot"><span id="pos"></span> · ← → navigate · F fullscreen</div>
+
+<script>
+  const slides = [...document.querySelectorAll(".slide")];
+  let index = 0;
+  const pos = document.getElementById("pos");
+  function show(next) {
+    index = Math.max(0, Math.min(slides.length - 1, next));
+    slides.forEach((slide, i) => slide.classList.toggle("active", i === index));
+    pos.textContent = (index + 1) + " / " + slides.length;
+  }
+  addEventListener("keydown", (event) => {
+    if (["ArrowRight", "PageDown", " "].includes(event.key)) show(index + 1);
+    else if (["ArrowLeft", "PageUp"].includes(event.key)) show(index - 1);
+    else if (event.key === "Home") show(0);
+    else if (event.key === "End") show(slides.length - 1);
+    else if (event.key.toLowerCase() === "f") document.documentElement.requestFullscreen?.();
+  });
+  addEventListener("click", () => show(index + 1));
+  show(0);
+</script>
+</body>
+</html>
