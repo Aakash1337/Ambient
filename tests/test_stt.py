@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import numpy as np
 import pytest
 
@@ -198,3 +200,30 @@ def test_cuda_dll_dirs_are_registered_and_on_path() -> None:
     # add_dll_directory alone does not help CTranslate2's dynamic cuBLAS load.
     for directory in added:
         assert directory.lower() in os.environ["PATH"].lower()
+
+
+def test_warmup_loads_the_model_once_and_swallows_failure() -> None:
+    # The first utterance otherwise pays the ~10s model load at the moment the
+    # user is testing whether the app hears them; a failed warmup must fall
+    # back to the lazy path rather than kill the worker.
+    transcriber = WhisperTranscriber(STTConfig())
+    calls = []
+
+    def fake_load() -> None:
+        calls.append(1)
+        transcriber.model = FakeWhisper("warm")
+
+    transcriber._load_model = fake_load  # type: ignore[method-assign]
+    asyncio.run(transcriber.warmup())
+    assert transcriber.model is not None and calls == [1]
+    asyncio.run(transcriber.warmup())
+    assert calls == [1]  # already loaded: no second load
+
+    failing = WhisperTranscriber(STTConfig())
+
+    def broken_load() -> None:
+        raise RuntimeError("no CUDA")
+
+    failing._load_model = broken_load  # type: ignore[method-assign]
+    asyncio.run(failing.warmup())  # must not raise
+    assert failing.model is None

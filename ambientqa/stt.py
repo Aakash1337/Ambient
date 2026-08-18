@@ -8,9 +8,13 @@ import os
 import re
 import site
 import textwrap
+import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Awaitable, Callable
+
+import numpy as np
 
 from .bus import DropOldestQueue, Transcript, Utterance
 from .config import STTConfig
@@ -178,6 +182,44 @@ class WhisperTranscriber:
     async def transcribe(self, utterance: Utterance) -> Transcript | None:
         return await asyncio.to_thread(self._transcribe_sync, utterance)
 
+    async def warmup(self) -> None:
+        """Load the model and warm the first inference before anyone speaks.
+
+        Left lazy, the model load (measured 9.5s from cache on this machine)
+        is paid by the FIRST UTTERANCE -- at exactly the moment the user is
+        testing whether the app hears them. Runs on a daemon thread signalling
+        an asyncio.Event, like OllamaGate.warmup, so quitting mid-load never
+        hangs shutdown; failures fall back to the lazy load path, which
+        retries and surfaces errors as before.
+        """
+        if self.model is not None:
+            return
+        loop = asyncio.get_running_loop()
+        done = asyncio.Event()
+
+        def _load() -> None:
+            try:
+                self._load_model()
+                # One inference of silence pays the CUDA kernel/cuDNN warmup
+                # that the model constructor alone does not.
+                segments, _info = self.model.transcribe(
+                    np.zeros(8000, dtype=np.float32),
+                    condition_on_previous_text=False,
+                    vad_filter=False,
+                )
+                for _segment in segments:
+                    pass
+            except Exception as exc:
+                log.warning("Whisper warmup failed; loading lazily instead: %s", exc)
+            finally:
+                with suppress(RuntimeError):
+                    loop.call_soon_threadsafe(done.set)
+
+        threading.Thread(
+            target=_load, name="ambientqa-whisper-warmup", daemon=True
+        ).start()
+        await done.wait()
+
 
 async def stt_worker(
     utterances: DropOldestQueue[Utterance],
@@ -187,6 +229,11 @@ async def stt_worker(
     on_drop: Callable[[Transcript], Awaitable[None]] | None = None,
 ) -> None:
     """One serial worker owns the Whisper model/GPU."""
+    # Warm the model before consuming anything. The worker is the model's sole
+    # user, so waiting here also guarantees no utterance can race the load;
+    # speech during the warmup simply queues and transcribes the moment the
+    # model is hot.
+    await transcriber.warmup()
     while not stop.is_set():
         try:
             utterance = await asyncio.wait_for(utterances.get(), timeout=0.25)

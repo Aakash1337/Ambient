@@ -310,17 +310,28 @@ def has_need_marker(text: str) -> bool:
 def is_question_shaped(text: str) -> bool:
     """Whether the utterance was actually spoken as a question.
 
-    Deliberately just the question mark. Whisper adds it from rising intonation,
-    which is the one signal that survives disfluency -- "Okay, what do you mean,
-    how, how do I truncate it?" is a mess of restarts but unmistakably asked.
+    The question mark comes first: Whisper adds it from rising intonation,
+    which is the one signal that survives disfluency -- "Okay, what do you
+    mean, how, how do I truncate it?" is a mess of restarts but unmistakably
+    asked. But the mark is also fragile the other way: a garbled TAIL eats it,
+    and then "Why does it always take a little time after the first words are
+    spoken Ferry 2." -- a blatant interrogative -- died unheard while its
+    terse re-ask sailed through. So an interrogative-word START (after
+    discourse prefixes) counts as question-shaped too.
 
-    This guards the semantic gate on your own channel. That gate is what turns
-    "...so I built a RAG system where" into "What is a RAG system?", because it
-    is asked to REWRITE speech as a query and will happily oblige for a plain
-    statement. Requiring question intonation first means a declarative sentence
-    never gets the chance.
+    Shape only earns the right to be JUDGED, never an answer: this guards
+    which utterances may reach the semantic gate on your own channel, and that
+    gate still rejects statements. Pseudo-clefts ("What I did was refactor
+    it.") now cost one local gate call instead of a free reject -- the gate's
+    prompt, not punctuation, is what keeps narration unanswered.
     """
-    return text.rstrip().endswith("?")
+    if text.rstrip().endswith("?"):
+        return True
+    lowered = [token.lower() for token in words(text)]
+    start = 0
+    while start < len(lowered) and lowered[start] in QUESTION_PREFIXES:
+        start += 1
+    return start < len(lowered) and lowered[start] in INTERROGATIVES
 
 
 def content_words(text: str) -> set[str]:
@@ -462,6 +473,10 @@ class OllamaGate:
             "WANT information. Merely mentioning a technical topic is not enough. A speaker "
             "asserting a fact, stating a plan, or narrating what they are doing is NOT asking -- "
             "they already know it. Return FALSE for those even though they sound substantive.\n"
+            "Utterances are speech transcriptions and may carry recognition garble, especially "
+            "at the end (stray words, repeated fragments, a lost question mark). Judge the "
+            "coherent part on its own merits and leave the garble out of the rewrite; garble "
+            "alone is never a reason to reject an otherwise clear ask.\n"
             "Examples:\n"
             '- "I have no idea how python decorators handle arguments" -> TRUE (the utterance '
             "itself names a topic and states an information need; phrasing it as a statement "
@@ -474,6 +489,10 @@ class OllamaGate:
             "the speaker already knows; not a request for information).\n"
             '- "uh, um, so, the thing is" -> FALSE (names no topic of its own; do not borrow one '
             "from context or the profile).\n"
+            '- "Why does it always take a bit of time after the first words are spoken Ferry 2. '
+            'Ferry 2." -> TRUE (an interrogative whose tail is recognition garble that also ate '
+            'the question mark; judge the coherent part and rewrite it clean: "Why does it take '
+            'time after the first words are spoken?").\n'
             "\nReturn JSON matching the schema. If TRUE, rewrite the request as a concise, "
             "self-contained query. If FALSE, query is empty."
         )

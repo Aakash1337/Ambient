@@ -589,3 +589,57 @@ def test_imperative_requests_are_accepted(text: str) -> None:
 )
 def test_imperative_lookalikes_are_not_accepted(text: str) -> None:
     assert heuristic_decision(text).outcome != "accept"
+
+
+# --- question shape: an interrogative START counts, not just the '?' ---
+# Whisper drops the question mark when the tail garbles ("Why does it always
+# take a little time... Ferry 2. Ferry 2."), and the blatant interrogative
+# died unheard while its terse re-ask sailed through. Shape only earns the
+# right to be JUDGED by the semantic gate -- never an answer by itself.
+
+
+def test_interrogative_start_without_mark_reaches_the_semantic_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = QuestionGate(GateConfig())
+    calls: list[str] = []
+
+    async def fake_classify(text: str, _context: list[str]) -> tuple[bool, str]:
+        calls.append(text)
+        return True, "Why does it take time after the first words are spoken?"
+
+    monkeypatch.setattr(gate.ollama, "classify", fake_classify)
+    result = asyncio.run(
+        gate.evaluate(
+            Transcript(
+                "mic",
+                "Why does it always take A little bit of time After the first words are spoken Ferry 2. Ferry 2.",
+                100.0,
+                "u1",
+            ),
+            [],
+            policy="explicit",
+        )
+    )
+    assert calls, "interrogative-start utterance never reached the gate"
+    assert result.accepted is True
+
+
+def test_plain_statements_still_never_reach_the_gate_on_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = QuestionGate(GateConfig())
+
+    async def must_not_run(_text: str, _context: list[str]) -> tuple[bool, str]:
+        raise AssertionError("statement reached the semantic gate on explicit")
+
+    monkeypatch.setattr(gate.ollama, "classify", must_not_run)
+    result = asyncio.run(
+        gate.evaluate(
+            Transcript("mic", "I built the retriever with hybrid search last week.", 100.0, "u1"),
+            [],
+            policy="explicit",
+        )
+    )
+    assert result.accepted is False
+    assert result.reason == "not_a_direct_question"
