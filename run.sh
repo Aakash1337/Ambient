@@ -33,7 +33,7 @@ if [ ! -f "$STAMP" ] || [ requirements.txt -nt "$STAMP" ]; then
 fi
 
 # WebRTC mic processing (noise suppression + automatic gain control), the same
-# chain Windows runs in its audio stack. The raw USB mic at full PipeWire
+# class of processing Windows applies itself. The raw USB mic at full PipeWire
 # volume sits ~34dB above its hardware-neutral level: loud speech clips
 # (measured 1.7% of samples) and quiet rooms drown in boosted noise -- both
 # garble Whisper. config.toml pins mic_device to the processed "ec_mic"

@@ -1,8 +1,8 @@
 # Ambient Q&A
 
-Ambient Q&A is a passive Windows side pane that listens to the microphone and system audio,
-transcribes speech locally, identifies real questions, and answers only those questions. It never
-prompts or interrupts you.
+Ambient Q&A is a passive side pane for Windows and Linux that listens to the microphone and
+system audio, transcribes speech locally, identifies real questions, and answers only those
+questions. It never prompts or interrupts you.
 
 ## Documentation
 
@@ -18,9 +18,12 @@ Moving development to a new machine? Follow the porting checklist at the end of
 
 ## Quickstart
 
-Requirements: Windows 11, Python 3.11 through the Python launcher, Ollama with the model named
-in `[gate] model` pulled (`gemma4:e2b` by default; any small instruct model such as `qwen2.5:3b`
-works), the Claude CLI signed in, and an NVIDIA GPU for the preferred Whisper configuration.
+Both platforms need Ollama with the model named in `[gate] model` pulled (`gemma4:e2b` by
+default — the gate prompt was engineered against it; the earlier stand-in `qwen2.5:3b`
+measurably flips on real questions once transcript context is present), the Claude CLI signed
+in, and an NVIDIA GPU for the preferred Whisper configuration.
+
+**Windows** (Windows 11, Python 3.11 through the Python launcher):
 
 ```powershell
 .\setup.ps1
@@ -28,19 +31,32 @@ works), the Claude CLI signed in, and an NVIDIA GPU for the preferred Whisper co
 python -m ambientqa
 ```
 
-On Linux the same repo runs first-class through PipeWire (`pactl`/`parec`) — microphone
-**and** system audio, since every output's *monitor* source is PipeWire's equivalent of
-WASAPI loopback. `./run.sh` bootstraps its own environment (`.venv-linux`; the Windows-only
-`pyaudiowpatch` is skipped by its requirements marker) on first run, starts Ollama if it is
-down, and launches the pane:
+`setup.ps1` deliberately uses `py -3.11`; do not use the unrelated `python` environment already
+on `PATH`.
+
+**Linux** (PipeWire with `pipewire-pulse`, which provides the `pactl`/`parec` tools the capture
+backend runs on):
 
 ```bash
 ./run.sh
 ```
 
-`setup.ps1` deliberately uses `py -3.11`; do not use the unrelated `python` environment already
-on `PATH`. The first Ollama warmup can take about 67 seconds. Once warm, question classification
-is normally well under a second.
+`run.sh` is the whole setup. On first run it creates its own `.venv-linux` (the Windows-only
+`pyaudiowpatch` is skipped by its `sys_platform` marker in `requirements.txt`), and it re-runs
+pip whenever `requirements.txt` is newer than its install stamp. On every run it starts Ollama
+if it is down, loads PipeWire's `module-echo-cancel` to provide the processed `ec_mic`
+microphone source, points CTranslate2 at the pip-installed CUDA libraries, and launches the
+pane. Because it bootstraps everything itself, it is also the right `Exec` target for a desktop
+app-menu entry (wrapped in a terminal, e.g. `konsole --workdir <repo> -e ./run.sh` — the pane
+is a TUI).
+
+`ec_mic` matters for transcription quality: it runs WebRTC noise suppression and automatic gain
+control over the raw microphone. The raw USB mic at full PipeWire volume sits ~34 dB above its
+hardware-neutral level — loud speech clipped 1.7% of samples and garbled Whisper — so
+`config.toml` pins `audio.mic_device` to the processed source instead.
+
+The first Ollama warmup can take about 67 seconds. Once warm, question classification is
+normally well under a second.
 
 Use `python scripts/list_devices.py` to see input and system-audio endpoint names (WASAPI
 loopback on Windows, PipeWire monitor sources on Linux). Set `audio.mic_device` or
@@ -92,6 +108,11 @@ once (WASAPI loopback endpoints on Windows, PipeWire monitor sources on Linux) a
 whichever one is actually carrying speech, so it does not matter whether today's call plays
 through the headset, the monitor or the desktop speakers.
 
+On Linux this needs no loopback driver or virtual cable: every output has a *monitor* source
+(`Monitor of <sink>`) that carries whatever the machine plays through it — PipeWire's native
+equivalent of WASAPI loopback — so the `sys` channel works out of the box, and blank watches
+all the monitors exactly as it watches all the loopback endpoints on Windows.
+
 Naming an endpoint pins it, and that is how a whole conversation gets lost. A loopback opened on an
 endpoint the call is not playing through does not error — it opens perfectly happily and captures
 silence. The status bar reads `sys:on`, your own transcripts keep scrolling, and you find out
@@ -133,8 +154,13 @@ had to be force-answered by hand.
 
 `explicit` is the split that satisfies both. An utterance is accepted when it is a well-formed
 interrogative (Stage A, free and instant — **no Ollama call at all**), or when Whisper heard it end
-in `?`, which is the one signal that survives disfluency. Anything declarative is rejected before
-the semantic gate ever sees it, so it cannot be rewritten into a question.
+in `?`, which is the one signal that survives disfluency. Command-form asks are accepted the same
+free way — *"Talk about evaluation metrics."* carries no `?` and no interrogative word, but it is
+as direct as a request gets. And a statement that substantially overlaps a question answered in
+the last ~90 s is accepted as a deliberate re-ask: the first answer missed, and retries
+(*"no, prompt engineering..."*) rarely carry fresh question intonation. Everything else
+declarative is rejected before the semantic gate ever sees it, so it cannot be rewritten into a
+question.
 
 Replayed over all 690 recorded mic utterances: **221 were answered under the old gate, 66 under
 `explicit`** — 38 of them instantly via Stage A, 28 through the semantic gate. 662 utterances never
@@ -226,15 +252,17 @@ pause arrives as fragments. `[merge]` stitches them back together before gating.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `merge_gap_s` | 4.5 | Max **silence** between two utterances for the second to continue the first |
-| `merge_window_s` | 9.0 | Max **wall-clock** time an unfinished utterance is held awaiting a continuation |
+| `merge_gap_s` | 6.5 | Max **silence** between two utterances for the second to continue the first |
+| `merge_window_s` | 13.0 | Max **wall-clock** time an unfinished utterance is held awaiting a continuation |
 | `max_merge_parts` | 5 | Fragments combined into one utterance |
 | `max_merge_s` | 25.0 | Total spoken length of a merged utterance |
 
 `merge_window_s` must be comfortably larger than `merge_gap_s` — it has to outlast the silence
 **plus** the spoken length of the continuation **plus** its transcription latency. If it only
 matches the gap, the hold expires before the continuation is transcribed and merging silently
-never happens. Raise both if you pause for longer than ~4s mid-sentence.
+never happens. The defaults moved from 4.5/9.0 after a measured miss: people pause ~5 s to
+think between a trailed-off setup and the question that continues it, so the gate saw only the
+second half. Raise both if you pause for longer than ~6 s mid-sentence.
 
 Only utterances that look *unfinished* are held, so complete questions are still gated instantly
 and these values add no latency to them.
@@ -286,13 +314,29 @@ Suppression happens *before* the Ollama call, so it also saves ~700ms per rehear
 
 ## How it works
 
-Non-blocking capture threads — one per open stream, over WASAPI (PyAudioWPatch) on Windows or
-PipeWire (`parec`) on Linux — feed per-channel Silero VAD segmenters. One
-faster-whisper worker transcribes utterances serially. Free heuristics reject obvious
-non-questions and fast-accept explicit interrogatives; remaining speech goes to the local
-Ollama gate model (`[gate] model`). Confirmed questions each launch their own bounded, one-shot
+Platform audio lives behind a small backend layer (`ambientqa/backends/`):
+`[audio] backend = "auto"` selects the platform's native stack — WASAPI (PyAudioWPatch) on Windows,
+PipeWire (one `parec` subprocess per stream) on Linux — behind one device/stream contract, so
+everything above capture is platform-blind. Non-blocking capture threads — one per open stream —
+feed per-channel Silero VAD segmenters. One faster-whisper worker transcribes utterances
+serially. Free heuristics reject obvious non-questions and fast-accept explicit interrogatives
+and command-form requests; remaining speech goes to the local Ollama gate model
+(`[gate] model`). Confirmed questions each launch their own bounded, one-shot
 `claude -p` process and stream output into that question's card as it is generated. There is
 intentionally no persistent Claude stream session.
+
+Two second passes run behind the live path, one per direction of error. `answer.verify` audits
+every **delivered** answer: a verifier with a wider transcript window
+(`verify_context_turns` = 18 against the fast path's 6) plus the full Q&A history re-reads it
+after it is already on screen, and replaces the card — marked `revised` — only when it was
+materially wrong: a missed constraint, a misheard question, a dropped enumeration item. Style is
+never grounds. `answer.sweep` covers the **missed**: every `sweep_interval_s` (25 s) a small
+model (`sweep_model`, `claude-haiku-4-5` by default) re-judges the gate's judgment-stage
+rejections against the same wide context and the list of questions already answered or in
+flight; genuine asks come back as late cards through the normal answer path, logged as
+`second_pass_recovery`. A missed question therefore has a ladder of recovery: re-ask it (past
+the 8 s dedupe cooldown a repeat gets a fresh answer, and a statement retry of a recent
+question is accepted outright), wait for the sweep, or press `a`.
 
 Keys:
 
@@ -337,13 +381,22 @@ specific one, and `-o` to choose the output location (default: the `.html` next 
 the working directory. The replay also shows what the live pane never had room for: every
 rejection reason, which is where gate-tuning signal comes from.
 
+## Running several copies
+
+On Linux, run `./run.sh` as many times as you like. PipeWire multiplexes every source natively,
+so a second instance opening the same microphone and the same monitors never conflicts with the
+first — or with any other application. There is deliberately no single-instance lock in
+`run.sh`. Each instance writes its own `logs/session-<timestamp>.jsonl`.
+
 ## Configuration reference
 
-All settings are in the fully commented `config.toml`.
+All settings load from `config.toml` (commented in place); any key left out of the file takes
+the default defined in `ambientqa/config.py`.
 
 | Section | Key | Meaning |
 |---|---|---|
-| `audio` | `mic_device`, `output_device` | Optional device-name substring |
+| `audio` | `backend` | `auto` (default) / `wasapi` / `pipewire` — capture stack; `auto` picks the platform's native one |
+| | `mic_device`, `output_device` | Optional device-name substring |
 | | `sample_rate`, `frame_ms`, `queue_size` | Capture format and bounded frame queue |
 | | `silence_ms`, `pre_roll_ms` | Trailing silence and onset preservation |
 | | `min_utterance_ms`, `max_utterance_s` | Segment discard and force-flush limits |
@@ -362,6 +415,7 @@ All settings are in the fully commented `config.toml`.
 | | `reask_cooldown_s` | Near-duplicate dedupe horizon: inside it a repeat is a mechanical duplicate and is dropped; past it, re-asking an already-answered question gets a fresh answer |
 | | `dedupe_window_s`, `dedupe_ratio` | Recent answered-question suppression |
 | | `echo_window_s`, `echo_ratio` | Cross-channel transcript echo suppression |
+| | `answer_echo_window_s`, `answer_echo_ratio` | Rehearsal suppression — see "Rehearsing answers aloud" |
 | | `queue_size` | Bounded transcript queue |
 | `merge` | `enabled` | Coalesce likely mid-sentence VAD fragments before gating |
 | | `merge_gap_s`, `merge_window_s` | Maximum audio gap and continuation hold window |
@@ -394,7 +448,7 @@ depth. Profile context never filters topics or turns contextless speech into a q
 **Status bar shows `sys:SILENT 60s ⚠`:** the loopback opened fine but is carrying nothing. If you
 have pinned `audio.output_device`, clear it — blank watches every endpoint and follows the one with
 speech on it, which removes this failure entirely. If it is already blank, nothing is playing
-through *any* output endpoint: check that the call is not muted and that Windows is routing it
+through *any* output endpoint: check that the call is not muted and that the OS is routing it
 somewhere. Press `d` for live meters; the right endpoint is the one that moves when the other
 person speaks. Tune the delay with `audio.silent_source_warn_s` (default 45 s).
 
@@ -434,9 +488,17 @@ Remove-Item -Recurse -Force .venv
 Verify with `python -c "import sys; print(sys.base_prefix)"` — it must not contain `WindowsApps`.
 
 **It hears system audio but not me:** check *which* microphone it picked. The status bar names the
-active device, and the app follows the Windows default, which is often not the one you speak into.
+active device, and the app follows the platform default, which is often not the one you speak into.
 Set `audio.mic_device` in `config.toml` to any case-insensitive substring of the device you want
 (for example `"Logitech"`), using the names from `python scripts/list_devices.py`.
+
+**Mic transcription is garbled (Linux):** the microphone is almost certainly clipping. The raw
+USB mic at full PipeWire volume runs ~34 dB above its hardware-neutral level; loud speech clipped
+1.7% of samples, and Whisper garbles clipped audio. `run.sh` loads PipeWire's
+`module-echo-cancel` to provide `ec_mic` — WebRTC noise suppression plus
+automatic gain control, the class of processing Windows applies in its own audio stack — and `config.toml` pins
+`audio.mic_device` to it. If the app reports the mic unavailable, the module did not load: rerun
+`./run.sh`, or press `d` and pick the raw device (then turn its volume down).
 
 **Whisper says `cpu`:** CUDA/model initialization failed, so faster-whisper fell back to CPU
 `int8`. Check the NVIDIA driver and the installed `nvidia-cublas-cu12`/`nvidia-cudnn-cu12`
@@ -455,3 +517,23 @@ removed.
 **Claude answers time out or fail:** run `claude -p "hello"` to confirm the CLI is installed and
 authenticated. Each question intentionally uses a separate one-shot process and is killed after
 `answer.answer_timeout_s`; concurrent questions are limited by `answer.max_concurrent`.
+
+**An answer appeared, then changed:** that is the audit, not a glitch. With
+`answer.verify = "always"` (the default) every delivered answer is re-read by a second pass with
+a wider transcript window and the full Q&A history, and replaced only when it was materially
+wrong — the card is prefixed `revised` and the session log records `verify_revision`. Style is
+never grounds for a revision. Set `answer.verify = "off"` to keep first answers untouched.
+
+**A question was answered late, well after it was asked:** the sweeper recovered it. The gate
+had rejected it, and the periodic second pass (`answer.sweep`, every `sweep_interval_s` = 25 s)
+re-judged the recent judgment-stage rejections against wide context and decided it was a genuine
+ask; the card arrives with `gate_reason: second_pass_recovery` in the log. Up to ~25 s of lag is
+the design — a late answer beats a missed one. Set `answer.sweep = "off"` to disable it.
+
+**Everything used to crash the moment you first spoke (Linux — fixed):** Whisper's first model
+load spawned the multiprocessing resource tracker after Textual had replaced stderr with a
+capture whose `fileno()` is -1; the spawn died with `bad value(s) in fds_to_keep` and every
+transcription failed, CUDA and the CPU fallback alike. The tracker is now started before Textual
+takes the terminal. Relatedly, nothing logs to stderr any more — inside a TUI a traceback
+painted over the interface only makes the app look dead — so when something does go wrong, the
+details are in `logs/ambientqa.log`.
