@@ -28,6 +28,8 @@ def test_defaults_match_spec() -> None:
     assert config.answer.answer_model == "claude-sonnet-5"
     assert config.answer.stream is True
     assert config.answer.max_concurrent == 4
+    assert config.answer.verify == "off"
+    assert config.answer.sweep == "always"
     assert config.gate.max_concurrent == 3
     assert config.answer.answer_timeout_s == 45.0
     # Your own channel answers direct questions but never has its narration
@@ -35,6 +37,61 @@ def test_defaults_match_spec() -> None:
     assert config.gate.channel_policy == {"mic": "explicit", "sys": "full"}
     assert config.answer.style == "cue"
     assert config.audio.silent_source_warn_s == 45.0
+
+
+def test_knowledge_defaults_are_opt_in_and_safe() -> None:
+    knowledge = default_config().knowledge
+    assert knowledge.enabled is False
+    assert knowledge.path == ""
+    assert knowledge.hit_threshold == 0.66
+    assert knowledge.min_query_words == 3
+    assert knowledge.ground_on_miss is True
+    assert knowledge.retrieve_k == 3
+
+
+def test_knowledge_section_loads_over_defaults(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[knowledge]\n"
+        "enabled = true\n"
+        'path = "knowledge/aws-security-architect"\n'
+        "hit_threshold = 0.7\n"
+        "min_query_words = 5\n"
+        "ground_on_miss = false\n"
+        "retrieve_k = 2\n",
+        encoding="utf-8",
+    )
+    knowledge = load_config(path).knowledge
+    assert knowledge.enabled is True
+    assert knowledge.path == "knowledge/aws-security-architect"
+    assert knowledge.hit_threshold == 0.7
+    assert knowledge.min_query_words == 5
+    assert knowledge.ground_on_miss is False
+    assert knowledge.retrieve_k == 2
+
+
+@pytest.mark.parametrize("threshold", [-0.1, 1.5])
+def test_knowledge_rejects_out_of_range_threshold(
+    tmp_path: Path, threshold: float
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(f"[knowledge]\nhit_threshold = {threshold}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="hit_threshold"):
+        load_config(path)
+
+
+def test_knowledge_rejects_zero_min_query_words(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("[knowledge]\nmin_query_words = 0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="min_query_words"):
+        load_config(path)
+
+
+def test_knowledge_rejects_unknown_key(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("[knowledge]\nthreshold = 0.9\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Unknown key"):
+        load_config(path)
 
 
 def test_channel_policy_rejects_unknown_channel(tmp_path: Path) -> None:
@@ -108,6 +165,8 @@ max_words = 42
     assert config.context.enabled is False
     assert config.answer.max_words == 42
     assert config.answer.stream is True
+    assert config.answer.verify == "off"
+    assert config.answer.sweep == "always"
 
 
 def test_rejects_unknown_key(tmp_path: Path) -> None:
@@ -133,6 +192,8 @@ def test_project_config_loads() -> None:
     assert config.audio.silence_ms == 900
     assert config.merge.enabled is True
     assert config.answer.stream is True
+    assert config.answer.verify == "off"
+    assert config.answer.sweep == "always"
     assert config.stt.hallucination_blocklist
     assert config.gate.channel_policy == {"mic": "explicit", "sys": "full"}
     # Device fields are machine-local state the in-app device picker rewrites

@@ -64,7 +64,16 @@ QUESTION_PREFIXES = {
     "so", "well", "okay", "ok", "then", "and", "but",
     "great", "alright", "right", "sure", "now", "yes", "yeah", "cool",
     "perfect", "good", "nice", "fine",
+    # Sentence-initial conversational lead-ins observed in real misses. Since
+    # Whisper capitalizes every utterance, the vocative heuristic otherwise
+    # mistakes these for names: "Again, describe RAG pipelines" became speech
+    # addressed to a fictional person named Again.
+    "again", "wait", "hello", "please",
 }
+# Some acknowledgments are question lead-ins only as a complete phrase. Making
+# either word a QUESTION_PREFIX by itself would be far too broad: most mic
+# narration begins with "it", and "got an error ..." is not an acknowledgment.
+_QUESTION_PREFIX_PHRASES = (("got", "it"),)
 # Command-form asks. "Evaluation metrics. Talk about them." carries no
 # question mark and no interrogative, yet is as explicit as a request gets --
 # and interviewers open with imperatives constantly ("Tell me about
@@ -73,6 +82,13 @@ REQUEST_VERBS = {
     "explain", "describe", "talk", "tell", "walk", "give", "list", "compare",
     "elaborate", "define", "discuss", "summarize", "summarise", "outline",
 }
+# A generic honorific remains ambiguous on the user's microphone, so it is not
+# a general QUESTION_PREFIX: "Sir, can you close the window?" may be aimed at a
+# real person. The narrower command-form exception below handles unmistakable
+# requests for an explanation without opening every honorific-prefixed action.
+_GENERIC_HONORIFICS = {"sir", "madam", "ma'am"}
+_HONORIFIC_REQUEST_VERBS = REQUEST_VERBS - {"give"}
+_REQUEST_PREFIXES = QUESTION_PREFIXES | _GENERIC_HONORIFICS
 # Everyday idioms that share the shape but request nothing. Matched against
 # the whole compacted utterance (punctuation-stripped): precision matters
 # here because the imperative accept skips the semantic gate entirely.
@@ -104,6 +120,19 @@ TAG_PATTERNS = (
     re.compile(r"(?:^|\W)ok\?$"),
     re.compile(r"(?:^|\W)know what i mean\?$"),
     re.compile(r"(?:^|\W)am i right\?$"),
+)
+
+# A tag can also be the speaker's way of CHALLENGING an earlier answer rather
+# than making a throwaway rhetorical check-in.  Keep this deliberately narrow:
+# the utterance must explicitly call back to what was said, contain an earlier
+# tag/question boundary, and then introduce a contrasting observation.  It is
+# not accepted outright -- it merely earns semantic judgment below.
+_ANSWER_CALLBACK_RE = re.compile(
+    r"^(?:you (?:said|mentioned|explained|told me|were saying)\b"
+    r"|(?:as|like) you (?:said|mentioned|explained)\b)"
+)
+_CONTRAST_AFTER_QUESTION_RE = re.compile(
+    r"\?\s+(?:but|however|yet)\b"
 )
 
 PROMPTS = {
@@ -141,6 +170,27 @@ def words(text: str) -> list[str]:
     return WORD_RE.findall(text)
 
 
+def _question_start(lowered: list[str]) -> int:
+    """Index after conversational lead-ins at the start of an utterance."""
+    start = 0
+    while start < len(lowered):
+        if lowered[start] in QUESTION_PREFIXES:
+            start += 1
+            continue
+        phrase = next(
+            (
+                candidate
+                for candidate in _QUESTION_PREFIX_PHRASES
+                if lowered[start : start + len(candidate)] == list(candidate)
+            ),
+            None,
+        )
+        if phrase is None:
+            break
+        start += len(phrase)
+    return start
+
+
 def _is_vocative(text: str) -> bool:
     stripped = text.strip()
     # "Hey Sarah, ..." / "Hey Sarah can you ..."
@@ -163,15 +213,32 @@ def _is_vocative(text: str) -> bool:
     return match.group(1).casefold() not in QUESTION_PREFIXES
 
 
+def _has_generic_honorific_prefix(text: str) -> bool:
+    match = re.match(r"^([A-Z][A-Za-z'-]+)\s*,", text.strip())
+    return bool(
+        match and match.group(1).casefold() in _GENERIC_HONORIFICS
+    )
+
+
 def _is_imperative_request(text: str, compact: str) -> bool:
     """Whether the utterance is a command-form ask ("Talk about X.")."""
-    if compact.rstrip(".?! ") in _IMPERATIVE_IDIOMS:
+    compact_tokens = [token.lower() for token in words(compact)]
+    compact_start = 0
+    while (
+        compact_start < len(compact_tokens)
+        and compact_tokens[compact_start] in _REQUEST_PREFIXES
+    ):
+        compact_start += 1
+    # Courtesy/discourse prefixes do not turn a non-request idiom into a
+    # request: "Sir, give me a second" remains a request for time, not an
+    # information question.
+    if " ".join(compact_tokens[compact_start:]) in _IMPERATIVE_IDIOMS:
         return False
     for sentence in _SENTENCE_SPLIT_RE.split(text):
         tokens = [token.lower() for token in words(sentence)]
         start = 0
         while start < len(tokens) and (
-            tokens[start] in QUESTION_PREFIXES or tokens[start] == "please"
+            tokens[start] in _REQUEST_PREFIXES or tokens[start] == "please"
         ):
             start += 1
         if start < len(tokens) and tokens[start] in REQUEST_VERBS:
@@ -190,6 +257,39 @@ def _is_imperative_request(text: str, compact: str) -> bool:
     )
 
 
+def is_complete_imperative_request(text: str) -> bool:
+    """Whether *text* is a complete command-form ask, even without punctuation.
+
+    This is shared by continuity and gating: "Explain RAG" must neither wait in
+    the fragment merge window nor die under the three-word noise floor. At the
+    same time, true stubs such as "Tell me" and "So, talk about" stay open.
+    """
+    lowered = [token.lower() for token in words(text)]
+    if len(lowered) < 2 or lowered[-1] in TRAILING_FRAGMENT_WORDS:
+        return False
+    generic_honorific = _has_generic_honorific_prefix(text)
+    if _is_vocative(text) and not generic_honorific:
+        return False
+    start = 0
+    while start < len(lowered) and lowered[start] in _REQUEST_PREFIXES:
+        start += 1
+    request = lowered[start:]
+    if len(request) < 2:
+        return False
+    if generic_honorific and request[0] not in _HONORIFIC_REQUEST_VERBS:
+        return False
+    # These relational verbs still lack their requested object in the terse
+    # two-word form. Longer forms ("Tell me about RAG") are complete.
+    if (
+        len(request) == 2
+        and request[0] in {"tell", "walk", "give"}
+        and request[1] in {"me", "us"}
+    ):
+        return False
+    compact = re.sub(r"\s+", " ", text.strip().lower())
+    return _is_imperative_request(text, compact)
+
+
 def _is_tag_question(compact: str) -> bool:
     """Whether the utterance is a tag/rhetorical ask, not a real question.
 
@@ -206,6 +306,17 @@ def _is_tag_question(compact: str) -> bool:
             continue
         remainder = compact[: match.start()].rstrip()
         if remainder.endswith(","):
+            # "You said X, right? But I observed Y, so X should apply, right?"
+            # is a substantive challenge to an earlier answer.  Treating the
+            # final "right?" in isolation used to hard-reject the entire
+            # follow-up before the semantic gate could see the conflict.  A
+            # plain confirmation ("You said X, right?") and repeated agreement
+            # seeking without a contrast remain rhetorical.
+            if (
+                _ANSWER_CALLBACK_RE.search(compact)
+                and _CONTRAST_AFTER_QUESTION_RE.search(remainder)
+            ):
+                return False
             return True
         if all(
             token in STOPWORDS or token in FILLERS or token in INTERROGATIVES
@@ -223,7 +334,8 @@ def heuristic_decision(
 ) -> StageADecision:
     tokens = words(text)
     lowered = [token.lower() for token in tokens]
-    if len(tokens) < min_words:
+    complete_imperative = is_complete_imperative_request(text)
+    if len(tokens) < min_words and not complete_imperative:
         return StageADecision("reject", "too_few_words")
     if lowered and all(token in FILLERS for token in lowered):
         return StageADecision("reject", "filler_only")
@@ -251,12 +363,7 @@ def heuristic_decision(
     # INTERROGATIVES from slipping through: "Will, can you review this?" is
     # addressed to Will, not to the assistant, and must reach the vocative
     # handling below whatever the first word looks like.
-    question_start = 0
-    while (
-        question_start < len(lowered)
-        and lowered[question_start] in QUESTION_PREFIXES
-    ):
-        question_start += 1
+    question_start = _question_start(lowered)
     if (
         text.rstrip().endswith("?")
         and question_start < len(lowered)
@@ -272,11 +379,7 @@ def heuristic_decision(
     # disqualifies it: "So, tell me about" is a request CUT OFF mid-sentence,
     # and accepting the stub would answer a question with no object -- the
     # merge layer holds it until the rest arrives.
-    if (
-        lowered[-1] not in TRAILING_FRAGMENT_WORDS
-        and not _is_vocative(text)
-        and _is_imperative_request(text, compact)
-    ):
+    if complete_imperative:
         return StageADecision("accept", "imperative_request")
     if _is_vocative(text):
         return StageADecision("reject", "human_vocative")
@@ -328,9 +431,7 @@ def is_question_shaped(text: str) -> bool:
     if text.rstrip().endswith("?"):
         return True
     lowered = [token.lower() for token in words(text)]
-    start = 0
-    while start < len(lowered) and lowered[start] in QUESTION_PREFIXES:
-        start += 1
+    start = _question_start(lowered)
     return start < len(lowered) and lowered[start] in INTERROGATIVES
 
 
@@ -467,7 +568,11 @@ class OllamaGate:
             + "\n\nJudge ONLY the CURRENT UTTERANCE. The information need must be present in the "
             "current utterance itself. CONTEXT is provided solely to resolve referents (pronouns, "
             "'that one', 'the second one') appearing inside the current utterance -- never to "
-            "supply a topic the current utterance does not mention."
+            "supply a topic the current utterance does not mention. Resolve a referent to its "
+            "NEAREST plausible antecedent: the immediately preceding context line(s) outrank an "
+            "older, more-discussed topic. A statement spoken just before a question is usually "
+            "that question's setup -- 'it' in the question points into that statement, not back "
+            "at an earlier exchange."
             + profile_topic
             + "\n\nDecisive test: the speaker must be expressing that they DO NOT KNOW something, or "
             "WANT information. Merely mentioning a technical topic is not enough. A speaker "
@@ -476,13 +581,27 @@ class OllamaGate:
             "Utterances are speech transcriptions and may carry recognition garble, especially "
             "at the end (stray words, repeated fragments, a lost question mark). Judge the "
             "coherent part on its own merits and leave the garble out of the rewrite; garble "
-            "alone is never a reason to reject an otherwise clear ask.\n"
+            "alone is never a reason to reject an otherwise clear ask. But this salvage has a "
+            "floor: it requires a coherent ask to already be present. When the utterance is "
+            "mostly word-salad -- disjointed phrases that do not compose into one sensible "
+            "request, even if technical terms and a question word appear in it -- return FALSE. "
+            "NEVER assemble a question out of garble fragments; a mis-transcription the speaker "
+            "never asked is worse than staying silent.\n"
+            "A sentence-final confirmation tag such as 'right?' is FALSE when it merely asks "
+            "for agreement. But a multi-sentence callback that explicitly contrasts something "
+            "previously said with a conflicting observation is a real clarification request, "
+            "even when it also ends in 'right?'. Return TRUE and rewrite the underlying conflict "
+            "as a concise question.\n"
             "Examples:\n"
             '- "I have no idea how python decorators handle arguments" -> TRUE (the utterance '
             "itself names a topic and states an information need; phrasing it as a statement "
             "rather than a question does not matter).\n"
             '- "I wonder how much memory that actually uses" -> TRUE (resolve "that" from '
             "context; the need is in the utterance).\n"
+            '- "You said browser sharing should include system audio, right? But I shared the '
+            'whole screen and no audio was sent, so that should have worked, right?" -> TRUE '
+            "(the contrast challenges earlier information and asks for the discrepancy to be "
+            "explained; rewrite that discrepancy as a direct question).\n"
             '- "I\'m going to bump the timeout to thirty seconds" -> FALSE (a stated plan; the '
             "speaker is telling, not asking).\n"
             '- "we still need signoff from platform before Thursday" -> FALSE (an asserted fact '
@@ -493,6 +612,16 @@ class OllamaGate:
             'Ferry 2." -> TRUE (an interrogative whose tail is recognition garble that also ate '
             'the question mark; judge the coherent part and rewrite it clean: "Why does it take '
             'time after the first words are spoken?").\n'
+            '- "who are the details, IAM and identity, I am the limitation of this process, when '
+            'you have an official opinion, a security operator, this is a separation of duties" '
+            "-> FALSE (word-salad throughout: technical terms and a question word, but no "
+            "coherent ask survives to salvage; do not invent one).\n"
+            '- CONTEXT ends with "leadership wants to guarantee no one can disable CloudTrail." '
+            'and the current utterance is "in any account, how do you enforce it '
+            'organization-wide?" -> TRUE with query "How do you enforce organization-wide '
+            "CloudTrail so no one can disable it in any account?\" ('it' resolves into the "
+            "immediately preceding setup line, never back to an older exchange on a different "
+            "topic).\n"
             "\nReturn JSON matching the schema. If TRUE, rewrite the request as a concise, "
             "self-contained query. If FALSE, query is empty."
         )

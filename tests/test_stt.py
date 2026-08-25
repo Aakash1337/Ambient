@@ -53,6 +53,67 @@ def test_exact_hallucination_phrase_is_dropped() -> None:
     assert transcriber._transcribe_sync(utterance()) is None
 
 
+@pytest.mark.parametrize(
+    "courtesy",
+    ["Thank you.", "Thank you very much.", "Thank you so much!"],
+)
+def test_agent_runtime_preserves_real_courtesy_with_cyber_profile(
+    courtesy: str,
+) -> None:
+    profile = Profile(
+        "Cybersecurity analytics",
+        "Defensive cybersecurity analytics",
+        "",
+        [],
+        "",
+    )
+    transcriber = WhisperTranscriber(STTConfig(), profile=profile)
+    transcriber.set_agent_mode(True)
+    transcriber.model = FakeWhisper(courtesy)
+
+    result = transcriber._transcribe_sync(utterance())
+
+    assert result is not None
+    assert result.text == courtesy
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    ["Thank you for watching.", "Thanks for watching!", "Please subscribe."],
+)
+def test_agent_runtime_still_drops_non_conversational_artifacts(
+    artifact: str,
+) -> None:
+    profile = Profile(
+        "Customer service",
+        "Customer support",
+        "",
+        [],
+        "",
+        interaction="agent",
+    )
+    transcriber = WhisperTranscriber(STTConfig(), profile=profile)
+    transcriber.set_agent_mode(True)
+    transcriber.model = FakeWhisper(artifact)
+
+    assert transcriber._transcribe_sync(utterance()) is None
+
+
+def test_customer_service_profile_in_assist_still_drops_thank_you() -> None:
+    profile = Profile(
+        "Customer service",
+        "Customer support",
+        "",
+        [],
+        "",
+        interaction="agent",  # legacy metadata must not control runtime STT
+    )
+    transcriber = WhisperTranscriber(STTConfig(), profile=profile)
+    transcriber.model = FakeWhisper("Thank you.")
+
+    assert transcriber._transcribe_sync(utterance()) is None
+
+
 def test_courteous_opener_before_real_question_survives() -> None:
     transcriber = WhisperTranscriber(STTConfig())
     transcriber.model = FakeWhisper(
@@ -174,6 +235,29 @@ def test_cuda_inference_failure_falls_back_to_cpu(monkeypatch) -> None:
     assert result is not None and result.text == "How does this work?"
     assert transcriber.device == "cpu", "must degrade instead of dying"
     assert flaky.calls == 2, "must retry the utterance on the CPU model"
+
+
+def test_cuda_oom_warning_explains_what_to_close() -> None:
+    config = STTConfig(cpu_compute_type="int8")
+    transcriber = WhisperTranscriber(config)
+
+    warning = transcriber._cuda_fallback_warning(
+        "CUDA Whisper initialization failed", "CUDA failed with error out of memory"
+    )
+
+    assert "GPU memory is exhausted" in warning
+    assert "games" in warning
+    assert "Whisper/dictation" in warning
+    assert "Ollama" in warning
+    assert "CPU int8" in warning
+
+
+def test_non_oom_cuda_warning_does_not_guess_at_gpu_pressure() -> None:
+    transcriber = WhisperTranscriber(STTConfig())
+    warning = transcriber._cuda_fallback_warning(
+        "CUDA Whisper unavailable", "cublas is missing"
+    )
+    assert "GPU memory is exhausted" not in warning
 
 
 def test_cpu_runtime_errors_are_not_swallowed() -> None:

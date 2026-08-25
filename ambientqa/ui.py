@@ -68,8 +68,14 @@ def plain_text(answer: str) -> str:
 
 class UIController(Protocol):
     paused: bool
+    voice_enabled: bool
+    agent_mode: bool
 
     def toggle_pause(self) -> bool: ...
+    def toggle_voice(self) -> str: ...
+    def toggle_agent_mode(self) -> str: ...
+    def toggle_interaction_mode(self) -> str: ...
+    def toggle_input_channel(self, channel: str) -> bool: ...
     async def force_answer_last(self) -> None: ...
     def cycle_gate_mode(self) -> str: ...
     def status_text(self) -> str: ...
@@ -570,10 +576,17 @@ class QACard(Static):
         self,
         question: str,
         rendered_callback: Callable[[], None] | None = None,
+        agent_mode: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.question = question
+        self.agent_mode = agent_mode
+        # Agent is an interaction role, not a customer-service profile.  Keep
+        # these labels useful for a cybersecurity or technical conversation too.
+        self._question_prefix = "SPEAKER  " if agent_mode else "Q  "
+        self._answer_prefix = "AMBIENT  " if agent_mode else "A  "
+        self._waiting_word = "responding" if agent_mode else "answering"
         self._rendered_callback = rendered_callback or (lambda: None)
         self._spinner_index = 0
         self._spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -585,8 +598,8 @@ class QACard(Static):
         self._resolved = False
 
     def compose(self) -> ComposeResult:
-        yield Label("Q  " + self.question, classes="question")
-        yield Static("⠋  answering…", classes="answer")
+        yield Label(self._question_prefix + self.question, classes="question")
+        yield Static(f"⠋  {self._waiting_word}…", classes="answer")
 
     def on_mount(self) -> None:
         self._timer = self.set_interval(0.1, self._tick)
@@ -596,7 +609,7 @@ class QACard(Static):
             return
         self._spinner_index = (self._spinner_index + 1) % len(self._spinner)
         self.query_one(".answer", Static).update(
-            f"{self._spinner[self._spinner_index]}  answering…"
+            f"{self._spinner[self._spinner_index]}  {self._waiting_word}…"
         )
 
     def _render_stream(self) -> None:
@@ -607,7 +620,7 @@ class QACard(Static):
         # Sample and schedule auto-follow before the update changes scroll bounds.
         self._rendered_callback()
         self.query_one(".answer", Static).update(
-            "A  " + plain_text(self._raw_answer)
+            self._answer_prefix + plain_text(self._raw_answer)
         )
         self._last_stream_render = time.monotonic()
 
@@ -647,7 +660,11 @@ class QACard(Static):
             self._flush_timer.pause()
             self._flush_timer = None
         self._raw_answer = answer
-        prefix = "A  " if status == "ok" else f"{status.replace('_', ' ')}  "
+        prefix = (
+            self._answer_prefix
+            if status == "ok"
+            else f"{status.replace('_', ' ')}  "
+        )
         self._rendered_callback()
         self.query_one(".answer", Static).update(prefix + plain_text(answer))
 
@@ -659,12 +676,21 @@ class QACard(Static):
 
 
 class AmbientQAApp(App[None]):
-    TITLE = "Ambient Q&A"
+    TITLE = "Ambient"
     SUB_TITLE = "passive question side-channel"
     CSS = """
     Screen { layout: vertical; }
     #feed { height: 1fr; scrollbar-gutter: stable; }
     .transcript { color: $text-muted; height: auto; margin: 0 1; }
+    #agent-banner {
+        height: 1;
+        display: none;
+        background: $success;
+        color: $text;
+        text-style: bold;
+        text-align: center;
+    }
+    #agent-banner.visible { display: block; }
     /* NOT docked. Two bottom-docked widgets do not stack here: #status and the
        Footer both resolved to the same row and the Footer drew over it, so the
        whole status line (mic:off, whisper device, warnings) was invisible.
@@ -698,16 +724,32 @@ class AmbientQAApp(App[None]):
     #paused-banner.visible { display: block; }
     """
     BINDINGS = [
+        ("1", "mic_input", "Mic listen"),
+        ("2", "system_input", "System listen"),
         ("p", "pause", "Pause"),
         ("c", "clear", "Clear"),
         ("t", "transcripts", "Transcripts"),
         ("l", "sessions", "Sessions"),
         ("a", "force_answer", "Answer last"),
         ("s", "strictness", "Strictness"),
+        ("m", "voice", "Voice"),
+        ("g", "agent_mode", "Q&A / Agent"),
+        ("r", "conversation", "Delivery"),
         ("x", "profiles", "Context profile"),
         ("d", "devices", "Audio devices"),
         ("q", "quit", "Quit"),
     ]
+
+    def check_action(
+        self, action: str, parameters: tuple[object, ...]
+    ) -> bool | None:
+        # The voice key exists only in voice mode (--voice); a silent pane's
+        # footer must look exactly as it always has.
+        if action in {"voice", "agent_mode", "conversation"} and not getattr(
+            self.controller, "voice_enabled", False
+        ):
+            return False
+        return True
 
     def __init__(
         self,
@@ -727,6 +769,7 @@ class AmbientQAApp(App[None]):
         self._transcript_rows: dict[str, Static] = {}
 
     def compose(self) -> ComposeResult:
+        yield Static("", id="agent-banner")
         yield VerticalScroll(id="feed")
         yield Static("", id="paused-banner")
         yield Static("starting…", id="status")
@@ -735,6 +778,33 @@ class AmbientQAApp(App[None]):
     def on_mount(self) -> None:
         self.set_interval(self.status_interval_s, self._refresh_status)
         self._apply_paused()
+        self._apply_mode_chrome()
+
+    def _apply_mode_chrome(self) -> None:
+        """Make autonomous participation impossible to miss at a glance."""
+        agent_mode = bool(getattr(self.controller, "agent_mode", False))
+        banner = self.query_one("#agent-banner", Static)
+        if agent_mode:
+            customer = getattr(self.controller, "_agent_customer_channel", "mic")
+            getter = getattr(self.controller, "input_channel_enabled", None)
+            customer_live = bool(getter(customer)) if callable(getter) else True
+            if getattr(self.controller, "paused", False):
+                message = "○ AGENT PAUSED — press p to resume"
+            elif not customer_live:
+                label = "microphone" if customer == "mic" else "system audio"
+                key = "1" if customer == "mic" else "2"
+                message = f"○ AGENT WAITING — speaker {label} is muted · press {key}"
+            else:
+                label = "MIC" if customer == "mic" else "SYSTEM"
+                message = (
+                    f"● AGENT LIVE · SPEAKER={label} — responds to the conversation · "
+                    "1 mic · 2 system"
+                )
+            banner.update(message)
+        else:
+            banner.update("")
+        banner.set_class(agent_mode, "visible")
+        self.query_one("#status", Static).set_class(agent_mode, "agent")
 
     def _apply_paused(self) -> None:
         """Show the pause state. Kept separate from the status line so the key
@@ -750,6 +820,7 @@ class AmbientQAApp(App[None]):
     def _refresh_status(self) -> None:
         self.query_one("#status", Static).update(self.controller.status_text())
         self._apply_paused()
+        self._apply_mode_chrome()
 
     def _following(self, feed: VerticalScroll) -> bool:
         """Whether the view sits at the edge where new entries appear: the top
@@ -796,6 +867,7 @@ class AmbientQAApp(App[None]):
         card = QACard(
             question,
             rendered_callback=self._answer_card_rendered,
+            agent_mode=bool(getattr(self.controller, "agent_mode", False)),
             id=f"qa-{question_id}",
         )
         self._cards[question_id] = card
@@ -844,6 +916,30 @@ class AmbientQAApp(App[None]):
     def action_strictness(self) -> None:
         mode = self.controller.cycle_gate_mode()
         self.notify(f"Gate mode: {mode}")
+
+    def action_voice(self) -> None:
+        self.notify(self.controller.toggle_voice())
+        self._refresh_status()
+
+    def action_agent_mode(self) -> None:
+        self.notify(self.controller.toggle_agent_mode())
+        self._refresh_status()
+
+    def action_conversation(self) -> None:
+        self.notify(self.controller.toggle_interaction_mode())
+        self._refresh_status()
+
+    def _toggle_input(self, channel: str, label: str) -> None:
+        enabled = self.controller.toggle_input_channel(channel)
+        state = "listening" if enabled else "muted"
+        self.notify(f"{label} input {state}")
+        self._refresh_status()
+
+    def action_mic_input(self) -> None:
+        self._toggle_input("mic", "Microphone")
+
+    def action_system_input(self) -> None:
+        self._toggle_input("sys", "System audio")
 
     # Own worker group (as below): in the shared default group, pressing x
     # while the picker is stopping/restarting capture would cancel this worker
@@ -907,6 +1003,7 @@ class AmbientQAApp(App[None]):
                     self.add_warning("Context profile is unavailable or globally disabled")
                 else:
                     self.notify(f"Profile active: {name}")
+                self._refresh_status()
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -8,7 +8,13 @@ import pytest
 
 from ambientqa.config import GateConfig
 from ambientqa.bus import Transcript
-from ambientqa.gate import OllamaGate, PROMPTS, QuestionGate, heuristic_decision
+from ambientqa.gate import (
+    OllamaGate,
+    PROMPTS,
+    QuestionGate,
+    heuristic_decision,
+    is_question_shaped,
+)
 from ambientqa.profile import Profile
 
 
@@ -150,6 +156,73 @@ def test_pure_tag_phrases_are_rejected_despite_interrogative_shape(text: str) ->
     assert (decision.outcome, decision.reason) == ("reject", "tag_or_rhetorical")
 
 
+_REPORTED_CONTRASTIVE_FOLLOWUP = (
+    "You said there wasn't much support for Teams and Firefox in terms of "
+    "sharing audio, right? But I was sharing the whole screen of my monitor. "
+    "So it should just share the audio that the system is getting, right?"
+)
+
+
+def test_contrastive_callback_ending_in_tag_reaches_semantic_gate() -> None:
+    # 10:48:58 production regression: looking only at the final "right?" hid
+    # the actual information need -- reconcile an earlier answer with a
+    # conflicting observation.  This is intentionally not fast-accepted; the
+    # semantic gate still decides whether the contrast really asks anything.
+    decision = heuristic_decision(_REPORTED_CONTRASTIVE_FOLLOWUP)
+    assert (decision.outcome, decision.reason) == ("llm", "needs_semantic_gate")
+
+
+def test_contrastive_callback_is_judged_on_explicit_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = QuestionGate(GateConfig())
+    calls: list[str] = []
+
+    async def fake_classify(text: str, _context: list[str]) -> tuple[bool, str]:
+        calls.append(text)
+        return True, "Should sharing the whole screen also share system audio?"
+
+    monkeypatch.setattr(gate.ollama, "classify", fake_classify)
+    result = asyncio.run(
+        gate.evaluate(
+            Transcript(
+                "mic",
+                _REPORTED_CONTRASTIVE_FOLLOWUP,
+                100.0,
+                "reported-tag-followup",
+            ),
+            ["[mic] Are there any workarounds?"],
+            policy="explicit",
+        )
+    )
+
+    assert calls == [_REPORTED_CONTRASTIVE_FOLLOWUP]
+    assert (result.accepted, result.reason, result.query) == (
+        True,
+        "ollama_accept",
+        "Should sharing the whole screen also share system audio?",
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A lone callback asks only for agreement; there is no conflicting
+        # observation for Ambient to reconcile.
+        "You said the retry is automatic, right?",
+        # Multiple tags alone are not enough.  Requiring an explicit contrast
+        # prevents ordinary agreement-seeking conversation from flooding cards.
+        "You said the retry is automatic, right? So we're done, right?",
+        # A contrast is not enough without an explicit callback to an earlier
+        # answer; this is ordinary conversation between the two people.
+        "The retry is automatic, right? But it failed again, right?",
+    ],
+)
+def test_non_substantive_or_non_callback_tags_stay_rejected(text: str) -> None:
+    decision = heuristic_decision(text)
+    assert (decision.outcome, decision.reason) == ("reject", "tag_or_rhetorical")
+
+
 def test_names_that_look_like_interrogatives_stay_vocative() -> None:
     # A name that casefolds into INTERROGATIVES must not ride the fast-accept
     # past the vocative check: this is addressed to Will, not the assistant.
@@ -171,12 +244,197 @@ def test_acknowledgment_lead_ins_do_not_block_fast_accept(text: str) -> None:
     assert (decision.outcome, decision.reason) == ("accept", "explicit_interrogative")
 
 
+def test_multiword_acknowledgment_does_not_block_fast_accept() -> None:
+    decision = heuristic_decision("Got it, so what should I improve?")
+    assert (decision.outcome, decision.reason) == (
+        "accept",
+        "explicit_interrogative",
+    )
+
+
+def test_multiword_acknowledgment_with_lost_mark_reaches_semantic_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = (
+        "Got it, so, what do I do to improve, the, the, the, the, the, "
+        "the, the, the, the, the, the, video, video, audio capture, "
+        "video, audio capture,"
+    )
+    gate = QuestionGate(GateConfig())
+    calls: list[str] = []
+
+    async def fake_classify(raw: str, _context: list[str]) -> tuple[bool, str]:
+        calls.append(raw)
+        return True, "What do I do to improve video and audio capture?"
+
+    monkeypatch.setattr(gate.ollama, "classify", fake_classify)
+    result = asyncio.run(
+        gate.evaluate(
+            Transcript("mic", text, 100.0, "reported-disfluent-question"),
+            [],
+            policy="explicit",
+        )
+    )
+
+    assert calls == [text]
+    assert (result.accepted, result.reason, result.query) == (
+        True,
+        "ollama_accept",
+        "What do I do to improve video and audio capture?",
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Got it, so the video capture needs improvement.",
+        "Got it working, so the video capture is better.",
+    ],
+)
+def test_multiword_acknowledgment_does_not_make_narration_question_shaped(
+    text: str,
+) -> None:
+    assert is_question_shaped(text) is False
+
+
+def test_acknowledgment_prefixed_other_side_narration_is_not_blindly_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "Got it, so what I did was improve video capture."
+    gate = QuestionGate(GateConfig())
+    calls: list[str] = []
+
+    async def reject_narration(raw: str, _context: list[str]) -> tuple[bool, str]:
+        calls.append(raw)
+        return False, ""
+
+    monkeypatch.setattr(gate.ollama, "classify", reject_narration)
+    result = asyncio.run(
+        gate.evaluate(
+            Transcript("sys", text, 100.0, "other-side-narration"),
+            [],
+            policy="full",
+        )
+    )
+
+    assert calls == [text]
+    assert (result.accepted, result.reason) == (False, "ollama_reject")
+
+
 def test_leading_discourse_marker_is_not_a_vocative_name() -> None:
     # Whisper capitalizes every sentence start, so without the '?' the
     # fast-accept cannot save this one; it must fall through to the semantic
     # gate rather than dying as human_vocative.
     decision = heuristic_decision("Okay, can you explain the CAP theorem.")
     assert (decision.outcome, decision.reason) == ("llm", "needs_semantic_gate")
+
+
+def test_again_prefixed_command_is_not_mistaken_for_a_persons_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decision = heuristic_decision("Again, describe RAG pipelines.")
+    assert (decision.outcome, decision.reason) == (
+        "accept",
+        "imperative_request",
+    )
+
+    # Prove the live mic policy fast-accepts the exact reported transcript;
+    # neither the semantic model nor a later recovery pass should be needed.
+    gate = QuestionGate(GateConfig())
+
+    async def must_not_run(_text: str, _context: list[str]) -> tuple[bool, str]:
+        raise AssertionError("clear imperative reached the semantic gate")
+
+    monkeypatch.setattr(gate.ollama, "classify", must_not_run)
+    result = asyncio.run(
+        gate.evaluate(
+            Transcript(
+                "mic", "Again, describe RAG pipelines.", 1.0, "reported-miss"
+            ),
+            [],
+            policy="explicit",
+        )
+    )
+    assert (result.accepted, result.reason) == (True, "imperative_request")
+
+
+def test_again_prefixed_narration_is_not_accidentally_accepted() -> None:
+    decision = heuristic_decision("Again, we deployed the RAG pipeline.")
+    assert (decision.outcome, decision.reason) == ("llm", "needs_semantic_gate")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "EXPLAIN RAG",
+        "Define RAG.",
+        "Describe Kubernetes.",
+    ],
+)
+def test_complete_two_word_imperatives_bypass_the_noise_floor(text: str) -> None:
+    decision = heuristic_decision(text)
+    assert (decision.outcome, decision.reason) == (
+        "accept",
+        "imperative_request",
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Tell me.",
+        "Talk about.",
+        "Walk me.",
+        "Give me.",
+        "Explain about.",
+        "EXPREME LAG!",
+    ],
+)
+def test_incomplete_or_declarative_two_word_phrases_stay_rejected(text: str) -> None:
+    decision = heuristic_decision(text)
+    assert (decision.outcome, decision.reason) == ("reject", "too_few_words")
+
+
+def test_generic_honorific_does_not_turn_a_request_into_human_vocative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "Sir, talk to me about RAG."
+    assert heuristic_decision(text).reason == "imperative_request"
+
+    gate = QuestionGate(GateConfig())
+
+    async def must_not_run(_text: str, _context: list[str]) -> tuple[bool, str]:
+        raise AssertionError("honorific-prefixed request reached semantic gate")
+
+    monkeypatch.setattr(gate.ollama, "classify", must_not_run)
+    result = asyncio.run(
+        gate.evaluate(
+            Transcript("mic", text, 1.0, "reported-honorific-miss"),
+            [],
+            policy="explicit",
+        )
+    )
+    assert (result.accepted, result.reason) == (True, "imperative_request")
+
+
+def test_generic_honorific_does_not_fast_accept_an_action_for_a_human() -> None:
+    decision = heuristic_decision("Sir, can you close the window?")
+    assert (decision.outcome, decision.reason) == (
+        "reject",
+        "human_vocative",
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Sir, give me a second.",
+        "Again, tell me about it.",
+        "Okay, give me a break.",
+    ],
+)
+def test_prefixed_imperative_idioms_are_not_information_requests(text: str) -> None:
+    assert heuristic_decision(text).reason != "imperative_request"
 
 
 def test_right_suffix_inside_a_word_is_not_a_tag() -> None:
@@ -311,6 +569,23 @@ def test_profile_topic_is_disambiguation_only_in_gate_prompt() -> None:
     assert "Guardrails" not in prompt
     assert "never supply a topic the current utterance lacks" in prompt
     assert "not a relevance filter" in prompt
+
+
+def test_gate_prompt_rejects_word_salad_and_prefers_nearest_antecedent() -> None:
+    """Two live-session failure modes, pinned as prompt invariants.
+
+    A garbled rehearsal ("who are the details, IAM and identity, I am the
+    limitation...") was rewritten into a question nobody asked, and a dangling
+    'it' was resolved to an older exchange instead of the setup statement
+    spoken one line earlier.
+    """
+    prompt = OllamaGate(GateConfig()).system_prompt
+    assert "NEVER assemble a question out of garble fragments" in prompt
+    assert "word-salad" in prompt
+    assert "NEAREST plausible antecedent" in prompt
+    assert "usually" in prompt and "setup" in prompt
+    # The salvage rule for lightly-garbled real questions must survive.
+    assert "garble alone is never a reason to reject an otherwise clear ask" in prompt
 
 
 def test_profile_cannot_turn_contentless_fragment_into_question(

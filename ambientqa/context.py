@@ -80,6 +80,10 @@ class TranscriptContext:
         )
         return True
 
+    def clear(self) -> None:
+        """Start a fresh conversation without replacing the context object."""
+        self._lines.clear()
+
     def recent(self, count: int = 6, exclude_latest: bool = False) -> list[ContextLine]:
         lines = list(self._lines)
         if exclude_latest and lines:
@@ -92,4 +96,3 @@ class TranscriptContext:
     @property
     def last(self) -> ContextLine | None:
         return self._lines[-1] if self._lines else None
-

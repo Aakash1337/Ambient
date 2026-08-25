@@ -151,6 +151,26 @@ class UtteranceSegmenter:
             return self._finish(frame.channel, ended_at)
         return None
 
+    def discard(self, channel: str) -> None:
+        """Abandon any half-built utterance without emitting it.
+
+        Used when capture heard something that must never reach STT -- the
+        app's own voice during a speaking window. A frame gap alone is not
+        enough: the already-buffered chunks would still flush as an utterance
+        once the window closed.
+        """
+        state = self._states.get(channel)
+        if state is None:
+            return
+        state.active = False
+        state.chunks = []
+        state.pre_roll.clear()
+        state.silence_samples = 0
+        state.speech_samples = 0
+        reset = getattr(self._vads[channel], "reset", None)
+        if reset is not None:
+            reset()
+
     def flush(self, channel: str, timestamp: float) -> Utterance | None:
         if channel not in self._states or not self._states[channel].active:
             return None
@@ -173,6 +193,7 @@ async def segment_worker(
     utterances: DropOldestQueue[Utterance],
     segmenter: UtteranceSegmenter,
     stop: asyncio.Event,
+    mute: Callable[[str, float], bool] | None = None,
 ) -> None:
     while not stop.is_set():
         try:
@@ -180,6 +201,11 @@ async def segment_worker(
         except asyncio.TimeoutError:
             continue
         try:
+            # Dropped BEFORE the VAD, so a speaking window means the pipeline
+            # never even segments the app's own voice (any instance's).
+            if mute is not None and mute(frame.channel, frame.timestamp):
+                segmenter.discard(frame.channel)
+                continue
             utterance = segmenter.process(frame)
             if utterance is not None:
                 utterances.put_drop_oldest(utterance)

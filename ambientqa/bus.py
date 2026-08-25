@@ -7,7 +7,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field
 from time import time
-from typing import Generic, TypeVar
+from typing import Callable, Generic, TypeVar
 from uuid import uuid4
 
 import numpy as np
@@ -44,6 +44,36 @@ class DropOldestQueue(asyncio.Queue[T], Generic[T]):
                 self.task_done()
             except asyncio.QueueEmpty:
                 return items
+
+    def discard_where(self, predicate: Callable[[T], bool]) -> list[T]:
+        """Remove matching queued and thread-pending items, preserving order.
+
+        Capture producers first stage items in ``_thread_pending`` before an
+        event-loop callback moves them into the asyncio queue. Filtering only
+        the visible queue therefore leaves a race where an already-captured
+        frame appears immediately after a channel is muted. This method covers
+        both stores. Call it from the queue's event-loop thread, just like
+        ``drain()`` and ``put_drop_oldest()``.
+        """
+        discarded: list[T] = []
+        retained: list[T] = []
+        for item in self.drain():
+            if predicate(item):
+                discarded.append(item)
+            else:
+                retained.append(item)
+        for item in retained:
+            self.put_nowait(item)
+
+        with self._thread_lock:
+            pending: deque[T] = deque(maxlen=self._thread_pending.maxlen)
+            for item in self._thread_pending:
+                if predicate(item):
+                    discarded.append(item)
+                else:
+                    pending.append(item)
+            self._thread_pending = pending
+        return discarded
 
     def put_from_thread(self, loop: asyncio.AbstractEventLoop, item: T) -> None:
         """Bound both retained items and loop callbacks before the asyncio queue."""

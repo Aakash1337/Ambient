@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
+import pytest
+
+from ambientqa import __main__ as main_module
+from ambientqa.config import default_config
+from ambientqa import instances as instances_module
 from ambientqa.instances import HEARTBEAT_TTL_S, InstanceRegistry
 
 
@@ -33,11 +39,41 @@ def test_stale_heartbeats_are_pruned_not_counted(tmp_path: Path) -> None:
     assert not dead.exists(), "a crashed instance's file must be cleaned up"
 
 
+def test_stale_heartbeat_for_a_live_pid_is_not_pruned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "reg"
+    registry = InstanceRegistry(root, clock=lambda: 1000.0)
+    peer = root / "77777"
+    root.mkdir()
+    peer.touch()
+    os.utime(peer, (900.0, 900.0))
+    monkeypatch.setattr(
+        instances_module,
+        "_ambientqa_pid_alive",
+        lambda value: value == "77777",
+    )
+
+    assert registry.heartbeat_and_count() == 2
+    assert peer.exists()
+
+
 def test_close_removes_own_heartbeat(tmp_path: Path) -> None:
     registry = InstanceRegistry(tmp_path / "reg", clock=lambda: 1000.0)
     registry.heartbeat_and_count()
     registry.close()
     assert not (tmp_path / "reg" / str(os.getpid())).exists()
+
+
+def test_exclusive_lock_is_held_until_registry_closes(tmp_path: Path) -> None:
+    first = InstanceRegistry(tmp_path / "reg")
+    second = InstanceRegistry(tmp_path / "reg")
+
+    assert first.claim_exclusive()
+    assert not second.claim_exclusive()
+    first.close()
+    assert second.claim_exclusive()
+    second.close()
 
 
 def test_unusable_registry_still_reports_this_instance(tmp_path: Path) -> None:
@@ -47,3 +83,65 @@ def test_unusable_registry_still_reports_this_instance(tmp_path: Path) -> None:
     blocker.write_text("not a directory")
     registry = InstanceRegistry(blocker, clock=lambda: 1000.0)
     assert registry.heartbeat_and_count() == 1
+
+
+def test_startup_refuses_a_second_pipeline_before_controller_load(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    closed = False
+
+    class PeerRegistry:
+        def claim_exclusive(self) -> bool:
+            return True
+
+        def heartbeat_and_count(self) -> int:
+            return 2
+
+        def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    def controller_must_not_load(*_args, **_kwargs):
+        raise AssertionError("controller/model construction ran before the guard")
+
+    monkeypatch.setattr(main_module, "load_config", lambda _path: default_config())
+    monkeypatch.setattr(main_module, "InstanceRegistry", PeerRegistry)
+    monkeypatch.setattr(main_module, "AmbientController", controller_must_not_load)
+
+    with pytest.raises(SystemExit) as error:
+        asyncio.run(main_module._main())
+
+    assert error.value.code == 3
+    assert closed
+    assert "already running" in capsys.readouterr().err
+
+
+def test_startup_lock_failure_short_circuits_before_heartbeat_or_models(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    closed = False
+
+    class LockedRegistry:
+        def claim_exclusive(self) -> bool:
+            return False
+
+        def heartbeat_and_count(self) -> int:
+            raise AssertionError("heartbeat ran after the lifetime lock failed")
+
+        def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    def controller_must_not_load(*_args, **_kwargs):
+        raise AssertionError("controller/model construction ran after lock failure")
+
+    monkeypatch.setattr(main_module, "load_config", lambda _path: default_config())
+    monkeypatch.setattr(main_module, "InstanceRegistry", LockedRegistry)
+    monkeypatch.setattr(main_module, "AmbientController", controller_must_not_load)
+
+    with pytest.raises(SystemExit) as error:
+        asyncio.run(main_module._main())
+
+    assert error.value.code == 3
+    assert closed
+    assert "application lock is held" in capsys.readouterr().err

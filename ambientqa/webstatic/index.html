@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ambient — console</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div id="paused-bar" hidden>
+    <span class="pb-icon">⏸</span>
+    <strong>PAUSED — NOT LISTENING</strong>
+    <span class="pb-note">No audio enters transcription while paused.</span>
+    <button id="pb-resume" class="btn btn-invert">Resume · P</button>
+  </div>
+
+  <header id="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">AMBIENT</span>
+    </div>
+    <div id="listen-chip" class="chip chip-live"><span class="dot"></span><span id="listen-text">CONNECTING…</span></div>
+    <div id="agent-chip" class="chip chip-agent" hidden><span class="dot"></span><span id="agent-chip-text">AGENT LIVE</span></div>
+    <div class="input-controls" role="group" aria-label="Audio inputs">
+      <button class="btn btn-small on" id="btn-input-mic" type="button"
+        aria-pressed="true" title="Mute or resume microphone listening (1)">Mute mic · 1</button>
+      <button class="btn btn-small on system" id="btn-input-sys" type="button"
+        aria-pressed="true" title="Mute or resume system-audio listening (2)">Mute system · 2</button>
+    </div>
+    <div id="voice-chip" class="chip" hidden></div>
+    <div id="voice-controls" class="voice-controls" aria-label="Spoken answer controls" hidden>
+      <button class="btn btn-small" id="btn-voice" type="button"
+        title="Mute or unmute spoken answers (M)">Mute voice · M</button>
+      <div class="interaction-controls" role="group" aria-label="Interaction mode">
+        <span class="interaction-label">Interaction</span>
+        <button class="btn btn-small" id="btn-interaction-qa" type="button"
+          aria-pressed="true" title="Answer only detected questions (G)">Q&amp;A</button>
+        <button class="btn btn-small" id="btn-interaction-agent" type="button"
+          aria-pressed="false" title="Participate naturally in the conversation (G)">Agent</button>
+      </div>
+      <div class="delivery-controls" role="group" aria-label="Spoken answer delivery">
+        <span class="delivery-label">Delivery</span>
+        <button class="btn btn-small" id="btn-delivery-normal" type="button"
+          aria-pressed="false" title="Speak the opening cue">Normal</button>
+        <button class="btn btn-small" id="btn-delivery-conversational" type="button"
+          aria-pressed="false" title="Speak the complete answer in natural prose">Conversational</button>
+      </div>
+    </div>
+    <div id="head-note" class="head-note"></div>
+    <div class="spacer"></div>
+    <button class="btn" id="btn-devices" title="Audio devices (D)">Devices · D</button>
+    <button class="btn" id="btn-profile" title="Context profile (X)">Profile · X</button>
+    <button class="btn" id="btn-sessions" title="Recorded sessions (L)">Sessions · L</button>
+    <button class="btn btn-accent" id="btn-pause" title="Pause / resume listening (P)">Pause · P</button>
+    <button class="btn btn-danger" id="btn-quit" title="Quit the whole app (Q)">Quit</button>
+  </header>
+
+  <main id="grid">
+    <aside id="queue-col" class="col">
+      <div class="col-head"><span id="queue-title">QUESTION QUEUE</span> · <span id="queue-count">0</span></div>
+      <div id="queue-list"></div>
+      <div id="queue-empty" class="panel-hint">
+        Cards appear the moment something real is asked.
+        Small talk and narration never land.
+      </div>
+      <div class="col-spacer"></div>
+      <div id="sources" class="sources"></div>
+    </aside>
+
+    <section id="transcript-col" class="col">
+      <div class="col-head">
+        <span>LIVE TRANSCRIPT</span>
+        <span class="col-head-right">
+          <span id="transcript-lag" class="muted"></span>
+          <button class="btn btn-small" id="btn-transcripts">Hide · T</button>
+          <button class="btn btn-small" id="btn-clear" title="Clear the visible feed (C)">Clear · C</button>
+        </span>
+      </div>
+      <div id="standby" class="standby">
+        <div class="standby-label" id="standby-label">STANDBY</div>
+        <h1 id="standby-title">Listening starts the moment something plays.</h1>
+        <p id="standby-copy">Both sides are captured — the other speaker from whatever the
+        machine plays, you from the microphone. Nothing is answered until
+        something is actually asked.</p>
+        <div class="standby-grid" id="standby-grid"></div>
+        <div class="standby-privacy" id="standby-privacy">Speech never leaves this machine. Only a
+        gated question and a few turns of context go to the answer model.</div>
+      </div>
+      <div id="transcript-feed" class="feed"></div>
+    </section>
+
+    <aside id="cards-col" class="col">
+      <div class="col-head">
+        <span id="cards-title">CUE CARDS · NEWEST FIRST</span>
+        <span class="col-head-right muted" id="cards-count"></span>
+      </div>
+      <div id="cards-empty" class="answer-empty">
+        <h2 id="cards-empty-title">Nothing to answer yet.</h2>
+        <p id="cards-empty-copy">The pane is hearing both sides and holding fire. A card appears here
+        a few seconds after a real question — one sayable line and two or three
+        keywords.</p>
+        <button class="btn" id="btn-force">Answer the last thing said · A</button>
+      </div>
+      <div id="cards-list"></div>
+      <div class="col-head decisions-head">
+        <span><span id="decisions-title">GATE DECISIONS</span> · LAST <span id="decisions-cap">8</span></span>
+        <button class="btn btn-small" id="btn-strictness">Strictness · S</button>
+      </div>
+      <div id="decisions-list"></div>
+      <div class="decisions-note" id="decisions-note">Declining well is the product. Every rejection
+      is logged with its reason and re-checked by the sweeper.</div>
+    </aside>
+  </main>
+
+  <footer id="statusbar">
+    <span id="st-left"></span>
+    <span id="st-keys">
+      <b>P</b> pause · <b>A</b> answer last · <b>S</b> strictness ·
+      <b>1</b> mic input · <b>2</b> system input ·
+      <b>T</b> transcripts · <b>C</b> clear · <b>X</b> profile ·
+      <b>D</b> devices · <b>L</b> sessions<span id="st-voice-keys"> ·
+      <b>M</b> voice · <b>G</b> interaction · <b>R</b> delivery</span>
+    </span>
+  </footer>
+
+  <div id="toasts"></div>
+
+  <!-- Profile picker -->
+  <div class="overlay" id="profile-overlay" hidden>
+    <div class="modal" role="dialog" aria-label="Context profile">
+      <div class="modal-head">
+        <h2>Knowledge profile</h2>
+        <span class="muted">supplies domain vocabulary and answer context; Interaction is separate</span>
+        <span class="modal-keys">↵ select · Esc cancels</span>
+      </div>
+      <div class="modal-body" id="profile-list"></div>
+      <div class="modal-foot">
+        <button class="btn btn-accent" id="profile-use">Use selected · ↵</button>
+        <button class="btn" id="profile-cancel">Cancel · Esc</button>
+        <span class="muted">In Agent interaction, changing profile starts a fresh conversation.</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Audio devices -->
+  <div class="overlay" id="devices-overlay" hidden>
+    <div class="modal modal-wide" role="dialog" aria-label="Audio devices">
+      <div class="modal-head">
+        <h2>Audio devices</h2>
+        <span class="muted">Speak once — every meter below is live at the same time.</span>
+        <span class="modal-keys">↑ ↓ / j k move · ↵ select · Esc cancels</span>
+      </div>
+      <div class="modal-body" id="devices-list"></div>
+      <div class="modal-foot">
+        <button class="btn btn-accent" id="devices-use">Use selected · ↵</button>
+        <button class="btn" id="devices-cancel">Cancel · Esc</button>
+        <span class="muted">Switching a source restarts capture in ~200 ms. While this
+        is open the main pipeline is not listening.</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sessions replay -->
+  <div class="overlay" id="sessions-overlay" hidden>
+    <div class="sessions-panel" role="dialog" aria-label="Recorded sessions">
+      <div class="sessions-topbar">
+        <span class="brand-mark small" aria-hidden="true"></span>
+        <strong>SESSIONS — READ ONLY</strong>
+        <span class="muted">the live pipeline keeps running underneath</span>
+        <div class="spacer"></div>
+        <button class="btn btn-small" id="sessions-answers-only">Answers only</button>
+        <button class="btn btn-small btn-accent-outline" id="sessions-all">All decisions</button>
+        <button class="btn btn-accent" id="sessions-close">Back to live · Esc</button>
+      </div>
+      <div class="sessions-body">
+        <aside class="sessions-list-col">
+          <div class="col-head">RECORDED SESSIONS · NEWEST FIRST</div>
+          <div id="sessions-list"></div>
+          <div class="sessions-privacy muted" id="sessions-path">never leaves this machine</div>
+        </aside>
+        <section class="sessions-view-col">
+          <div class="sessions-view-head" id="session-title">Pick a session on the left.</div>
+          <div id="session-records" class="feed"></div>
+          <div class="sessions-stats" id="session-stats"></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- Quit confirm -->
+  <div class="overlay" id="quit-overlay" hidden>
+    <div class="modal modal-narrow" role="dialog" aria-label="Quit">
+      <div class="modal-head"><h2>Quit Ambient?</h2></div>
+      <div class="modal-body">
+        <p>This stops capture, transcription and answering — the whole
+        application, not just this page.</p>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-danger" id="quit-yes">Quit the app</button>
+        <button class="btn btn-accent" id="quit-no">Keep running · Esc</button>
+      </div>
+    </div>
+  </div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

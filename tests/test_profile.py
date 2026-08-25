@@ -129,3 +129,101 @@ def test_clearing_profile_removes_influence_from_all_three_stages() -> None:
     assert profile.topic not in gate.system_prompt
     assert profile.topic not in answerer.system_prompt
     assert profile.background not in answerer.system_prompt
+
+
+def test_agent_profile_parses_explicit_interaction_channel_and_greeting(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "customer-agent.md"
+    path.write_text(
+        "# Customer support\n"
+        "## Interaction\nAgent\n"
+        "## Customer Channel\nSYS\n"
+        "## Greeting\nHello!\nThanks for calling.\n"
+        "## Topic\nAccount support\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(path)
+
+    assert profile is not None
+    assert profile.interaction == "agent"
+    assert profile.is_agent is True
+    assert profile.customer_channel == "sys"
+    assert profile.greeting == "Hello! Thanks for calling."
+
+
+def test_ordinary_profile_defaults_to_assist_on_mic(tmp_path: Path) -> None:
+    path = tmp_path / "ordinary.md"
+    path.write_text("## Topic\nNetworking\n", encoding="utf-8")
+
+    profile = load_profile(path)
+
+    assert profile is not None
+    assert profile.interaction == "assist"
+    assert profile.is_agent is False
+    assert profile.customer_channel == "mic"
+    assert profile.greeting == ""
+
+
+def test_invalid_agent_metadata_fails_safe_with_warnings(tmp_path: Path) -> None:
+    path = tmp_path / "invalid.md"
+    path.write_text(
+        "## Interaction\nautonomous\n## Customer Channel\nboth\n",
+        encoding="utf-8",
+    )
+    warnings: list[str] = []
+
+    profile = load_profile(path, warnings.append)
+
+    assert profile is not None
+    assert profile.interaction == "assist"
+    assert profile.customer_channel == "mic"
+    assert len(warnings) == 2
+    assert "interaction" in warnings[0].casefold()
+    assert "customer channel" in warnings[1].casefold()
+
+
+def test_scope_defaults_to_open_and_parses_lens(tmp_path: Path) -> None:
+    default_path = tmp_path / "default.md"
+    default_path.write_text("## Topic\nNetworking\n", encoding="utf-8")
+    assert load_profile(default_path).scope == "open"
+
+    lens_path = tmp_path / "lens.md"
+    lens_path.write_text("## Scope\nlens\n## Topic\nCybersecurity\n", encoding="utf-8")
+    assert load_profile(lens_path).scope == "lens"
+
+
+def test_invalid_scope_fails_safe_to_open_with_warning(tmp_path: Path) -> None:
+    path = tmp_path / "bad-scope.md"
+    path.write_text("## Scope\nnarrow\n## Topic\nNetworking\n", encoding="utf-8")
+    warnings: list[str] = []
+
+    profile = load_profile(path, warnings.append)
+
+    assert profile is not None
+    assert profile.scope == "open"
+    assert any("scope" in message.casefold() for message in warnings)
+
+
+def test_knowledge_section_parses_pack_path(tmp_path: Path) -> None:
+    path = tmp_path / "with-pack.md"
+    path.write_text(
+        "## Knowledge\nknowledge/aws-security-architect\n## Topic\nAWS\n",
+        encoding="utf-8",
+    )
+    assert load_profile(path).knowledge == "knowledge/aws-security-architect"
+
+    no_pack = tmp_path / "no-pack.md"
+    no_pack.write_text("## Topic\nAWS\n", encoding="utf-8")
+    assert load_profile(no_pack).knowledge == ""
+
+
+def test_existing_five_argument_profile_constructor_stays_compatible() -> None:
+    profile = Profile("Legacy", "Topic", "Background", ["term"], "raw")
+
+    assert profile.interaction == "assist"
+    assert profile.customer_channel == "mic"
+    assert profile.greeting == ""
+    assert profile.scope == "open"
+    assert profile.knowledge == ""

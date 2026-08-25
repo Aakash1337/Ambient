@@ -82,6 +82,65 @@ def test_complete_question_gates_immediately_without_hold() -> None:
     assert merger.flush_expired(now=10.0) == []
 
 
+def test_direct_conversation_can_use_a_shorter_fragment_hold() -> None:
+    merger = ContinuityMerger(MergeConfig(merge_window_s=13.0))
+    fragment = transcript("I need help with,", start=0.0, end=1.0)
+
+    assert merger.push(fragment, now=10.0, hold_s=1.5) == []
+    assert merger.flush_expired(now=11.49) == []
+    assert merger.flush_expired(now=11.5) == [fragment]
+
+
+def test_reported_disfluent_question_does_not_wait_for_comma_hold() -> None:
+    merger = ContinuityMerger(MergeConfig(merge_window_s=13.0))
+    question = transcript(
+        "Got it, so, what do I do to improve, the, the, the, the, the, "
+        "the, the, the, the, the, the, video, video, audio capture, "
+        "video, audio capture,",
+        start=0.0,
+        end=3.575,
+    )
+
+    assert not is_open_utterance(question.text)
+    assert merger.push(question, now=10.0) == [question]
+    assert merger.flush_expired(now=23.0) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Got it, so, what do I do to improve the,",
+        "Got it, so, what do I do to improve with,",
+        "How do you manage context in,",
+    ],
+)
+def test_comma_question_ending_in_dangling_word_still_waits(text: str) -> None:
+    merger = ContinuityMerger(MergeConfig(merge_window_s=13.0))
+    fragment = transcript(text, start=0.0, end=1.0)
+
+    assert is_open_utterance(text)
+    assert merger.push(fragment, now=10.0) == []
+    assert merger.flush_expired(now=22.99) == []
+    assert merger.flush_expired(now=23.0) == [fragment]
+
+
+def test_punctuationless_two_word_imperative_gates_immediately() -> None:
+    merger = ContinuityMerger(MergeConfig(merge_window_s=13.0))
+    request = transcript("EXPLAIN RAG", start=0.0, end=1.0)
+
+    assert merger.push(request, now=10.0) == [request]
+    assert merger.flush_expired(now=23.0) == []
+
+
+@pytest.mark.parametrize("text", ["Tell me", "Talk about", "Explain about"])
+def test_incomplete_short_imperatives_still_wait_for_continuation(text: str) -> None:
+    merger = ContinuityMerger(MergeConfig())
+    fragment = transcript(text, start=0.0, end=1.0)
+
+    assert merger.push(fragment, now=10.0) == []
+    assert merger.flush_all() == [fragment]
+
+
 def test_continuation_after_merge_gap_does_not_merge() -> None:
     merger = ContinuityMerger(MergeConfig(merge_window_s=15.0))
     first = transcript("connect knowledge base", start=0.0, end=1.0)

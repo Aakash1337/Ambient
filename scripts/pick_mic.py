@@ -1,4 +1,4 @@
-"""Interactively identify and select an Ambient Q&A capture device."""
+"""Interactively identify and select an Ambient capture device."""
 
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def _meter_for(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare live capture levels and choose an Ambient Q&A device."
+        description="Compare live capture levels and choose an Ambient device."
     )
     parser.add_argument(
         "--seconds",

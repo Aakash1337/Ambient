@@ -1,4 +1,4 @@
-# Ambient Q&A default configuration.
+# Ambient default configuration.
 # Device names are case-insensitive substrings; leave blank to use Windows defaults.
 [audio]
 # Case-insensitive substring of the microphone to pin, matched against the
@@ -42,8 +42,14 @@ device = "cuda"
 compute_type = "float16"
 cpu_compute_type = "int8"
 queue_size = 12
-# Empty means automatic language detection.
-language = ""
+# Empty means automatic language detection — which re-detects PER UTTERANCE.
+# On marginal audio (mumbling, rehearsing an answer under your breath) the
+# detector can flip to another language and Whisper then hallucinates fluent
+# nonsense in it (measured: one 20s utterance drifting Korean/Japanese/Russian/
+# German mid-sentence). Garbled text also defeats the answer-echo gate, which
+# matches against the transcript. Pin English for English-only sessions; clear
+# it only if a session genuinely mixes languages.
+language = "en"
 # Discarded when the normalized transcript EXACTLY equals an entry (never a
 # prefix -- prefix matching ate real openers like "Thank you. So, tell me...").
 # List the full utterances Whisper hallucinates on silence.
@@ -61,7 +67,38 @@ hallucination_blocklist = [
 # Standing domain context is optional. Set enabled = false to ignore it globally.
 enabled = true
 # Empty disables profiles. Relative paths are resolved from this config file.
-profile = "profiles/genai-engineer-interview.md"
+# Switch back to "profiles/cybersecurity-analytics.md" for the cyber demo.
+profile = "profiles/aws-security-architect.md"
+
+[knowledge]
+# A pre-answered knowledge pack: a directory of *.md documents (one per topic)
+# whose ## entries are anticipated questions with ready-to-read cue-card answers.
+# When enabled, a gated question is matched against the pack first: a strong
+# match is answered VERBATIM in milliseconds with no `claude -p` call at all
+# (total latency is then just the ~0.9s gate), and a weak match falls through to
+# the live model with the closest entries injected as authoritative reference so
+# even the miss is faster and better grounded. Off by default; the pack must
+# match the active profile to be useful. Loaded once at startup.
+enabled = true
+# Fallback pack directory, resolved relative to this config file. A profile's
+# own "## Knowledge" path overrides this, so each profile carries its own pack
+# and switching profiles in the picker swaps packs with no restart. Leave blank
+# to give profiles that declare no pack no cache at all. The AWS Security
+# Architect profile points at knowledge/aws-security-architect itself.
+path = ""
+# Minimum match score (0..1) to answer verbatim from the pack. Higher = fewer,
+# safer cache hits; a miss is always answered live, so err high. 0.66 was chosen
+# after a dense pack produced a borderline 0.62 false-positive (an MFA question
+# matched an IAM Roles Anywhere entry); 0.66 trims that band while losing no
+# genuine paraphrase hits measured against the drill set.
+hit_threshold = 0.66
+# Never answer a shorter question from cache: a tiny fragment overlaps too many
+# entries by accident. Counts raw words, so "What is GuardDuty?" (3) still hits.
+min_query_words = 3
+# On a miss, inject up to retrieve_k closest entries into the live prompt as
+# reference. Set ground_on_miss = false to leave live answers exactly as before.
+ground_on_miss = true
+retrieve_k = 3
 
 [gate]
 # The gate prompt was engineered against gemma4:e2b; qwen2.5:3b (the earlier
@@ -124,7 +161,9 @@ stream = true
 # "interview" = a spoken answer you could say aloud in a technical interview.
 # "terse"     = one or two compressed sentences.
 style = "cue"
-max_words = 45
+# Conversational voice answers need enough room for two or three complete spoken
+# sentences. Cue mode remains compact because its own format has stricter limits.
+max_words = 70
 # Questions answered simultaneously; each is its own `claude -p` process.
 max_concurrent = 4
 # "off" | "auto" | "always" -- look facts up instead of recalling them.
@@ -137,7 +176,40 @@ max_concurrent = 4
 web_lookup = "auto"
 answer_timeout_s = 45.0
 context_turns = 6
+# Keep the per-answer Sonnet verifier off: it doubled paid calls. The recovery
+# sweep stays on and batches rejected candidates through the smaller Haiku
+# model, so a genuine first-pass miss still has the promised second chance.
+verify = "off"
+sweep = "always"
 queue_size = 16
+
+[tts]
+# Voice mode: launch one `./run.sh --voice` process to show and speak answers;
+# this section only tunes how. Starting silent and voice panes side by side
+# duplicates Whisper and Claude work, so a second process is refused by default.
+# "kokoro" is the neural voice (local model in models/, CPU); "espeak" is the
+# instant robotic fallback, also used automatically if Kokoro fails to load.
+engine = "kokoro"
+voice = "af_heart"
+speed = 1.0
+# Normal-mode baseline: "first_line" speaks only the sayable opening line of a
+# cue answer; "full" speaks the whole answer minus code blocks. In Voice mode,
+# press `r` for the runtime-only Conversational override (full + interview
+# prose); every relaunch safely starts back in Normal.
+speak = "first_line"
+# Which channels' accepted questions get spoken answers. Default mic only:
+# speaking answers to the OTHER side's questions would broadcast them into
+# the room -- and into any live call's microphone.
+speak_channels = ["mic"]
+# Channels every instance mutes while speech is playing. The loopback hears
+# playback verbatim and the mic hears it acoustically (measured: the ec_mic
+# module does NOT cancel app playback), so both are muted by default.
+# Headphone users can set ["sys"] to keep talking over the answer.
+mute_channels = ["mic", "sys"]
+# Mute hold after playback ends (sink latency + room decay), and how stale a
+# queued answer may grow before it is shown but no longer spoken.
+gate_tail_s = 0.7
+max_age_s = 30.0
 
 [ui]
 show_transcripts = true

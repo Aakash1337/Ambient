@@ -1,12 +1,12 @@
 # Live Speech Coaching Feasibility and Implementation Plan
 
-**Project assessed:** Ambient Q&A  
+**Project assessed:** Ambient
 **Assessment date:** 2026-08-06  
 **Conclusion:** This repository is a strong foundation for a Windows live speech-coaching MVP. Its audio capture, voice-activity detection, transcription, asynchronous pipeline, channel separation, profiles, UI, and session logging are reusable. The main new work is a coaching-analysis branch, a rate-limited coaching UI, session-level metrics, and privacy controls.
 
 ## Executive summary
 
-Ambient Q&A currently listens to microphone and system audio, segments speech into utterances, transcribes it locally, detects questions, and streams generated answers into a side pane. A speech coach needs nearly the same infrastructure but a different decision and feedback layer:
+Ambient currently listens to microphone and system audio, segments speech into utterances, transcribes it locally, detects questions, and streams generated answers into a side pane. A speech coach needs nearly the same infrastructure but a different decision and feedback layer:
 
 ```text
 Current:
@@ -534,4 +534,3 @@ Build a mic-only coach mode that reuses the existing capture, VAD, Whisper, UI, 
 5. Speaking/listening ratio when system audio is explicitly enabled.
 
 Add one stable live cue plus an end-of-session summary. Keep all scoring deterministic and local in this milestone. This is the smallest scope that demonstrates genuine speech-coaching value while preserving the strongest qualities of the existing architecture.
-

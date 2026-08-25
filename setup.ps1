@@ -21,7 +21,7 @@ if ($BasePrefix -match "WindowsApps") {
     Write-Error @"
 This .venv is built on the Microsoft Store Python:
     $BasePrefix
-Its app container blocks microphone access, so Ambient Q&A would run
+Its app container blocks microphone access, so Ambient would run
 system-audio-only and never hear you speak.
 
 Install a normal Python 3.11 and rebuild:

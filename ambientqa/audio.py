@@ -98,6 +98,23 @@ class AudioCapture:
         self._stop = threading.Event()
         self._enabled = threading.Event()
         self._enabled.set()
+        # Runtime input switches are independent of the global pause switch.
+        # Keep the streams open even while a channel is disabled so source
+        # health remains measurable and re-enabling is instant.  These events
+        # deliberately survive stop()/start(): opening the device picker must
+        # not silently undo the user's listening choices.
+        self._channel_enabled = {
+            "mic": threading.Event(),
+            "sys": threading.Event(),
+        }
+        for event in self._channel_enabled.values():
+            event.set()
+        # An Event tells readers the current state, but not whether it changed
+        # while a blocking stream.read() was in flight.  A quick off -> on
+        # cycle could otherwise make pre-mute samples look newly enabled.  The
+        # generation makes every read that spans either boundary disposable.
+        self._channel_generation = {"mic": 0, "sys": 0}
+        self._channel_state_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._session: BackendSession | None = None
         self._streams: list[SourceStream] = []
@@ -291,6 +308,30 @@ class AudioCapture:
         else:
             self._enabled.clear()
 
+    def set_channel_enabled(self, channel: str, enabled: bool) -> None:
+        """Enable or disable one logical input without closing its stream."""
+        try:
+            event = self._channel_enabled[channel]
+        except KeyError:
+            raise ValueError(f"Unknown audio channel: {channel}") from None
+        with self._channel_state_lock:
+            if event.is_set() == enabled:
+                return
+            self._channel_generation[channel] += 1
+            if enabled:
+                event.set()
+            else:
+                event.clear()
+
+    def channel_enabled(self, channel: str) -> bool:
+        """Return the runtime listening choice for ``mic`` or ``sys``."""
+        try:
+            event = self._channel_enabled[channel]
+        except KeyError:
+            raise ValueError(f"Unknown audio channel: {channel}") from None
+        with self._channel_state_lock:
+            return event.is_set()
+
     def _capture_source(
         self,
         channel: str,
@@ -310,6 +351,10 @@ class AudioCapture:
             # judge the mic means a winning sys endpoint mutes the microphone
             # outright -- the mic loses every contest it was never entered in.
             arbiter = None
+        # Resolve once per runner. The Event itself is persistent and
+        # thread-safe, so later UI toggles are observed without a stream
+        # restart or a dictionary lookup on every 25 ms frame.
+        channel_enabled = self._channel_enabled[channel]
         try:
             rate = int(stream.rate)
             channels = int(stream.channels)
@@ -336,6 +381,8 @@ class AudioCapture:
             # _stop, and without the check the zombie would resume pushing its
             # stale device's frames into the live session's queue.
             while entered and not self._stop.is_set() and generation == self._generation:
+                with self._channel_state_lock:
+                    read_generation = self._channel_generation[channel]
                 samples = stream.read(native_frames)
                 if channels > 1:
                     samples = samples.reshape(-1, channels).mean(axis=1)
@@ -372,13 +419,29 @@ class AudioCapture:
                 )
                 # Resampling still ran, so the stream's resampler state stays
                 # consistent and a later handover starts clean.
-                if not self._enabled.is_set() or not forwarding:
-                    output_buffer = np.empty(0, dtype=np.float32)
-                    continue
-                while len(output_buffer) >= target_frames:
-                    frame = output_buffer[:target_frames].copy()
-                    output_buffer = output_buffer[target_frames:]
-                    put_threadsafe(loop, output, AudioFrame(channel, frame, time.time()))
+                # Keep the check and queue handoff atomic with respect to a
+                # channel toggle. If a read spans an off/on cycle, its original
+                # samples are discarded even though the Event is set again by
+                # the time the blocking read returns. If a toggle begins after
+                # this section, the controller's boundary purge sees anything
+                # handed off here before set_channel_enabled() can return.
+                with self._channel_state_lock:
+                    if (
+                        read_generation != self._channel_generation[channel]
+                        or not self._enabled.is_set()
+                        or not channel_enabled.is_set()
+                        or not forwarding
+                    ):
+                        output_buffer = np.empty(0, dtype=np.float32)
+                        continue
+                    while len(output_buffer) >= target_frames:
+                        frame = output_buffer[:target_frames].copy()
+                        output_buffer = output_buffer[target_frames:]
+                        put_threadsafe(
+                            loop,
+                            output,
+                            AudioFrame(channel, frame, time.time()),
+                        )
         except Exception as exc:
             if self._stop.is_set() or generation != self._generation:
                 # stop() unblocks readers by stopping their streams, so a read

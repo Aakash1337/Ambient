@@ -3,6 +3,7 @@ soxr
 numpy
 silero-vad
 onnxruntime
+kokoro-onnx; sys_platform != "win32"
 faster-whisper
 textual
 tomli

@@ -1,4 +1,4 @@
-# Ambient Q&A — Call-Center Agent-Assist Prototype
+# Ambient — Call-Center Agent-Assist Prototype
 
 Demo package: feature list, talking points, and a step-by-step live demo script.
 The slide deck lives next to this file: open `callcenter-deck.html` in a browser
@@ -9,7 +9,7 @@ The slide deck lives next to this file: open `callcenter-deck.html` in a browser
 ## The pitch in three sentences
 
 Agents put customers on hold to search knowledge bases; new agents take months
-to ramp. Ambient Q&A listens to both sides of a live call, ignores everything
+to ramp. Ambient listens to both sides of a live call, ignores everything
 that is not a real question, and puts a glanceable answer card in front of the
 agent about four seconds after the customer finishes asking. All speech
 processing runs on the agent's own machine — no call audio ever leaves it.

@@ -9,7 +9,12 @@ from typing import Callable
 
 from .bus import Transcript
 from .config import MergeConfig
-from .gate import TRAILING_FRAGMENT_WORDS, words
+from .gate import (
+    TRAILING_FRAGMENT_WORDS,
+    is_complete_imperative_request,
+    is_question_shaped,
+    words,
+)
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _LEADING_CONTINUATION_RE = re.compile(
@@ -36,11 +41,29 @@ def is_open_utterance(text: str) -> bool:
     # so "so tell me about." must stay open.
     if probe.endswith(("?", "!")):
         return False
+    # Whisper frequently omits punctuation on terse commands. These are
+    # semantically closed and should reach the gate immediately; holding
+    # "EXPLAIN RAG" for the full merge window made a clear retry look dead.
     tokens = words(stripped)
     if tokens and tokens[-1].lower() in TRAILING_FRAGMENT_WORDS:
         return True
+    # Whisper can preserve a clear interrogative while losing its final '?'
+    # and ending the result with a comma instead.  Once the question shape is
+    # coherent, the semantic gate should judge it now; a punctuation artifact
+    # must not add the full continuity window first.  Keep this after the
+    # dangling-word check above so genuinely unfinished questions such as
+    # "How do you connect it to," still wait for their continuation.
+    if is_question_shaped(stripped):
+        return False
     if probe.endswith(",") or probe.endswith(tuple(_OPEN_DASHES)):
         return True
+    # Keep this exception deliberately terse. Once several VAD fragments have
+    # accumulated, an early request verb does not prove the speaker is done;
+    # the original merge regression was a long "tell me ..." setup that kept
+    # going. Six words covers direct retries such as "EXPLAIN RAG" and
+    # "Tell me about RAG" without flushing long merged setups prematurely.
+    if len(tokens) <= 6 and is_complete_imperative_request(stripped):
+        return False
     return not probe.endswith(tuple(_TERMINAL_PUNCTUATION))
 
 
@@ -111,14 +134,21 @@ class ContinuityMerger:
             or duration >= self.config.max_merge_s
         )
 
-    def _begin(self, transcript: Transcript, now: float) -> list[Transcript]:
+    def _begin(
+        self,
+        transcript: Transcript,
+        now: float,
+        hold_s: float | None = None,
+    ) -> list[Transcript]:
         if not is_open_utterance(transcript.text):
             return [transcript]
         pending = _Pending(
             transcript=transcript,
             parts=1,
             first_started_at=self._start(transcript),
-            deadline=now + self.config.merge_window_s,
+            deadline=now + (
+                self.config.merge_window_s if hold_s is None else hold_s
+            ),
         )
         if self._at_cap(pending):
             return [transcript]
@@ -130,6 +160,7 @@ class ContinuityMerger:
         pending: _Pending,
         transcript: Transcript,
         now: float,
+        hold_s: float | None = None,
     ) -> Transcript:
         previous = pending.transcript
         merged = Transcript(
@@ -142,7 +173,9 @@ class ContinuityMerger:
         )
         pending.transcript = merged
         pending.parts += 1
-        pending.deadline = now + self.config.merge_window_s
+        pending.deadline = now + (
+            self.config.merge_window_s if hold_s is None else hold_s
+        )
         return merged
 
     def flush_expired(self, now: float | None = None) -> list[Transcript]:
@@ -164,15 +197,27 @@ class ContinuityMerger:
         self,
         transcript: Transcript,
         now: float | None = None,
+        *,
+        complete: bool = False,
+        hold_s: float | None = None,
     ) -> list[Transcript]:
-        """Consume one STT result and return only transcripts ready for gating."""
+        """Consume one STT result and return transcripts ready for routing.
+
+        ``complete`` is used by direct conversational roles after they have
+        classified a VAD turn as self-contained. It bypasses the question-mode
+        punctuation heuristic, while still joining the turn onto any genuinely
+        pending fragment from the same channel.
+        """
         if not self.config.enabled:
             return [transcript]
         current = self._clock() if now is None else now
         ready = self.flush_expired(current)
         pending = self._pending.get(transcript.channel)
         if pending is None:
-            ready.extend(self._begin(transcript, current))
+            if complete:
+                ready.append(transcript)
+            else:
+                ready.extend(self._begin(transcript, current, hold_s))
             return ready
 
         gap = self._start(transcript) - pending.transcript.timestamp
@@ -186,11 +231,14 @@ class ContinuityMerger:
         if not continues:
             self._pending.pop(transcript.channel, None)
             ready.append(pending.transcript)
-            ready.extend(self._begin(transcript, current))
+            if complete:
+                ready.append(transcript)
+            else:
+                ready.extend(self._begin(transcript, current, hold_s))
             return ready
 
-        merged = self._merge(pending, transcript, current)
-        if self._at_cap(pending) or not is_open_utterance(merged.text):
+        merged = self._merge(pending, transcript, current, hold_s)
+        if complete or self._at_cap(pending) or not is_open_utterance(merged.text):
             self._pending.pop(transcript.channel, None)
             ready.append(merged)
         return ready
@@ -202,3 +250,8 @@ class ContinuityMerger:
         ]
         self._pending.clear()
         return sorted(transcripts, key=lambda transcript: transcript.timestamp)
+
+    def discard(self, channel: str) -> Transcript | None:
+        """Abandon one channel's held thought without disturbing the other."""
+        pending = self._pending.pop(channel, None)
+        return None if pending is None else pending.transcript

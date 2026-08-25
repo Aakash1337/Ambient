@@ -10,7 +10,26 @@ from typing import Callable
 _SECTION_RE = re.compile(r"^##[ \t]+(.+?)[ \t]*$", re.MULTILINE | re.IGNORECASE)
 _TITLE_RE = re.compile(r"^#[ \t]+(.+?)[ \t]*$", re.MULTILINE)
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
-_RECOGNISED = {"topic", "background", "vocabulary"}
+_RECOGNISED = {
+    "topic",
+    "background",
+    "vocabulary",
+    "interaction",
+    "customer channel",
+    "greeting",
+    "scope",
+    "knowledge",
+}
+_INTERACTIONS = {"assist", "agent"}
+_CUSTOMER_CHANNELS = {"mic", "sys"}
+# How tightly answers are bound to the profile's domain.
+#   "open" - the domain only sets the answer's level and experience angle; an
+#            off-topic question gets a straight off-topic answer (the default,
+#            and the historical behaviour).
+#   "lens" - answer through the domain: a question that is ambiguous or merely
+#            adjacent is resolved within the domain and its real use cases
+#            rather than drifting to a generic reading.
+_SCOPES = {"open", "lens"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +39,22 @@ class Profile:
     background: str
     vocabulary: list[str]
     raw: str
+    # These defaults deliberately follow ``raw`` so older code and tests that
+    # construct Profile with five positional arguments remain source-compatible.
+    interaction: str = "assist"
+    customer_channel: str = "mic"
+    greeting: str = ""
+    scope: str = "open"
+    # Directory of a pre-answered knowledge pack that belongs to this profile,
+    # resolved relative to the config file. Loaded when the profile becomes
+    # active so a pack travels with its profile instead of being pinned at
+    # startup. Empty means "use the global knowledge.path fallback, if any".
+    knowledge: str = ""
+
+    @property
+    def is_agent(self) -> bool:
+        """Legacy recommendation; the runtime role is selected separately."""
+        return self.interaction == "agent"
 
 
 def _clean_section(text: str) -> str:
@@ -34,6 +69,27 @@ def _vocabulary(text: str) -> list[str]:
         if term:
             terms.append(term)
     return terms
+
+
+def _profile_choice(
+    sections: dict[str, str],
+    name: str,
+    allowed: set[str],
+    default: str,
+    report: Callable[[str], None],
+    profile_path: Path,
+) -> str:
+    """Read one small enum from a Markdown section, failing safely."""
+    raw = sections.get(name, "").strip().casefold()
+    if not raw:
+        return default
+    if raw in allowed:
+        return raw
+    report(
+        f'Profile {name} must be one of {", ".join(sorted(allowed))} '
+        f'({profile_path}); using "{default}"'
+    )
+    return default
 
 
 def load_profile(
@@ -76,10 +132,41 @@ def load_profile(
 
     title = _TITLE_RE.search(raw)
     display_name = title.group(1).strip() if title else profile_path.stem
+    interaction = _profile_choice(
+        sections,
+        "interaction",
+        _INTERACTIONS,
+        "assist",
+        report,
+        profile_path,
+    )
+    customer_channel = _profile_choice(
+        sections,
+        "customer channel",
+        _CUSTOMER_CHANNELS,
+        "mic",
+        report,
+        profile_path,
+    )
+    scope = _profile_choice(
+        sections,
+        "scope",
+        _SCOPES,
+        "open",
+        report,
+        profile_path,
+    )
+    knowledge_section = sections.get("knowledge", "").strip()
+    knowledge = knowledge_section.splitlines()[0].strip() if knowledge_section else ""
     return Profile(
         name=display_name,
         topic=sections.get("topic", ""),
         background=sections.get("background", ""),
         vocabulary=_vocabulary(sections.get("vocabulary", "")),
         raw=raw,
+        interaction=interaction,
+        customer_channel=customer_channel,
+        greeting=" ".join(sections.get("greeting", "").split()),
+        scope=scope,
+        knowledge=knowledge,
     )

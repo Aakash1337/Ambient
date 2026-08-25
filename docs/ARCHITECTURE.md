@@ -1,4 +1,4 @@
-# Ambient Q&A — Architecture Deep Dive
+# Ambient — Architecture Deep Dive
 
 This document explains how the system works internally, module by module, and — more
 importantly — *why* it is shaped the way it is. Nearly every non-obvious decision here was
@@ -69,10 +69,11 @@ discarded. This is non-negotiable — audio capture runs at wall-clock speed and
 back-pressured. Losing the oldest un-transcribed utterance under overload is strictly
 better than stalling capture and losing *everything* after it.
 
-Hanging off the right edge of this diagram, and deliberately absent from it, is a
-**second pass** (§12): an audit task that re-reads each delivered answer with wider
-context, and a sweeper that re-judges recent gate rejections. Both are asynchronous and
-best-effort; neither ever blocks or delays the live path above.
+Hanging off the right edge of this diagram, and deliberately absent from it, is an
+optional **second pass** (§12): an audit task that re-reads each delivered answer with
+wider context, and a sweeper that re-judges recent gate rejections. The costly per-answer
+audit defaults off; the batched recovery sweep defaults on. Both are asynchronous and
+best-effort, and neither blocks the live path.
 
 Data types flowing through (all in `bus.py`):
 
@@ -253,9 +254,11 @@ Symmetrically, a crashing capture process cannot take the app down; the reader s
 EOF (with the stderr tail as the reason) as an ordinary stream error the orchestrator
 already routes around.
 
-PipeWire multiplexes every source natively, so devices are never "busy": streams here
-never conflict with other applications — or with a second copy of this app. **Multiple
-app instances are supported**, and `run.sh` deliberately has no single-instance lock.
+PipeWire multiplexes every source natively, so devices are never "busy" and streams do
+not conflict with other applications. Multiple full app processes are nevertheless unsafe:
+they duplicate capture, Whisper, and paid answer work. Startup therefore holds a shared
+process-lifetime OS lock (with heartbeats retained for status and legacy detection) and
+refuses a second pipeline by default; `--allow-multiple` is diagnostic.
 
 ### The orchestrator (audio.py)
 
@@ -315,7 +318,7 @@ the whole channel dead while five others still ran.
 ### run.sh and the ec_mic chain
 
 Linux launches through `run.sh` (Windows stays `python -m ambientqa` in `.venv`), which
-does four things:
+does five things:
 
 - **Bootstraps `.venv-linux`**, gated on a `.deps-installed` stamp written only *after*
   pip succeeds, and re-runs pip when `requirements.txt` is newer than the stamp. Gating
@@ -323,6 +326,12 @@ does four things:
   creation makes that file first, so a Ctrl-C during the multi-hundred-MB wheel
   downloads would leave a dependency-less venv that every later run execs into a
   `ModuleNotFoundError`.
+- **Optionally runs the pre-launch Textual mode picker** when the desktop entry passes
+  `--choose`. The picker imports no audio/model/controller code and returns Assist, Voice,
+  Web Assist, Web Voice, Emergency, or Cancel before any pipeline exists. Those four
+  current-build roles map to ordinary launch arguments; Emergency requires an in-picker
+  confirmation and execs the still-independent pinned fallback with `--takeover`. Direct
+  `run.sh` / `run.sh --voice` behavior is unchanged.
 - **Loads PipeWire's `module-echo-cancel`** (WebRTC: noise suppression + automatic gain
   control — the class of processing Windows applies in its own audio stack) exposing an
   `ec_mic` source, which `config.toml` pins as `mic_device`. This exists because of a
@@ -410,6 +419,10 @@ text is open or the new text starts like a continuation (leading conjunction or
 lowercase letter). Joins strip Whisper's invented boundary punctuation on both sides of
 the seam — the period *and* the trailing-off ellipsis it sometimes emits instead.
 
+A terse, complete command-form request (at most six words) is also closed without terminal
+punctuation. This narrow exception sends `EXPLAIN RAG` straight to gating while leaving
+unfinished `Tell me` / `Talk about` fragments—and long merged setups—inside continuity.
+
 Two safety rails: a **wall-clock deadline** `merge_window_s` (13 s — must exceed the gap
 *plus* the continuation's spoken length *plus* its STT latency, or merging silently
 never happens **[measured]**), and caps (`max_merge_parts` 5, `max_merge_s` 25) so noisy
@@ -487,7 +500,8 @@ the part that differs. Statements past both tests reject as `not_a_direct_questi
 
 Ordered; first match wins:
 
-1. `too_few_words` — under 3 real words.
+1. `too_few_words` — under 3 real words, except a complete command-form request with an
+   object (`Explain RAG`). Incomplete two-word forms still reject.
 2. `filler_only` — every token in {uh, um, hmm, yeah, okay, right…}.
 3. `near_duplicate` — token-set ratio ≥ 0.85, but **time-scoped**: only questions
    answered within `gate.reask_cooldown_s` (8 s) count as duplicates. Mechanical dupes
@@ -530,7 +544,9 @@ Ordered; first match wins:
    about that later" asks nothing; a vocative wins — "Sarah, tell me…" is aimed at
    Sarah; and a trailing fragment word disqualifies the whole thing — "So, tell me
    about" is a request *cut off* mid-sentence, and answering the stub would answer a
-   question with no object (the merge layer holds it until the rest arrives).
+   question with no object (the merge layer holds it until the rest arrives). Generic
+   honorifics are allowed only before a clear information command (`Sir, talk...`), not as
+   general question prefixes; human-directed actions remain vocatives.
 7. `human_vocative` — "Hey Sarah, can you…" (aimed at a person, not the assistant). The
    pattern covers both modal-you forms ("Sarah, can you…") and name-addressed
    imperatives ("Sarah, tell me…"). Whisper capitalizes every sentence start, so a
@@ -674,6 +690,10 @@ a bare cap degenerates into comma-jammed keyword lists, a generous one into essa
 The one formatting exception: code. The no-markdown rule would make the model inline
 code into sentences (invalid and unreadable), so fenced blocks are explicitly demanded
 for code, exempt from the word budget, and preserved verbatim by the UI's flattener.
+The runtime `agent` style is orthogonal to the knowledge profile: it produces one to
+three short, direct spoken sentences, uses active dialogue history, and applies the
+courtesy guard before final text is displayed or spoken. Raw Agent streaming deltas
+are withheld because they have not passed that guard.
 
 ## 12. The second pass — audit and sweep
 
@@ -685,10 +705,11 @@ different shapes: a bad answer *exists* and can be re-read; a wrongly-rejected q
 produced nothing and must be re-found.
 
 The shared design stance: **both passes are best-effort and structurally unable to hurt
-the live path.** Every failure path in `verify()` and `detect_missed()` returns
-None/[] — a broken auditor must never disturb an already-delivered answer, a broken
-sweeper must never disturb the pipeline. Both run as detached tasks, both log loudly on
-failure, and neither delays anything the user is waiting on.
+the live path.** `verify()` returns `None` on failure; `detect_missed()` returns `None`
+and leaves its candidate batch queued for retry (a successful no-miss verdict is `[]`).
+A broken auditor must never disturb an already-delivered answer, and a broken sweeper
+must never disturb the pipeline. Both run as detached tasks, log failures, and do not
+delay anything the user is waiting on.
 
 ### The audit (`[answer] verify = "always" | "off"`)
 
@@ -717,19 +738,20 @@ When a replacement comes back, three things update: the card re-resolves with st
 `"revised"`, the Q&A-history entry is replaced (otherwise "elaborate on that" expands
 the answer the audit just retracted), and a second JSONL record is appended for the
 same utterance id with `gate_reason: "verify_revision"` / `answer_status: "revised"`.
-Audits run at most one at a time (their own semaphore) — they must not compete with
-primary answers for the CLI process budget — and under the same 45 s timeout.
+Audits run at most one at a time (their own semaphore) and share the answerer's aggregate
+Claude process semaphore with primary answers, under the same 45 s timeout.
 
 ### The sweep (`[answer] sweep = "always" | "off"`)
 
 The audit only reviews answers that exist. Every `sweep_interval_s` (25 s) a sweeper
-re-judges the recent **judgment-stage** rejections — only
-`not_a_direct_question` / `ollama_reject` / `ollama_unavailable`, the reasons meaning
-"this reached judgment and got voted down". Mechanical rejections (filler, dedupe, echo,
-tags, pause) are not misses and never enter the buffer (a deque of 24, cleared each
-sweep; nothing runs while paused). The restriction is empirical: both live misses so far
-were exactly these — an `ollama_reject` on a real question and a
-`not_a_direct_question` on a command-form ask.
+re-judges the recent **judgment-stage** rejections —
+`not_a_direct_question` / `ollama_reject` / `ollama_unavailable` / `human_vocative`, the
+reasons meaning "this reached judgment and got voted down". Mechanical rejections
+(filler, dedupe, echo, tags, pause) are not misses and never enter the buffer (a deque of 24, cleared after a
+successful sweep; nothing runs while paused). The vocative case is included because
+Whisper's sentence-initial capitalization made "Again, describe RAG pipelines" look like
+a request addressed to a person named Again; the sweep independently rejects genuine
+human-directed speech.
 
 The sweeper (`sweep_model`, default `claude-haiku-4-5` — it is a small classification,
 so a fast cheap model is right; empty falls back to `answer_model`) sees the candidates,
@@ -780,6 +802,50 @@ The device picker (`d`) deserves a mention: it stops capture, opens *every* endp
 with live level meters, and the correct endpoint is self-evident — it is the one whose
 meter moves when the other person talks. Selection is written back to `config.toml`.
 
+### 13b. webui.py — the opt-in web console
+
+`--web` swaps the Textual pane for a browser console served on `127.0.0.1` (default
+port 8802, with automatic next-port fallback when unpinned). It is *not* a second UI layer inside the pipeline: `WebUIApp` duck-types
+the same application interface the controller already calls (`add_transcript`,
+`add_question`, `append_answer_delta`, `resolve_answer`, `notify`, `run_async`, …), and
+the only seam in the main path is an optional `app_factory` argument on
+`AmbientController` that defaults to the Textual app. The console is stdlib-only
+(`ThreadingHTTPServer` + Server-Sent Events) so it adds nothing to `requirements.txt`
+— run.sh's pip stamp, the emergency baseline, and the Windows path are all untouched.
+
+Design points that mirror hard-won pipeline rules:
+
+- **The gate-decision panel taps the session logger**, not a new reporting path: the
+  logger's `append` is wrapped so every rejection (with its reason) that reaches the
+  JSONL also reaches the browser. One record, two sinks, no drift.
+- **The web status tick doubles as the instance heartbeat**, exactly like the TUI's
+  status refresh — the emergency launcher's PID checks keep working under `--web`.
+- **The device picker self-closes** (30 s ping deadline) because it stops main capture
+  while open; a browser tab that navigated away must not leave the app deaf.
+- **Web Voice is a launch-time combination**, not a second process or a runtime model
+  bootstrap: the picker maps it to `--web --voice --open-browser`, while visible web
+  controls call the same voice, Q&A/Agent interaction, and Normal/Conversational
+  delivery controller methods as M/G/R.
+- **Quit is acknowledged before tab closure**: the page only calls `window.close()`
+  after the server confirms shutdown. If browser security blocks self-closing an
+  externally opened tab, the page becomes a persistent stopped-state notice.
+- **Streaming deltas carry a running length** so a page that connects mid-answer
+  detects the gap and resyncs from the snapshot instead of showing spliced text.
+- The server binds loopback only; the session-log endpoint whitelists
+  `session-*.jsonl` names rather than joining paths.
+
+`scripts/webui_demo.py` drives the real console against a scripted stub controller —
+no audio, models, or Claude — for rehearsal and offline demo fallback.
+
+The mode picker (`--choose`, the desktop shortcut's path) offers the console as a
+fourth option, followed by a delivery choice: Web Assist maps exit code 40 to
+`--web --open-browser`; Web Voice maps exit code 50 to
+`--web --voice --open-browser`. Both remain one controller/capture pipeline. `--open-browser`
+exists because an app-menu launch has no terminal showing the URL; the open runs on
+a throwaway thread (`webbrowser` shells out and can block) and a failure costs only
+the convenience. The picker's splash is deliberately sized to fit all four options
+in a stock 80×24 terminal — a clipped splash leaves the bottom row unclickable.
+
 ## 14. \_\_main\_\_.py — the controller and runtime traps
 
 `AmbientController` wires everything: builds queues, capture (over the shared backend
@@ -797,6 +863,8 @@ sys transcript:  echo-check → (hold for echo window, only if mic policy is "fu
                  → continuity merge → process
 mic transcript:  settle any pending sys duplicates → continuity merge → process
 process:         context.add (echo-suppressed) → UI transcript line
+                 → if Agent: selected-speaker/filter → local social reply or
+                   serialized direct Agent answer (no question gate/sweep)
                  → channel policy check (Stage 0)
                  → snapshot gate context + answer context     ← ordered path ends here
                  → detach bounded gate task
@@ -859,7 +927,10 @@ Vocabulary sections). Vocabulary → Whisper hotwords; Topic → gate referent
 disambiguation (with explicit prompt language forbidding its use as a relevance filter
 or topic-injector); Topic+Background → answer pitch, explicitly subordinate to the
 recent transcript (§11). Profiles are data, never instructions — the prompts say so
-explicitly, which is the injection defence.
+explicitly, which is the injection defence. Profiles may also supply an Agent greeting
+and selected speaker channel, but never activate the role: Q&A/Agent is runtime state,
+independent of profile and delivery. Changing profile during Agent starts a clean
+conversation boundary.
 
 **logging_.py** — one JSONL line per utterance, written live (open-append-close per
 record, lock-guarded): channel, text, gate decision + reason, query, answer, status,

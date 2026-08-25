@@ -1,4 +1,4 @@
-# Rebuilding Ambient Q&A From Scratch
+# Rebuilding Ambient From Scratch
 
 A staged, hands-on guide to building this system yourself — the order to build it in,
 what each stage must do, how to *prove* each stage works before moving on, and the traps
@@ -98,9 +98,9 @@ makes one codebase serve both platforms.
    `stop()` simply terminates the child: stdout hits EOF, any blocked reader returns
    instantly, and a crashing capture process can never take the app down — the reader
    surfaces the EOF as an error the orchestrator already routes around. And because
-   PipeWire multiplexes every source, devices are never "busy": other apps keep the
-   mic, and several copies of this app can run at once — which is why `run.sh` has no
-   single-instance lock. Do not add one.
+   PipeWire multiplexes every source, so other apps keep the mic. Still refuse a second
+   copy of this app before model load: it would duplicate capture, Whisper, and paid answer
+   calls. Keep an explicit override only for diagnostics.
 
 Then the platform-neutral capture loop on top (`audio.py`): open a stream per candidate
 device, read 25 ms buffers, downmix to mono by averaging, resample to 16 kHz with
@@ -397,14 +397,15 @@ answer:
   the first card, so it is only worth the distraction when the first answer would have
   misled. A revision must also replace the Q&A-history entry, or "elaborate on that"
   expands the answer the audit just retracted. Run audits one at a time, strictly after
-  their answer is on screen: they must not compete with primary answers for the CLI
-  pool.
+  their answer is on screen. Use one audit at a time and the same aggregate CLI semaphore
+  as primary answers.
 - `[answer] sweep = "always" | "off"` — the audit only reviews answers that *exist*; a
   wrongly rejected question produces nothing to audit. Every `sweep_interval_s` = 25 s
   a sweeper (`sweep_model`, default `claude-haiku-4-5` — it is a small classification,
   so cheap and fast is right) re-judges the gate's *judgment-stage* rejections only
-  (`not_a_direct_question` / `ollama_reject` / `ollama_unavailable`; mechanical
-  rejections — filler, dedupe, echo, tags — are not misses) against wide context and
+  (`not_a_direct_question` / `ollama_reject` / `ollama_unavailable` /
+  `human_vocative`; mechanical rejections — filler, dedupe, echo, tags — are not misses)
+  against wide context and
   the answered/in-flight list. Genuine asks come back as late cards with gate reason
   `second_pass_recovery` through the normal answer path, streaming and audit included.
 
@@ -501,6 +502,9 @@ is a documented production failure:
      Whisper invents a period at every VAD boundary, so "so tell me about." stays open.
    - At merge joins, strip Whisper's boundary periods AND ellipses from both sides —
      the pending fragment was already judged open, so that punctuation is not semantic.
+   - Treat a complete command-form request of at most six words as closed even if Whisper
+     omitted punctuation. Otherwise `EXPLAIN RAG` waits the entire hold before gating;
+     keep incomplete forms and long accumulated setups open.
    - The wall-clock-window lesson: the hold window (`merge_window_s` = 13.0) must
      exceed the gap (`merge_gap_s` = 6.5 — a ~5 s think-pause between a trailed-off
      setup and its question must merge) *plus* the continuation's spoken length *plus*
@@ -570,13 +574,18 @@ Linux-specific:
   `.deps-installed` stamp (and re-runs pip when `requirements.txt` is newer), starts
   Ollama if it is not already up, loads PipeWire's `module-echo-cancel` exposing the
   `ec_mic` source, exports `LD_LIBRARY_PATH` over the pip CUDA libs, and execs
-  `python -m ambientqa`. It is safe to run several copies at once.
+  `python -m ambientqa`. Run one copy; require an explicit unsafe override for diagnostics.
 - Why `ec_mic` exists: WebRTC noise suppression + automatic gain control over the raw
   mic — the class of processing Windows applies in its own audio stack. The raw USB mic at
   100% PipeWire volume sits ~34 dB above its hardware-neutral level: loud speech
   clipped 1.7% of samples and garbled Whisper. `config.toml` pins `mic_device` to the
   module's device description (`Echo-cancelled_Microphone`); if the module ever fails
   to load, press `d` in the app and pick the raw mic, or rerun `run.sh`.
+- For a Linux app-menu entry, pass `--choose` to `run.sh`. Its standalone Textual splash
+  selects Assist or Voice before audio/model construction; Cancel launches nothing. Keep
+  explicit `run.sh` and `run.sh --voice` paths so automation and terminal recovery never
+  depend on the chooser, and keep the pinned emergency script independently callable even
+  if the picker is broken.
 
 ## Suggested rebuild exercises
 

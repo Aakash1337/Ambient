@@ -39,6 +39,16 @@ def test_terse_style_still_available() -> None:
     assert "terse" in prompt.lower()
 
 
+def test_per_answer_style_override_does_not_mutate_normal_style() -> None:
+    answerer = ClaudeAnswerer(AnswerConfig(style="cue", max_words=60))
+
+    conversational = answerer.system_prompt_for("interview")
+
+    assert "two to four sentences" in conversational.lower()
+    assert "cue card" in answerer.system_prompt.lower()
+    assert answerer.config.style == "cue"
+
+
 def test_profile_topic_and_background_do_not_change_interview_style_rules() -> None:
     profile = Profile(
         "AWS",
@@ -57,6 +67,25 @@ def test_profile_topic_and_background_do_not_change_interview_style_rules() -> N
     assert "two to four sentences" in lowered
     assert "no closing summary" in lowered
     assert "markdown" in lowered
+
+
+def test_lens_scope_adds_domain_binding_to_the_prompt() -> None:
+    open_profile = Profile("Cyber", "Defensive security", "Analyst copilot", [], "")
+    lens_profile = Profile(
+        "Cyber",
+        "Defensive security",
+        "Analyst copilot",
+        [],
+        "",
+        scope="lens",
+    )
+
+    open_prompt = ClaudeAnswerer(AnswerConfig(), profile=open_profile).system_prompt
+    lens_prompt = ClaudeAnswerer(AnswerConfig(), profile=lens_profile).system_prompt
+
+    assert "DOMAIN LENS" not in open_prompt
+    assert "DOMAIN LENS" in lens_prompt
+    assert "adjacent to the domain" in lens_prompt
 
 
 def test_invalid_style_rejected() -> None:

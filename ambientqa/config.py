@@ -1,4 +1,4 @@
-"""Typed configuration loading for Ambient Q&A."""
+"""Typed configuration loading for Ambient."""
 
 from __future__ import annotations
 
@@ -67,6 +67,36 @@ class STTConfig:
 class ContextConfig:
     profile: str = ""
     enabled: bool = True
+
+
+@dataclass(slots=True)
+class KnowledgeConfig:
+    """A pre-answered knowledge pack for near-instant, grounded answers.
+
+    Opt-in and off by default so existing sessions are untouched. When enabled,
+    a gated question is first matched against the pack: a strong match is
+    answered verbatim in milliseconds with no model call, and a weak match falls
+    through to the live model with the closest entries injected as reference.
+    """
+
+    enabled: bool = False
+    # Directory of *.md knowledge documents, resolved relative to this config
+    # file (like context.profile). Empty or missing simply disables the cache.
+    path: str = ""
+    # Minimum lexical match score (0..1) to answer verbatim from the pack. Set
+    # deliberately high: serving the wrong cached answer confidently is worse
+    # than taking the slower, correct live path. Raised to 0.66 after a dense
+    # pack produced a borderline 0.62 false positive.
+    hit_threshold: float = 0.66
+    # A query with fewer words than this is never answered from cache -- a short
+    # fragment matches too much by accident to trust. Counts raw words, so a
+    # three-word "What is GuardDuty?" still qualifies.
+    min_query_words: int = 3
+    # On a miss, inject up to this many of the closest entries into the live
+    # prompt as authoritative reference. 0, or ground_on_miss = false, disables
+    # grounding and leaves the live answer exactly as it is today.
+    ground_on_miss: bool = True
+    retrieve_k: int = 3
 
 
 @dataclass(slots=True)
@@ -176,7 +206,10 @@ class AnswerConfig:
     # misheard question, a dropped enumeration item. Style is never grounds:
     # a correction that lands ~8s late is only worth the distraction when the
     # first answer would have misled. "always" | "off".
-    verify: str = "always"
+    # Expensive and deliberately opt-in.  Running a second Sonnet request for
+    # every answer doubled paid traffic and exhausted the demo account without
+    # making that extra work visible in the status bar.
+    verify: str = "off"
     # The auditor sees more transcript than the first pass deliberately: what
     # it exists to catch is context the fast path missed.
     verify_context_turns: int = 18
@@ -186,12 +219,60 @@ class AnswerConfig:
     # transcript context to a model and asks which were genuine asks; the
     # catches come back as late answer cards through the normal answer path
     # (streaming, audit and all). "always" | "off".
+    # Enabled as the recovery backstop. It batches recent rejected candidates
+    # into one small-model call per interval; unlike verify, it does not add a
+    # second Sonnet call to every successful answer. Emergency mode overrides
+    # this to "off" for its minimum-dependency baseline.
     sweep: str = "always"
     sweep_interval_s: float = 25.0
     # The sweep is a small classification, so a fast cheap model is the right
     # default; empty falls back to answer_model.
     sweep_model: str = "claude-haiku-4-5"
     queue_size: int = 16
+
+
+@dataclass(slots=True)
+class TtsConfig:
+    """Voice mode (launched with --voice). The section only tunes HOW answers
+    are spoken; WHETHER an instance speaks is decided per launch, never here,
+    so several instances can share this file with different roles."""
+
+    # "kokoro" is the neural voice (local ~310 MB model, CPU inference);
+    # "espeak" is the instant robotic fallback. Kokoro degrades to espeak by
+    # itself when its model or dependencies are unavailable.
+    engine: str = "kokoro"
+    voice: str = "af_heart"
+    speed: float = 1.0
+    # "first_line" speaks only the sayable opening line (cue answers are
+    # designed with exactly one); "full" speaks the whole answer with code
+    # blocks dropped -- pair it with answer.style = "interview".
+    speak: str = "first_line"
+    # Channels whose accepted questions get spoken answers. Default is mic
+    # only: speaking answers to the OTHER side's questions broadcasts them
+    # into the room -- and into any live call's microphone.
+    speak_channels: list[str] | None = None
+    # Channels every instance drops while ANY instance is speaking. The sys
+    # loopback always hears playback verbatim; the mic hears it acoustically
+    # (the ec_mic module does not cancel app playback -- measured 6-9 dB at
+    # best). Headphone users can shrink this to ["sys"] to keep talking
+    # while the answer plays.
+    mute_channels: list[str] | None = None
+    # Unspoken answers waiting behind the single serial voice. Small on
+    # purpose: a burst should drop stale speech, not build a backlog.
+    queue_size: int = 2
+    # Mute hold after playback ends: sink latency plus room decay.
+    gate_tail_s: float = 0.7
+    # An answer older than this when its turn comes is shown, not spoken.
+    max_age_s: float = 30.0
+    # Resolved relative to this config file, like context.profile.
+    model_path: str = "models/kokoro-v1.0.onnx"
+    voices_path: str = "models/voices-v1.0.bin"
+
+    def __post_init__(self) -> None:
+        if self.speak_channels is None:
+            self.speak_channels = ["mic"]
+        if self.mute_channels is None:
+            self.mute_channels = ["mic", "sys"]
 
 
 @dataclass(slots=True)
@@ -213,6 +294,8 @@ class Config:
     answer: AnswerConfig
     ui: UIConfig
     merge: MergeConfig = field(default_factory=MergeConfig)
+    tts: TtsConfig = field(default_factory=TtsConfig)
+    knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
 
 
 T = TypeVar("T")
@@ -294,6 +377,34 @@ def validate_config(config: Config) -> Config:
         raise ValueError("audio.silent_source_warn_s must be greater than 0")
     if config.ui.feed_direction not in {"top", "bottom"}:
         raise ValueError('ui.feed_direction must be "top" or "bottom"')
+    if config.tts.engine not in {"kokoro", "espeak"}:
+        raise ValueError('tts.engine must be "kokoro" or "espeak"')
+    if config.tts.speak not in {"first_line", "full"}:
+        raise ValueError('tts.speak must be "first_line" or "full"')
+    for name, channels in (
+        ("tts.speak_channels", config.tts.speak_channels or []),
+        ("tts.mute_channels", config.tts.mute_channels or []),
+    ):
+        unknown_tts = sorted(set(channels) - {"mic", "sys"})
+        if unknown_tts:
+            raise ValueError(
+                f'{name} may only contain "mic" and "sys"; '
+                f"got {', '.join(unknown_tts)}"
+            )
+    if config.tts.queue_size < 1:
+        raise ValueError("tts.queue_size must be at least 1")
+    if not 0 <= config.tts.gate_tail_s <= 5:
+        raise ValueError("tts.gate_tail_s must be between 0 and 5")
+    if config.tts.max_age_s <= 0:
+        raise ValueError("tts.max_age_s must be greater than 0")
+    if not 0.25 <= config.tts.speed <= 3:
+        raise ValueError("tts.speed must be between 0.25 and 3")
+    if not 0 <= config.knowledge.hit_threshold <= 1:
+        raise ValueError("knowledge.hit_threshold must be between 0 and 1")
+    if config.knowledge.min_query_words < 1:
+        raise ValueError("knowledge.min_query_words must be at least 1")
+    if config.knowledge.retrieve_k < 0:
+        raise ValueError("knowledge.retrieve_k must be at least 0")
     return config
 
 
@@ -306,6 +417,8 @@ def default_config() -> Config:
         answer=AnswerConfig(),
         ui=UIConfig(),
         merge=MergeConfig(),
+        tts=TtsConfig(),
+        knowledge=KnowledgeConfig(),
     )
 
 
@@ -315,7 +428,10 @@ def load_config(path: str | Path = "config.toml") -> Config:
     if config_path.exists():
         with config_path.open("rb") as handle:
             raw = tomllib.load(handle)
-    allowed = {"audio", "stt", "context", "gate", "merge", "answer", "ui"}
+    allowed = {
+        "audio", "stt", "context", "gate", "merge", "answer", "ui", "tts",
+        "knowledge",
+    }
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise ValueError(f"Unknown config section(s): {', '.join(unknown)}")
@@ -327,5 +443,7 @@ def load_config(path: str | Path = "config.toml") -> Config:
         merge=_section(MergeConfig, raw.get("merge", {}), "merge"),
         answer=_section(AnswerConfig, raw.get("answer", {}), "answer"),
         ui=_section(UIConfig, raw.get("ui", {}), "ui"),
+        tts=_section(TtsConfig, raw.get("tts", {}), "tts"),
+        knowledge=_section(KnowledgeConfig, raw.get("knowledge", {}), "knowledge"),
     )
     return validate_config(config)

@@ -23,6 +23,16 @@ from .profile import Profile
 log = logging.getLogger(__name__)
 REAL_CONTENT_RE = re.compile(r"[A-Za-z0-9]")
 
+# These phrases are common faster-whisper silence hallucinations in passive
+# Assist mode, but they are also real, semantically important customer turns in
+# Agent mode.  Keep only the short courtesy forms; credits such as "thank you
+# for watching" remain blocked under every profile.
+_AGENT_COURTESY_ALLOWLIST = {
+    "thank you",
+    "thank you very much",
+    "thank you so much",
+}
+
 
 def register_cuda_dll_dirs() -> list[str]:
     """Put the pip-installed CUDA DLLs on the Windows DLL search path.
@@ -73,6 +83,10 @@ class WhisperTranscriber:
         self.model = None
         self.device = config.device
         self.profile = profile
+        # Runtime interaction role, deliberately independent of profile domain.
+        # Assist drops common silence hallucinations; Agent keeps the few short
+        # courtesy turns that are meaningful in a live conversation.
+        self.agent_mode = False
         self._blocked = {
             normalise_phrase(item) for item in (config.hallucination_blocklist or [])
         }
@@ -80,12 +94,28 @@ class WhisperTranscriber:
     def set_profile(self, profile: Profile | None) -> None:
         self.profile = profile
 
+    def set_agent_mode(self, enabled: bool) -> None:
+        self.agent_mode = bool(enabled)
+
+    def _cuda_fallback_warning(self, label: str, reason: str) -> str:
+        advice = ""
+        if "out of memory" in reason.casefold():
+            advice = (
+                " GPU memory is exhausted; close GPU-heavy games, other "
+                "Whisper/dictation processes, or unused Ollama models, then "
+                "relaunch."
+            )
+        return (
+            f"{label} ({reason}); FALLING BACK TO CPU "
+            f"{self.config.cpu_compute_type}. Transcription will be much slower."
+            f"{advice}"
+        )
+
     def _fall_back_to_cpu(self, reason: str) -> None:
         from faster_whisper import WhisperModel
 
-        warning = (
-            f"CUDA Whisper unavailable ({reason}); FALLING BACK TO CPU "
-            f"{self.config.cpu_compute_type}. Transcription will be much slower."
+        warning = self._cuda_fallback_warning(
+            "CUDA Whisper unavailable", reason
         )
         log.warning(warning)
         self.status_callback(warning)
@@ -110,9 +140,8 @@ class WhisperTranscriber:
             self.device = self.config.device
             self.status_callback(f"Whisper ready on {self.device}")
         except Exception as exc:
-            warning = (
-                f"CUDA Whisper initialization failed ({exc}); FALLING BACK TO CPU int8. "
-                "Transcription will be much slower."
+            warning = self._cuda_fallback_warning(
+                "CUDA Whisper initialization failed", str(exc)
             )
             log.exception(warning)
             self.status_callback(warning)
@@ -168,7 +197,10 @@ class WhisperTranscriber:
         # routinely open with a courtesy -- "Thank you. So, tell me about your
         # experience with Kubernetes." -- and the entire question would vanish
         # here, before gating, with no log record at all.
-        if normalised in self._blocked:
+        agent_courtesy = bool(
+            self.agent_mode and normalised in _AGENT_COURTESY_ALLOWLIST
+        )
+        if normalised in self._blocked and not agent_courtesy:
             return None
         return Transcript(
             channel=utterance.channel,

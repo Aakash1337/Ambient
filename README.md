@@ -1,6 +1,6 @@
-# Ambient Q&A
+# Ambient
 
-Ambient Q&A is a passive side pane for Windows and Linux that listens to the microphone and
+Ambient is a passive side pane for Windows and Linux that listens to the microphone and
 system audio, transcribes speech locally, identifies real questions, and answers only those
 questions. It never prompts or interrupts you.
 
@@ -47,8 +47,18 @@ pip whenever `requirements.txt` is newer than its install stamp. On every run it
 if it is down, loads PipeWire's `module-echo-cancel` to provide the processed `ec_mic`
 microphone source, points CTranslate2 at the pip-installed CUDA libraries, and launches the
 pane. Because it bootstraps everything itself, it is also the right `Exec` target for a desktop
-app-menu entry (wrapped in a terminal, e.g. `konsole --workdir <repo> -e ./run.sh` — the pane
-is a TUI).
+app-menu entry (the pane is a TUI).
+
+On this KDE installation, opening **Ambient** from the app menu launches a pre-start splash
+with four guarded choices: **Assist** (answers stay on screen), **Voice** (screen plus spoken
+answers), **Web Console** (then **Web Assist** or **Web Voice** in the browser), or **Emergency
+Fallback** (the pinned pre-voice build, behind a second confirmation). Web Assist is focused by
+default; Web Voice launches the same single pipeline with independent Q&A/Agent interaction
+and Normal/Conversational delivery controls.
+Cancel starts nothing. The chooser runs before capture, models, Ollama, or the application lock,
+so it never creates a second pipeline merely to select a mode. Terminal launches remain direct:
+`./run.sh` or `./run.sh --assist` selects Assist, and `./run.sh --voice` selects Voice. The app
+menu's right-click actions can also bypass the splash and start either launch role directly.
 
 `ec_mic` matters for transcription quality: it runs WebRTC noise suppression and automatic gain
 control over the raw microphone. The raw USB mic at full PipeWire volume sits ~34 dB above its
@@ -68,6 +78,177 @@ Run the test suite with:
 ```powershell
 python -m pytest -q
 ```
+
+## Voice mode
+
+```bash
+./run.sh --voice
+```
+
+The app-menu splash selects this flag for you; no terminal is required for normal use.
+
+Voice mode is a per-launch role, not a config switch. Start exactly one copy with `--voice`:
+that same pane shows the answer card and speaks it aloud. Do not run a silent copy beside it;
+each process would independently capture, transcribe, gate, and call Claude for the same
+question. The app refuses a second live pipeline by default. The first voice launch downloads
+the local Kokoro voice files (~340 MB into `models/`); synthesis runs on the CPU so Whisper and
+the gate keep the GPU. If Kokoro cannot load, the app falls back to `espeak-ng` (robotic but
+instant) and reports the fallback. Press `m` to mute or unmute speech. Press `r` to switch
+between **Normal** and **Conversational** delivery at runtime; the status bar shows the voice
+state and selected delivery together (for example `voice:on/conversational`). Linux only for
+now — playback runs through PipeWire's `paplay`.
+
+Normal is the safe startup default: answers keep the glanceable cue-card format and voice reads
+only the opening sentence. Conversational mode asks for short, natural spoken prose and reads the
+complete answer, including the substance of bullet/options lines (code blocks remain visual
+only). It also understands narrowly scoped requests about a recent answer such as “continue
+reading the answer,” “read the rest,” and “repeat that” without another Claude call. The choice is
+runtime-only and resets to Normal on relaunch, so it cannot change the emergency baseline or the
+known demo default. It deliberately keeps the microphone's conservative question gate; making all
+mic narration semantic input previously produced dozens of unsolicited cards.
+
+Repeating an answer is not limited to Conversational delivery: a recent mic request such as
+“Can you repeat what you just said?” immediately reuses the exact previous answer in every
+surface and delivery mode. It creates a normal card, follows the current speech setting, and
+never asks Claude to interpret “repeat” as an audio-replay capability question.
+
+### Agent interaction with any profile
+
+Voice mode has an independent runtime **Interaction** control: **Q&A** keeps the selective
+question/request gate, while **Agent** participates directly in a natural conversation. Press
+`g` in the terminal or use the Q&A/Agent buttons in the browser. The selected knowledge profile
+is a separate axis, so combinations such as **Cybersecurity analytics + Agent + Conversational**
+and **Cybersecurity analytics + Q&A + Normal** are both valid. Every launch starts in Q&A; the
+choice is runtime-only and does not modify the profile or emergency baseline.
+
+Agent introduces itself once as an AI assistant, handles greetings, thanks, hold requests, and
+goodbyes locally, and sends complete meaningful statements directly to the answer worker instead
+of the question-only gate. Model replies use short speech-shaped prose plus layered prompt and
+deterministic courtesy safeguards before they are displayed or spoken. The active profile supplies
+domain knowledge, vocabulary, and framing rather than deciding whether Agent is on.
+
+`profiles/customer-service-agent.md` supplies a call-specific greeting and support context, while
+`profiles/cybersecurity-analytics.md` makes the same Agent behavior a cybersecurity conversation.
+An optional `## Customer Channel` selects exactly one driving speaker input: `mic` is convenient
+for an in-room role-play, while `sys` is the remote side of a real call. The other channel stays
+visible but cannot steer Agent answers. A remote caller still needs the call application's audio
+routing to hear local `paplay` output; Ambient does not silently inject itself into Teams or a
+telephony device.
+
+Keys `1` and `2` independently stop or resume microphone and system-audio transcription. The
+Web UI exposes the same **Mic** and **System** buttons. These are input privacy controls: they do
+not mute spoken output, alter gate policy, or replace `m` (voice-output mute). Both inputs may be
+off; Pause remains the global master. Devices stay open for health metering, but buffered or
+in-flight audio from a muted interval is discarded before transcript/context and redacted from
+the session log.
+
+The hard problem voice mode solves is that this app listens to its own speakers: playback
+lands verbatim in the `sys` loopback and acoustically in the microphone. Audio-level echo
+cancellation was measured at only 6–9 dB on this path — far too shallow — so the defence is
+deterministic instead: while any instance is speaking, every instance drops capture frames
+for the muted channels (`tts.mute_channels`, default both). The speaking window is a file
+in a shared per-user directory, so muting is cross-instance by construction, and the exact
+spoken text is also recorded as answer-echo prose before playback starts, so anything that
+leaks past the window's tail is rejected by the gate rather than answered. The cost is
+honest deafness: for the few seconds an answer plays, the app is not listening, so
+Conversational mode is turn-taking rather than barge-in (headphone
+users can set `tts.mute_channels = ["sys"]` to keep the mic live).
+
+By default only your own (`mic`) questions get spoken answers — speaking answers to the
+other side's questions would broadcast them into the room and into any live call. Set
+`tts.speak_channels = ["mic", "sys"]` to voice everything, and `tts.speak = "full"` with
+`answer.style = "interview"` to hear whole prose answers instead of the cue headline.
+Cross-process speaking leases remain as a defensive guard for deliberate `--allow-multiple`
+testing, but that mode duplicates GPU and Claude work and is unsafe for a demo.
+
+## Web console (opt-in)
+
+```bash
+./run-web.sh            # or: ./run.sh --web
+./run-web.sh --voice    # browser UI plus spoken answers
+```
+
+From the desktop shortcut, the launch splash (`--choose`) now offers **Web
+console** alongside Assist, Voice, and the emergency fallback (`w` or `3`
+selects it), then asks for **Web Assist** or **Web Voice**. Picked that way it
+also opens your default browser on the console URL, since the app-menu launch
+has no terminal to read it from. Assist remains the first, default-focused
+choice at both safety boundaries.
+
+The same pipeline normally renders at `http://127.0.0.1:8802`, styled after the
+design exploration in `docs/UI/` and with larger,
+more readable type than the terminal pane. It shows the live transcript with both
+channels labelled, the question queue, streaming cue cards with REVISED / LATE /
+FORCED / WEB LOOKUP badges, a gate-decisions panel listing every rejection *and its
+reason* live, the status bar, and a read-only sessions replay built from the same
+JSONL logs. The TUI keys work unchanged in the browser (`p a s t c x d l q`, plus
+`m` for voice, `g` for Q&A/Agent, `r` for delivery, and `1`/`2` for independent
+Mic/System listening); the audio device picker has the same all-endpoints live
+meters and auto-closes if the page stops responding, so an abandoned tab can never
+leave capture stopped. Web Voice also exposes clickable Mute/Unmute, Q&A/Agent, and
+Normal/Conversational controls, with the same controller behavior as those keys.
+
+The browser Quit confirmation waits for the server to acknowledge that capture has
+stopped, then asks the browser to close the console tab. Browsers can refuse scripts
+permission to close an externally opened tab; when that security rule applies, the
+disconnected console is replaced by an unmistakable **Ambient has stopped** page
+instead of looking live or silently doing nothing.
+
+The app-menu launch verifies the Ambient health endpoint before opening the
+browser. If another local service owns 8802, it selects the next free loopback port
+and opens that actual URL; the terminal also prints it. An explicit `--web-port N`
+remains pinned and fails with a concise message when occupied. Do not assume a
+different service on a familiar port is this console—the health identity prevents
+that mix-up.
+
+The console is deliberately **not** the default surface:
+
+- The terminal pane remains the default (`./run.sh`) and the known demo baseline;
+  `--web` is the only way to get the console, and the flag does nothing else.
+- It is stdlib-only — nothing was added to `requirements.txt`, so run.sh's install
+  stamp, the Windows setup, and the emergency fallback are all untouched.
+- The pinned emergency build (`./run-emergency.sh`) predates the web console
+  entirely; if the console misbehaves mid-demo, quit it and launch either the
+  normal pane or the fallback.
+- The server binds `127.0.0.1` only. Transcripts never leave the machine.
+
+To rehearse the console with no microphone, models, or Claude at all:
+
+```bash
+.venv-linux/bin/python scripts/webui_demo.py        # scripted conversation, loops
+```
+
+which serves the real console fed by a canned call — useful as an offline demo
+surface that audio problems cannot break.
+
+## Demo emergency fallback
+
+The escape hatch is independent of the voice implementation and never resets, stashes, or
+overwrites the working tree. It extracts the pinned last pre-voice commit into a disposable
+directory, reuses the installed environment, disables the optional paid second passes, and
+runs with no voice code at all.
+
+It is also available as **Emergency Fallback** on the app-menu splash. That convenience path
+requires an explicit confirmation and then invokes the same validated `--takeover` script below;
+the standalone script remains independent if the current picker or build itself is damaged.
+
+```bash
+./run-emergency.sh --check
+# If fallback is needed, first quit the live pane with q, then:
+./run-emergency.sh
+# If the pane is frozen and cannot quit:
+./run-emergency.sh --takeover
+```
+
+The launcher shares a process-lifetime application lock with normal startup and also checks
+legacy heartbeat PIDs, so it refuses to start beside a live instance. That prevents recreating
+the duplicate Whisper/Claude workload even if a UI heartbeat stalls. It also refuses to install
+dependencies or accept voice arguments. `--takeover` is the explicit emergency button: it validates
+the per-user heartbeat PID's `/proc` command line, asks only confirmed `python -m ambientqa`
+processes to terminate, and force-stops one only if it remains frozen after five seconds. Run the
+`--check` once before the demo; it exits without opening the application. The fallback cannot bypass
+Claude authentication or an exhausted account limit; both versions still need a working
+`claude -p` answer call.
 
 ## Tuning the question gate
 
@@ -156,7 +337,9 @@ had to be force-answered by hand.
 interrogative (Stage A, free and instant — **no Ollama call at all**), or when Whisper heard it end
 in `?`, which is the one signal that survives disfluency. Command-form asks are accepted the same
 free way — *"Talk about evaluation metrics."* carries no `?` and no interrogative word, but it is
-as direct as a request gets. And a statement that substantially overlaps a question answered in
+as direct as a request gets. Terse forms such as *"Explain RAG"* bypass both the three-word noise
+floor and the fragment hold, while incomplete *"Tell me"* / *"Talk about"* forms do not. And a
+statement that substantially overlaps a question answered in
 the last ~90 s is accepted as a deliberate re-ask: the first answer missed, and retries
 (*"no, prompt engineering..."*) rarely carry fresh question intonation. Everything else
 declarative is rejected before the semantic gate ever sees it, so it cannot be rewritten into a
@@ -325,12 +508,15 @@ and command-form requests; remaining speech goes to the local Ollama gate model
 `claude -p` process and stream output into that question's card as it is generated. There is
 intentionally no persistent Claude stream session.
 
-Two second passes run behind the live path, one per direction of error. `answer.verify` audits
-every **delivered** answer: a verifier with a wider transcript window
+Two independent second passes can run behind the live path, one per direction of error. The
+per-answer verifier is disabled by default to avoid doubling Sonnet usage; the batched
+missed-question sweep is enabled as a recovery backstop. With `answer.verify = "always"`, every
+**delivered** answer is audited by a verifier with a wider transcript window
 (`verify_context_turns` = 18 against the fast path's 6) plus the full Q&A history re-reads it
 after it is already on screen, and replaces the card — marked `revised` — only when it was
 materially wrong: a missed constraint, a misheard question, a dropped enumeration item. Style is
-never grounds. `answer.sweep` covers the **missed**: every `sweep_interval_s` (25 s) a small
+never grounds. With `answer.sweep = "always"`, the **missed** side is covered: every
+`sweep_interval_s` (25 s) a small
 model (`sweep_model`, `claude-haiku-4-5` by default) re-judges the gate's judgment-stage
 rejections against the same wide context and the list of questions already answered or in
 flight; genuine asks come back as late cards through the normal answer path, logged as
@@ -346,6 +532,8 @@ Keys:
 - `l` — browse recorded session logs and open one read-only over the live pane
 - `a` — force-answer the most recent utterance
 - `s` — cycle strict, balanced, and eager gate modes
+- `1` — mute or resume microphone input without changing system audio or voice output
+- `2` — mute or resume system-audio input without changing the microphone or voice output
 - `x` — choose or disable a standing context profile
 - `d` — compare every microphone and loopback endpoint with live meters, then select one
 - `q` — quit
@@ -383,10 +571,11 @@ rejection reason, which is where gate-tuning signal comes from.
 
 ## Running several copies
 
-On Linux, run `./run.sh` as many times as you like. PipeWire multiplexes every source natively,
-so a second instance opening the same microphone and the same monitors never conflicts with the
-first — or with any other application. There is deliberately no single-instance lock in
-`run.sh`. Each instance writes its own `logs/session-<timestamp>.jsonl`.
+Use one live copy. PipeWire can technically multiplex the devices, but each application process
+is a complete Whisper and Claude pipeline, so two panes duplicate questions, GPU memory, and paid
+answer calls. Startup therefore holds a process-lifetime OS lock and refuses a fresh second
+instance. `--allow-multiple` exists only for deliberate diagnostics and should not be used during
+a demo.
 
 ## Configuration reference
 
@@ -427,8 +616,16 @@ the default defined in `ambientqa/config.py`.
 | | `max_concurrent`, `answer_timeout_s` | Process semaphore and per-answer timeout |
 | | `context_turns`, `queue_size` | Background context and configured capacity |
 | | `history_turns` | Completed Q&A pairs carried into each new answer so follow-ups ("elaborate on the second method") resolve against what was actually answered; 0 disables |
-| | `verify`, `verify_context_turns` | Second-pass audit of each delivered answer with a wider transcript window: replaces the card (marked "revised") only when the answer was materially wrong — missed constraint, misheard question, dropped enumeration item. `"always"` or `"off"` |
-| | `sweep`, `sweep_interval_s`, `sweep_model` | Detection second pass: periodically re-judges the gate's judgment-stage rejections against wide context and answers genuine asks it wrongly dropped, as late cards. `"always"` or `"off"`; small model by default |
+| | `verify`, `verify_context_turns` | Opt-in second-pass audit of each delivered answer with a wider transcript window: replaces the card (marked "revised") only when the answer was materially wrong. `"off"` by default; `"always"` adds one Claude call per answer |
+| | `sweep`, `sweep_interval_s`, `sweep_model` | Opt-in detection second pass: periodically re-judges judgment-stage rejections and answers genuine asks it wrongly dropped as late cards. `"off"` by default; small model when enabled |
+| `tts` | `engine` | `kokoro` (neural, local model) or `espeak` (instant fallback); Kokoro degrades to espeak by itself if it cannot load. Only tunes HOW answers are spoken — an instance speaks only when launched with `--voice` |
+| | `voice`, `speed` | Kokoro voice name and rate multiplier |
+| | `speak` | Normal-mode baseline: `first_line` speaks a cue answer's opening line; `full` speaks the whole code-stripped answer. Voice key `r` temporarily overrides this to `full` together with spoken-prose answer style |
+| | `speak_channels` | Channels whose accepted questions are spoken (default `["mic"]` — see "Voice mode") |
+| | `mute_channels` | Channels every instance drops while any instance speaks (default both) |
+| | `queue_size`, `max_age_s` | Unspoken backlog bound and staleness cutoff — late answers are shown, not spoken |
+| | `gate_tail_s` | Mute hold after playback ends (sink latency + room decay) |
+| | `model_path`, `voices_path` | Kokoro model file locations, relative to `config.toml` |
 | `ui` | `show_transcripts` | Initial raw-transcript visibility |
 | | `log_dir`, `status_interval_s` | Session output directory and status refresh |
 | | `feed_direction` | `"top"` shows the newest entry first (default); `"bottom"` appends chronologically |
@@ -438,7 +635,10 @@ The default `audio.silence_ms` is 900 ms. Raising it further can reduce splittin
 thinking pauses, but delays transcription and answers by the same additional silence.
 
 Context profiles live in `profiles/*.md` and may contain optional `## Topic`,
-`## Background`, and `## Vocabulary` sections. Vocabulary biases Whisper spelling, Topic helps
+`## Background`, and `## Vocabulary` sections. Agent sessions may additionally use
+`## Customer Channel` (`mic` or `sys`) and `## Greeting`; the Agent/Q&A role itself is selected
+at runtime and is not controlled by profile metadata.
+Vocabulary biases Whisper spelling, Topic helps
 the gate resolve words already present in an utterance, and Topic plus Background tune answer
 depth. Profile context never filters topics or turns contextless speech into a question. Press
 `x` to switch profiles live; the selection is saved to `context.profile`.
@@ -501,8 +701,11 @@ automatic gain control, the class of processing Windows applies in its own audio
 `./run.sh`, or press `d` and pick the raw device (then turn its volume down).
 
 **Whisper says `cpu`:** CUDA/model initialization failed, so faster-whisper fell back to CPU
-`int8`. Check the NVIDIA driver and the installed `nvidia-cublas-cu12`/`nvidia-cudnn-cu12`
-packages. The status bar deliberately makes this fallback prominent because it is slower.
+`int8`. Read the warning text first. If it says GPU memory is exhausted, close GPU-heavy games,
+another Whisper/dictation service, or unused Ollama models and relaunch; CPU fallback works but is
+far too slow for a conversational demo. Otherwise check the NVIDIA driver and the installed
+`nvidia-cublas-cu12`/`nvidia-cudnn-cu12` packages. The status bar deliberately makes this fallback
+prominent because it is slower.
 
 **Ollama is not running:** start Ollama, confirm `ollama list` includes the model named in
 `[gate] model` (a model that is configured but not pulled fails the same way), then restart
@@ -516,19 +719,23 @@ removed.
 
 **Claude answers time out or fail:** run `claude -p "hello"` to confirm the CLI is installed and
 authenticated. Each question intentionally uses a separate one-shot process and is killed after
-`answer.answer_timeout_s`; concurrent questions are limited by `answer.max_concurrent`.
+`answer.answer_timeout_s`; concurrent questions are limited by `answer.max_concurrent`. Account and
+rate-limit text emitted only in Claude's stream output is surfaced on the answer card rather than
+being collapsed into the generic `answer failed` message.
 
-**An answer appeared, then changed:** that is the audit, not a glitch. With
-`answer.verify = "always"` (the default) every delivered answer is re-read by a second pass with
+**An answer appeared, then changed:** that is the optional audit, not a glitch. With
+`answer.verify = "always"` every delivered answer is re-read by a second pass with
 a wider transcript window and the full Q&A history, and replaced only when it was materially
 wrong — the card is prefixed `revised` and the session log records `verify_revision`. Style is
-never grounds for a revision. Set `answer.verify = "off"` to keep first answers untouched.
+never grounds for a revision. The default is `answer.verify = "off"` to keep first answers
+untouched and avoid doubling Claude calls.
 
-**A question was answered late, well after it was asked:** the sweeper recovered it. The gate
+**A question was answered late, well after it was asked:** the optional sweeper recovered it. The gate
 had rejected it, and the periodic second pass (`answer.sweep`, every `sweep_interval_s` = 25 s)
 re-judged the recent judgment-stage rejections against wide context and decided it was a genuine
 ask; the card arrives with `gate_reason: second_pass_recovery` in the log. Up to ~25 s of lag is
-the design — a late answer beats a missed one. Set `answer.sweep = "off"` to disable it.
+the design — a late answer beats a missed one. It is enabled by default; the status bar shows
+`sweep:on` (set `answer.sweep = "off"` to disable it).
 
 **Everything used to crash the moment you first spoke (Linux — fixed):** Whisper's first model
 load spawned the multiprocessing resource tracker after Textual had replaced stderr with a

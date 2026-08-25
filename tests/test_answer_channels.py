@@ -83,6 +83,7 @@ class Recorder:
         controller._log_rejection = log_rejection  # type: ignore[method-assign]
         controller._enqueue_answer = enqueue  # type: ignore[method-assign]
         controller._gate_tasks = set()
+        controller._recent_rejections = deque(maxlen=24)
         controller._gate_semaphore = asyncio.Semaphore(
             self.config.gate.max_concurrent
         )
@@ -147,6 +148,55 @@ def test_full_policy_answers_that_channel_freely() -> None:
 
     assert recorder.answered == [text]
     assert recorder.rejections == []
+
+
+def test_judgment_rejection_reaches_the_optional_sweep_buffer() -> None:
+    """The ordinary rejected-gate path must feed second-pass recovery."""
+    recorder = Recorder({"mic": "explicit", "sys": "full"})
+    controller = recorder.build()
+    item = transcript("Tell me how the fallback works.", "sys")
+
+    class RejectingGate:
+        async def evaluate(
+            self,
+            candidate: Transcript,
+            _background: list[str],
+            policy: str = "full",
+        ) -> GateResult:
+            return GateResult(candidate, False, "ollama_reject", "", 1.0)
+
+    async def discard_log(_record: dict[str, Any]) -> None:
+        return None
+
+    controller.gate = RejectingGate()  # type: ignore[assignment]
+    controller._log = discard_log  # type: ignore[method-assign]
+
+    process(controller, item)
+
+    assert list(controller._recent_rejections) == [item]
+
+
+def test_vocative_judgment_reaches_the_sweep_safety_net() -> None:
+    controller = Recorder({"mic": "explicit", "sys": "full"}).build()
+    item = transcript("Again, describe RAG pipelines.", "mic")
+
+    controller._remember_sweep_rejection(item, "human_vocative")
+
+    assert list(controller._recent_rejections) == [item]
+
+
+def test_rhetorical_tag_judgment_reaches_the_sweep_safety_net() -> None:
+    """A clarification ending in ``right?`` can be a real follow-up."""
+    controller = Recorder({"mic": "explicit", "sys": "full"}).build()
+    item = transcript(
+        "You said Firefox has limited support, right? But full-screen "
+        "sharing should include system audio, right?",
+        "mic",
+    )
+
+    controller._remember_sweep_rejection(item, "tag_or_rhetorical")
+
+    assert list(controller._recent_rejections) == [item]
 
 
 class TestExplicitPolicy:

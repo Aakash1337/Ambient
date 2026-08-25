@@ -1,4 +1,4 @@
-# Ambient Q&A — Implementation Spec
+# Ambient — Implementation Spec
 
 ## Goal
 
@@ -105,9 +105,10 @@ which is how the suite passes on Linux.
 - `stop()` terminates the child; EOF on stdout unblocks any blocked reader, so shutdown is
   structurally instant, and a crashing capture process can never take the app down — its
   EOF surfaces as a stream error the orchestrator already routes around.
-- PipeWire multiplexes every source, so devices are never "busy": streams never conflict
-  with other applications **or with a second copy of this app**. Multi-instance is
-  supported; do not add a single-instance lock anywhere.
+- PipeWire multiplexes every source, so streams do not conflict with other applications.
+  A second copy of this app is different: it duplicates Whisper, gating, and paid answer
+  calls, so startup must acquire a process-lifetime per-user OS lock and refuse it by
+  default before loading models. An explicit unsafe override may exist for diagnostics.
 
 ### 1. `audio.py` — capture orchestration (backend-neutral)
 
@@ -155,6 +156,9 @@ which is how the suite passes on Linux.
   **first inference**, not model construction (`segments` is a lazy generator; a missing
   cuDNN DLL only shows up on consumption) — materialise inside the try block and recover to
   CPU there too, instead of dying.
+- An out-of-memory fallback says what happened and names the safe remedies (close a
+  GPU-heavy game, another Whisper/dictation process, or an unused Ollama model). It must
+  not terminate or unload another application on the user's behalf.
 - Single serial worker (one GPU), bounded queue. `condition_on_previous_text=False`
   (prevents hallucination loops on ambient noise).
 - Keep Whisper's punctuation. **The trailing `?` is a strong gate signal — do not strip it.**
@@ -177,7 +181,9 @@ halves separately loses the constraint. Per-channel stateful merger, between STT
   onto the next sentence, destroying the `?` fast-accept downstream). A terminal `.` earns
   **no** such trust: Whisper invents a period at every VAD boundary, so "so tell me about."
   stays open. Also open: trailing fragment word, trailing comma/dash, no terminal
-  punctuation.
+  punctuation. Exception: a complete command-form request of at most six words is closed
+  even without punctuation, so Whisper's `EXPLAIN RAG` reaches the gate immediately instead
+  of waiting the full 13-second hold.
 - `join_fragments` strips Whisper's artificial boundary periods **and ellipses** at the
   seam before joining.
 - A continuation merges when the audio-time gap ≤ `merge_gap_s` (**6.5** — measured miss at
@@ -228,7 +234,9 @@ question gets judged against a conversation that moved on without it.
 **Stage A — local heuristics (~0 ms), pure functions, unit-tested. The order is
 load-bearing; run exactly this sequence:**
 
-1. reject `too_few_words` — fewer than `min_words` (3) words.
+1. reject `too_few_words` — fewer than `min_words` (3) words, except a complete
+   command-form request with an object (`Explain RAG`); incomplete forms (`Tell me`,
+   `Talk about`, `Explain about`) still reject.
 2. reject `filler_only` — every word is filler (`uh um hmm hm yeah okay ok right`).
 3. reject `near_duplicate` — token-set ratio ≥ `dedupe_ratio` (0.85) against a question
    answered within `reask_cooldown_s` (**8 s**) — *time-scoped on purpose*: inside the
@@ -243,9 +251,9 @@ load-bearing; run exactly this sequence:**
    the GIL right?" answers; "Am I right?" does not. Judged before the fast-accept because a
    pure tag is interrogative-shaped and would sail through it.
 5. **fast-accept `explicit_interrogative`** (skips Stage B): ends with `?` **and**, after
-   stripping `QUESTION_PREFIXES` (`so well okay ok then and but` plus the acknowledgment
+   stripping `QUESTION_PREFIXES` (`so well okay ok then and but` plus conversational and acknowledgment
    lead-ins interviewers habitually attach: `great alright right sure now yes yeah cool
-   perfect good nice fine`), starts with an interrogative
+   perfect good nice fine again wait hello please`), starts with an interrogative
    (`what/why/how/when/where/who/which/whose/can/could/would/should/do/does/did/is/are/was/were/will/have/has/am/may/might/shall`),
    **and** is not a vocative — the vocative guard is what keeps names that casefold into
    interrogatives from slipping through ("Will, can you review this?" is addressed to Will).
@@ -262,7 +270,9 @@ load-bearing; run exactly this sequence:**
    going/later/tomorrow`) kills the bigram fallback ("we'll talk about that later" asks
    nothing); vocatives ("Sarah, tell me…"); and a trailing fragment word disqualifies the
    stub — "So, tell me about" is a request cut off mid-sentence and belongs to the merge
-   layer.
+   layer. A generic honorific plus a clear information command (`Sir, talk to me about
+   RAG`) is allowed, but the honorific is not a general question prefix: `Sir, can you
+   close the window?` remains a human vocative.
 7. reject `human_vocative` — `hey <Name> …`, or `<Name>, ` followed by modal-you (`can/
    could/would/will/do/did/are/have you`) **or** an imperative verb (`tell talk explain
    walk describe give`, optionally after "please"). First tokens in `QUESTION_PREFIXES` are
@@ -372,6 +382,9 @@ within `echo_window_s` (2 s), keep only the mic one. The sys-side hold applies o
   (2–4 spoken sentences, no markdown) and `terse` remain. Every style carries a CODE
   EXCEPTION: code goes in a real fenced block, never flattened into a sentence, exempt from
   the word budget.
+- Style is snapshotted per queued answer. A runtime Voice-mode delivery toggle therefore
+  cannot turn an already-queued cue answer into a different prompt or make its bullets get
+  read under a later mode.
 - **`asyncio.Semaphore(max_concurrent)`** (default 4). Parallel answering measured 6.0 s
   wall clock for four questions against 22.2 s serialised. Per-call timeout
   `answer_timeout_s` (45) → kill process, mark card `timed out`. Answers bind to question
@@ -379,7 +392,7 @@ within `echo_window_s` (2 s), keep only the mic one. The sys-side hold applies o
 
 ### 5.5. Two-pass system (both passes are best-effort: every failure path is a no-op)
 
-**Answer audit — `[answer] verify = "always" | "off"` (default always).** After each
+**Answer audit — `[answer] verify = "always" | "off"` (default off).** When enabled, after each
 delivered `ok` answer, an auditor re-reads it with what the fast path did not have: a wider
 transcript window (`verify_context_turns` = 18), the full Q&A history, and the **raw
 transcription** (which may contain mishearings the rewritten query inherited). It replies
@@ -388,8 +401,8 @@ when the delivered answer is materially wrong: missed constraint, misheard quest
 factual error, first-person impersonation of another party, topic wrongly sourced from the
 standing profile, dropped enumeration item. Style, phrasing, ordering, added depth are
 NEVER grounds — a correction lands ~8 s after the user may already be speaking from the
-first card, so it must earn the distraction. Audits run under a semaphore of 1 (they must
-not compete with primary answers for the CLI budget) and strictly after the answer is on
+first card, so it must earn the distraction. Audits run under a semaphore of 1 and share
+the aggregate Claude process limit with primary answers, strictly after the answer is on
 screen (first-answer latency untouched). A revision also **replaces the Q&A-history
 entry** — otherwise "elaborate on that" expands the answer the audit just retracted — and
 is logged as `gate_reason: "verify_revision"`, `answer_status: "revised"`.
@@ -397,14 +410,16 @@ is logged as `gate_reason: "verify_revision"`, `answer_status: "revised"`.
 **Missed-question sweep — `[answer] sweep = "always" | "off"` (default always).** The audit
 only reviews answers that exist; a wrongly rejected question produces nothing to audit.
 Every `sweep_interval_s` (25 s) a sweeper hands the recent **judgment-stage rejections
-only** — `not_a_direct_question`, `ollama_reject`, `ollama_unavailable`; mechanical
-rejections (filler, dedupe, echo, tags, pause) are not misses and never enter — to
+only** — `not_a_direct_question`, `ollama_reject`, `ollama_unavailable`,
+`human_vocative`; mechanical rejections (filler, dedupe, echo, tags, pause) are not
+misses and never enter — to
 `sweep_model` (default `claude-haiku-4-5`; a small classification wants a fast cheap model)
 along with wide transcript context and the answered/in-flight list. Strict-JSON reply, at
 most 2 recoveries per sweep, never resurrecting anything already answered. Genuine asks
 come back as late cards through the **normal answer path** (streaming, audit and all) with
-`gate_reason: "second_pass_recovery"`. Both live misses to date were exactly this shape: an
-`ollama_reject` on a real question and a `not_a_direct_question` on a command-form ask.
+`gate_reason: "second_pass_recovery"`. The `human_vocative` case is included because
+sentence-initial capitalization can make a discourse marker look like a person's name;
+the sweep independently rejects speech genuinely addressed to another human.
 
 ### 6. `ui.py` — the live pane
 
@@ -422,7 +437,10 @@ come back as late cards through the **normal answer path** (streaming, audit and
 - Keys (top-level BINDINGS): `p` pause/resume · `c` clear feed · `t` toggle transcript
   lines · `l` session browser (read-only replay of a recorded JSONL over the live pane) ·
   `a` force-answer the last utterance (bypasses the gate; reason `forced_by_user`) · `s`
-  cycle strict/balanced/eager · `x` context-profile picker · `d` audio device picker (live
+  cycle strict/balanced/eager · `m` mute/unmute voice · `g` toggle Q&A/Agent interaction ·
+  `r` toggle Normal/Conversational delivery (the three voice-only bindings are hidden in
+  non-Voice launches) · `x` context-profile
+  picker · `1` mute/resume mic input · `2` mute/resume system input · `d` audio device picker (live
   level meters; selection persists to config.toml via `config_write` and restarts capture)
   · `q` quit. Modal pickers close on Esc or their opening key and navigate with j/k/Enter.
 - `action_devices` / `action_profiles` / `action_sessions` each run in their **own
@@ -436,6 +454,56 @@ come back as late cards through the **normal answer path** (streaming, audit and
   `second_pass_recovery`, `verify_revision`, `forced_by_user`, `paused`,
   `paused_during_gate`, `transcript_queue_overflow`, and the shutdown flush reasons.
   Answer statuses: `ok`, `error`, `timed_out`, `dropped`, `cancelled`, `revised`.
+
+### 6.5. `tts.py` — Voice delivery
+
+- Voice is a launch role (`--voice`), never a second companion process. The per-user
+  application lock prevents duplicate capture/Whisper/Claude pipelines.
+- Every launch starts in **Normal** delivery: configured answer style (normally `cue`) and
+  configured speech selection (normally `first_line`). Pressing `r` opts into
+  **Conversational** delivery for future work: `interview` prose plus `full` speech. The
+  choice is runtime-only and switching back restores configured behavior without writing
+  `config.toml`.
+- `speakable(full)` includes all non-code answer lines, removes Markdown decoration, and
+  gives cue fragments sentence boundaries. Fenced code is never spoken.
+- In Conversational mode only, a narrow local control recognises “continue reading,” “read
+  the rest,” and “repeat that” against a mic-channel answer completed within 90 seconds.
+  This bypasses Claude and the missed-question sweep. It also tolerates the observed ASR
+  inversion `I'm not going to continue reading out the whole answer`, because both model
+  passes rationally see that corrupted transcript as narration. System audio, stale/no
+  answer, bare “continue,” and unrelated reading narration never activate it.
+- Playback is serial and capture is muted for the configured channels while speech is
+  audible, so default Conversational mode is turn-taking, not safe barge-in. Cross-process
+  claims/election, bounded player teardown, and capture-time mute windows prevent TTS echo
+  from becoming a new question.
+
+### 6.6. Runtime Agent conversation
+
+- Voice exposes two independent runtime axes. **Interaction** is Q&A or Agent (`g` in the TUI;
+  explicit browser buttons), while **Delivery** is Normal or Conversational (`r`). A knowledge
+  profile is orthogonal: cybersecurity, interview, and support profiles work in either role.
+  Every launch starts in Q&A; legacy `## Interaction` profile metadata is parsed but ignored.
+- Entering or leaving Agent, or changing profile while Agent is active, starts a clean conversation
+  boundary: prior context/history, pending cards, gate work, and queued speech cannot leak across it.
+- Enabling Agent defaults Delivery to Conversational but leaves the Delivery control available;
+  leaving Agent restores the pre-Agent delivery preference.
+- The selected speaker channel bypasses the question-only gate. Complete statements and terse
+  replies are actionable; local greetings, thanks, hold requests, and goodbyes answer without
+  an LLM call. Filler, echoes, the non-speaker channel, and muted input never reach the Agent
+  model or missed-question sweep.
+- Agent answer work is serialized to preserve turn order and Q&A history. Replies use short
+  TTS-shaped prose and layered courtesy safeguards; unguarded streaming deltas are withheld.
+  Operational failures produce a courteous recovery prompt, not raw CLI diagnostics.
+- Mic and system listening switches are independent from global Pause, voice-output mute, gate
+  policy, and automatic playback echo windows. A toggle discards that channel's not-yet-admitted
+  frames, utterances, transcripts, continuity fragments, and late STT results without touching
+  the other channel. Muted transcript text is not persisted.
+- Profiles may optionally provide `## Customer Channel` (`mic` or `sys`) and `## Greeting`; absent
+  settings use the microphone and a generic AI-assistant greeting. They configure an Agent session
+  but never activate the Agent role.
+- The safe default still mutes both capture channels during playback, so this is turn-taking,
+  not full-duplex barge-in. Local `paplay` output also needs explicit call-device routing before
+  a remote customer can hear it.
 
 ---
 
@@ -472,7 +540,8 @@ default. Structure and keys (defaults in parentheses):
   `cpu_compute_type` ("int8"), `queue_size` (12), `language` ("" = autodetect),
   `hallucination_blocklist` (whole-utterance defaults above)
 - `[context]` — `enabled` (true), `profile` ("" = none; relative paths resolve from the
-  config file; profiles are free-form Markdown under `profiles/`)
+  config file; profiles are free-form Markdown under `profiles/`; Agent sessions may use optional
+  `Customer Channel` and `Greeting` sections, while role selection remains runtime state)
 - `[gate]` — `model` ("gemma4:e2b"), `ollama_url`, `mode` ("balanced"),
   `channel_policy` ({mic = "explicit", sys = "full"}; only mic/sys keys; not all "off"),
   `max_concurrent` (3), `min_words` (3), `context_turns` (6), `dedupe_window_s` (300.0),
@@ -484,7 +553,8 @@ default. Structure and keys (defaults in parentheses):
 - `[answer]` — `answer_model` ("claude-sonnet-5"), `stream` (true), `style` ("cue" |
   "interview" | "terse"), `max_words` (45), `max_concurrent` (4), `web_lookup` ("auto"),
   `answer_timeout_s` (45.0), `context_turns` (6), `history_turns` (8; 0 disables history),
-  `verify` ("always" | "off"), `verify_context_turns` (18), `sweep` ("always" | "off"),
+  `verify` ("always" | "off", default "off"), `verify_context_turns` (18),
+  `sweep` ("always" | "off", default "always"),
   `sweep_interval_s` (25.0), `sweep_model` ("claude-haiku-4-5"; empty falls back to
   `answer_model`), `queue_size` (16)
 - `[ui]` — `show_transcripts` (true), `log_dir` ("logs"), `status_interval_s` (0.5),
@@ -501,10 +571,11 @@ commentary.
 ```
 Q&A/
   SPEC.md  README.md  requirements.txt  config.toml  setup.ps1  run.sh
+  run-emergency.sh
   ambientqa/
     __init__.py __main__.py config.py config_write.py bus.py logging_.py
     audio.py audio_devices.py segmenter.py stt.py continuity.py context.py
-    gate.py answer.py profile.py ui.py
+    gate.py answer.py profile.py ui.py mode_picker.py
     backends/  __init__.py base.py windows.py linux.py
   profiles/   free-form Markdown standing-context profiles (picked with x)
   scripts/    list_devices.py pick_mic.py eval_gate.py render_session.py
@@ -512,10 +583,12 @@ Q&A/
               test_answer_style.py test_audio_devices.py test_audio_health.py
               test_backends.py test_code_answers.py test_config.py
               test_config_write.py test_context.py test_continuity.py
-              test_gate_heuristics.py test_pause_and_fragments.py test_profile.py
+              test_gate_heuristics.py test_mode_picker.py
+              test_pause_and_fragments.py test_profile.py
               test_segmenter.py test_stt.py test_ui_audio_devices.py
               test_ui_profiles.py test_ui_sessions.py test_ui_streaming.py
-              test_ui_transcripts.py test_web_lookup.py
+              test_ui_transcripts.py test_ui_voice_mode.py test_tts.py
+              test_voice_controller.py test_web_lookup.py
 ```
 
 - `requirements.txt`: `pyaudiowpatch; sys_platform == "win32"` (Windows-only — Linux
@@ -528,9 +601,14 @@ Q&A/
   only after pip succeeds** (gating on `bin/python` alone mistakes an interrupted install
   for a finished one; a stamp older than `requirements.txt` re-runs pip); loads PipeWire
   `module-echo-cancel` exposing the `ec_mic` source config pins (see verified facts);
-  starts Ollama if absent; exports `LD_LIBRARY_PATH` pointing CTranslate2 at the
-  pip-installed CUDA libraries; `exec`s `python -m ambientqa`. **No single-instance
-  lock** — PipeWire multiplexes sources and several copies must be able to run at once.
+  when passed `--choose` by the desktop entry, runs the standalone Textual mode picker before
+  touching audio/models and maps its fixed Assist/Voice/Web Assist/Web Voice/Emergency/Cancel
+  results (Web Voice is the single-process `--web --voice --open-browser` combination); starts
+  Ollama if absent; exports `LD_LIBRARY_PATH` pointing CTranslate2 at the
+  pip-installed CUDA libraries; `exec`s `python -m ambientqa`. The application claims a
+  process-lifetime per-user lock before model load, retains heartbeats for status/legacy
+  detection, and refuses a second full pipeline unless the diagnostic `--allow-multiple`
+  escape hatch is explicitly supplied.
 - `scripts/`: `list_devices.py` prints inputs/loopbacks per backend; `pick_mic.py`
   interactively meters and selects a device; `eval_gate.py` replays labelled cases against
   the gate (run it after touching heuristics or Stage B prompts); `render_session.py`
@@ -539,6 +617,16 @@ Q&A/
   device, CUDA fallback, Ollama not running, empty gate responses → `think:false`,
   missing `ec_mic`).
 - Run with `python -m ambientqa` (or `./run.sh` on Linux).
+- **Opt-in web console** (`webui.py` + `webstatic/`, launched via `--web` /
+  `run-web.sh`, rehearsed offline with `scripts/webui_demo.py`, tested by
+  `tests/test_webui.py`): a browser rendering of the same pipeline behind the
+  controller's `app_factory` seam. Stdlib-only (no requirements.txt change), binds
+  127.0.0.1 only, defaults to port 8802, and identifies itself at `/api/health`.
+  An unpinned launch scans a short next-port range when another local service owns
+  the default, then opens the actual healthy URL; an explicit `--web-port` fails
+  cleanly instead of silently moving. Its status tick doubles as the instance
+  heartbeat, and the Textual pane remains the default surface — see
+  docs/ARCHITECTURE.md §13b.
 
 ## Non-negotiables
 
@@ -552,7 +640,8 @@ Q&A/
 6. parec stderr never attaches to a pipe.
 7. Stream teardown order is stop → join readers → close → session close; `stop()` must be
    callable from any thread and unblock a blocked `read()`.
-8. No single-instance lock anywhere; multiple app instances are supported on Linux.
+8. Refuse a second full app pipeline by default; multiple copies require an explicit unsafe
+   diagnostic override.
 9. The STT hallucination blocklist matches the exact normalised whole transcript, never a
    prefix.
 10. Nothing writes to stderr once Textual owns the terminal; the resource tracker starts
@@ -560,7 +649,7 @@ Q&A/
 
 ## Acceptance
 
-- `pytest`: **337 passed, 1 skipped** (the skip is an environment guard in
+- `pytest`: **514 passed, 1 skipped** (the skip is an environment guard in
   `tests/test_stt.py` that needs pip-installed CUDA libraries). Heuristic gate tests cover
   every Stage A rule above **and their ordering**.
 - App starts, shows `listening`, transcribes both channels on the current platform's
