@@ -1,5 +1,5 @@
 # Ambient default configuration.
-# Device names are case-insensitive substrings; leave blank to use Windows defaults.
+# Device names are case-insensitive substrings; leave blank to use platform defaults.
 [audio]
 # Case-insensitive substring of the microphone to pin, matched against the
 # device description (and on Linux also the PipeWire source name, e.g.
@@ -7,7 +7,8 @@
 # default source first and falls back through the rest, so an unplugged headset
 # never kills capture. A pinned name that matches nothing is a hard error —
 # guessing a microphone records the wrong room. Capture goes through PipeWire's
-# multiplexed sources on Linux, so the mic stays available to every other app.
+# multiplexed sources on Linux or CoreAudio on macOS, so the mic stays available
+# to every other app. Press d to replace a device pin copied from another machine.
 #
 # "ec_mic" is the WebRTC-processed source run.sh loads (noise suppression +
 # automatic gain control over the USB mic). The raw source runs hot enough to
@@ -18,6 +19,7 @@ mic_device = "Echo-cancelled_Microphone"
 # Leave BLANK (recommended). Blank opens every loopback endpoint at once and
 # follows whichever one is actually carrying speech, so it does not matter
 # whether today's call plays through the headset, the monitor or the speakers.
+# macOS requires a virtual CoreAudio input such as BlackHole 2ch; see README.md.
 # Naming one endpoint pins it: if the call plays anywhere else the loopback opens
 # perfectly happily on silence and the other speaker is never heard at all.
 output_device = "Monitor of Starship/Matisse HD Audio Controller Analog Stereo"
@@ -184,7 +186,8 @@ sweep = "always"
 queue_size = 16
 
 [tts]
-# Voice mode: launch one `./run.sh --voice` process to show and speak answers;
+# Voice mode: launch one `./run.sh --voice` (Linux) or
+# `./run-macos.sh --voice` (macOS) process to show and speak answers;
 # this section only tunes how. Starting silent and voice panes side by side
 # duplicates Whisper and Claude work, so a second process is refused by default.
 # "kokoro" is the neural voice (local model in models/, CPU); "espeak" is the

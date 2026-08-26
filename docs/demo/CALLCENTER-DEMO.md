@@ -85,8 +85,8 @@ processing runs on the agent's own machine — no call audio ever leaves it.
   Logs are git-ignored by design.
 
 ### Operations
-- **Runs on Windows and Linux from one codebase** (platform-selected audio
-  backends). One launcher script bootstraps everything on Linux.
+- **Runs on Windows, Linux, and macOS from one codebase** (platform-selected audio
+  backends). Dedicated launchers bootstrap Linux and macOS environments.
 - **Multiple instances are supported** and the status bar shows a live
   `instances:N` counter.
 - **Degrades, never dies.** Gate model down → heuristics-only. Audit or sweeper

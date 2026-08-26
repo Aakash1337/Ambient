@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import site
+import sys
 import textwrap
 import threading
 import time
@@ -81,7 +82,16 @@ class WhisperTranscriber:
         self.config = config
         self.status_callback = status_callback or (lambda _message: None)
         self.model = None
-        self.device = config.device
+        # CTranslate2 publishes native Intel and Apple-Silicon wheels, but its
+        # macOS runtime is CPU-only. A shared config commonly pins CUDA for the
+        # Windows/Linux machines, so translate that impossible request before
+        # model construction instead of showing a scary CUDA failure on every
+        # Mac launch and then doing the same CPU work anyway.
+        self.device = (
+            "cpu"
+            if sys.platform == "darwin" and config.device == "cuda"
+            else config.device
+        )
         self.profile = profile
         # Runtime interaction role, deliberately independent of profile domain.
         # Assist drops common silence hallucinations; Agent keeps the few short
@@ -127,19 +137,26 @@ class WhisperTranscriber:
     def _load_model(self) -> None:
         if self.model is not None:
             return
-        if self.config.device != "cpu":
+        requested_device = self.device
+        if requested_device != "cpu":
             register_cuda_dll_dirs()
         from faster_whisper import WhisperModel
 
         try:
             self.model = WhisperModel(
                 self.config.model,
-                device=self.config.device,
-                compute_type=self.config.compute_type,
+                device=requested_device,
+                compute_type=(
+                    self.config.cpu_compute_type
+                    if requested_device == "cpu"
+                    else self.config.compute_type
+                ),
             )
-            self.device = self.config.device
+            self.device = requested_device
             self.status_callback(f"Whisper ready on {self.device}")
         except Exception as exc:
+            if requested_device == "cpu":
+                raise
             warning = self._cuda_fallback_warning(
                 "CUDA Whisper initialization failed", str(exc)
             )

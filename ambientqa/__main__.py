@@ -2483,8 +2483,9 @@ async def _main(
     web_port: int | None = None,
     web_open_browser: bool = False,
     web_allow_port_fallback: bool = True,
+    config_path: str | Path = "config.toml",
 ) -> None:
-    config_path = Path("config.toml")
+    config_path = Path(config_path)
     config = load_config(config_path)
     app_factory = None
     if web_port is not None:
@@ -2566,9 +2567,14 @@ def main() -> None:
         description="Ambient: a passive listening pane that answers real questions.",
     )
     parser.add_argument(
+        "--config",
+        default="config.toml",
+        help="configuration file (macOS launcher uses config.macos.toml)",
+    )
+    parser.add_argument(
         "--voice",
         action="store_true",
-        help="voice mode: speak answers aloud (Linux/PipeWire only)",
+        help="voice mode: speak answers aloud (Linux/PipeWire or macOS/CoreAudio)",
     )
     parser.add_argument(
         "--allow-multiple",
@@ -2601,13 +2607,17 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
-    if args.voice and (sys.platform == "win32" or shutil.which("paplay") is None):
+    voice_error: str | None = None
+    if args.voice and sys.platform == "win32":
+        voice_error = "--voice is not supported on Windows"
+    elif args.voice and sys.platform.startswith("linux") and shutil.which("paplay") is None:
+        voice_error = "--voice needs PipeWire's paplay on Linux"
+    elif args.voice and sys.platform not in {"darwin"} and not sys.platform.startswith("linux"):
+        voice_error = f"--voice is not supported on {sys.platform}"
+    if voice_error is not None:
         # Checked here, before the TUI owns the terminal, so the message is
         # actually readable.
-        print(
-            "--voice needs Linux with PipeWire's paplay available",
-            file=sys.stderr,
-        )
+        print(voice_error, file=sys.stderr)
         raise SystemExit(2)
     logging.basicConfig(
         level=logging.INFO,
@@ -2628,6 +2638,7 @@ def main() -> None:
                 web_port=selected_web_port if args.web else None,
                 web_open_browser=args.open_browser,
                 web_allow_port_fallback=args.web_port is None,
+                config_path=args.config,
             )
         )
     except OSError as exc:

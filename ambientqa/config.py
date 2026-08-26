@@ -16,9 +16,8 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
 class AudioConfig:
     # Which capture stack feeds the pipeline. "auto" picks the platform's
     # native one -- WASAPI (pyaudiowpatch) on Windows, PipeWire (pactl/parec)
-    # elsewhere. Explicit values exist for the odd setup (e.g. PipeWire's
-    # pulse compatibility on a system this never auto-detects), not for
-    # day-to-day use.
+    # on Linux, and CoreAudio (sounddevice) on macOS. Explicit values exist for
+    # diagnostics and unusual setups, not for day-to-day use.
     backend: str = "auto"
     mic_device: str = ""
     output_device: str = ""
@@ -310,8 +309,10 @@ def _section(cls: type[T], values: dict[str, Any], name: str) -> T:
 
 
 def validate_config(config: Config) -> Config:
-    if config.audio.backend not in {"auto", "wasapi", "pipewire"}:
-        raise ValueError('audio.backend must be "auto", "wasapi", or "pipewire"')
+    if config.audio.backend not in {"auto", "wasapi", "pipewire", "coreaudio"}:
+        raise ValueError(
+            'audio.backend must be "auto", "wasapi", "pipewire", or "coreaudio"'
+        )
     if config.audio.sample_rate != 16000:
         raise ValueError("audio.sample_rate must be 16000 for Silero VAD and Whisper")
     if not 20 <= config.audio.frame_ms <= 30:
@@ -422,12 +423,47 @@ def default_config() -> Config:
     )
 
 
+def _merge_raw_config(
+    base: dict[str, Any], override: dict[str, Any]
+) -> dict[str, Any]:
+    """Recursively merge a small platform overlay into a shared config."""
+
+    merged = dict(base)
+    for key, value in override.items():
+        inherited = merged.get(key)
+        if isinstance(inherited, dict) and isinstance(value, dict):
+            merged[key] = _merge_raw_config(inherited, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_raw_config(path: Path, stack: tuple[Path, ...] = ()) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    resolved = path.resolve()
+    if resolved in stack:
+        chain = " -> ".join(str(item) for item in (*stack, resolved))
+        raise ValueError(f"Config extends cycle: {chain}")
+    with path.open("rb") as handle:
+        raw: dict[str, Any] = tomllib.load(handle)
+    extends = raw.pop("extends", None)
+    if extends is None:
+        return raw
+    if not isinstance(extends, str) or not extends.strip():
+        raise ValueError('Config "extends" must be a non-empty path string')
+    base_path = Path(extends)
+    if not base_path.is_absolute():
+        base_path = path.parent / base_path
+    if not base_path.exists():
+        raise ValueError(f"Extended config does not exist: {base_path}")
+    base = _load_raw_config(base_path, (*stack, resolved))
+    return _merge_raw_config(base, raw)
+
+
 def load_config(path: str | Path = "config.toml") -> Config:
     config_path = Path(path)
-    raw: dict[str, Any] = {}
-    if config_path.exists():
-        with config_path.open("rb") as handle:
-            raw = tomllib.load(handle)
+    raw = _load_raw_config(config_path)
     allowed = {
         "audio", "stt", "context", "gate", "merge", "answer", "ui", "tts",
         "knowledge",

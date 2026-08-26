@@ -1,0 +1,12 @@
+# macOS-only overrides. Every other setting is inherited from config.toml, so
+# shared profiles, answer behavior, and tuning stay in one place. Device choices
+# made with `d` are persisted here and never overwrite Windows/Linux selections.
+extends = "config.toml"
+
+[audio]
+mic_device = ""
+output_device = ""
+
+[stt]
+# CTranslate2's macOS wheels support Intel/Apple-Silicon CPUs, not Metal/MPS.
+device = "cpu"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,23 @@ def test_stale_heartbeat_for_a_live_pid_is_not_pruned(
 
     assert registry.heartbeat_and_count() == 2
     assert peer.exists()
+
+
+def test_macos_stale_pid_identity_uses_ps_without_proc(monkeypatch) -> None:
+    monkeypatch.setattr(instances_module.sys, "platform", "darwin")
+    monkeypatch.setattr(instances_module.os, "name", "posix")
+    monkeypatch.setattr(instances_module.os, "kill", lambda _pid, _signal: None)
+    calls: list[list[str]] = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="/usr/bin/python3 -m ambientqa --web\n", stderr=""
+        )
+
+    monkeypatch.setattr(instances_module.subprocess, "run", run)
+    assert instances_module._ambientqa_pid_alive("1234")
+    assert calls == [["ps", "-p", "1234", "-o", "command="]]
 
 
 def test_close_removes_own_heartbeat(tmp_path: Path) -> None:

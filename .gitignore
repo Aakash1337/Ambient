@@ -1,7 +1,8 @@
 # Environment
 .venv/
 .venv-linux/
-# Voice model binaries (~340 MB); run.sh fetches them on first --voice launch.
+.venv-macos/
+# Voice model binaries (~340 MB); the platform launcher fetches them on first --voice launch.
 models/
 __pycache__/
 *.pyc

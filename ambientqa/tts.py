@@ -31,6 +31,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -59,7 +60,7 @@ WINDOW_TTL_S = 5.0
 _ELECTION_DELAY_S = 0.1
 _CLAIM_REFRESH_S = 1.0
 
-# paplay normally exits at the end of the PCM stream.  Its hard deadline is
+# The platform player normally finishes at the end of the PCM stream. Its hard deadline is
 # the exact audio duration plus this allowance for process startup, buffering,
 # and scheduler delay.  A fixed deadline would incorrectly kill long answers.
 _PLAYER_TIMEOUT_SLACK_S = 2.0
@@ -349,6 +350,26 @@ class SpeechEngine(Protocol):
     def synthesize(self, text: str) -> bytes: ...
 
 
+class PlayerInput(Protocol):
+    def write(self, data: bytes) -> Any: ...
+
+    def close(self) -> Any: ...
+
+
+class PlayerProcess(Protocol):
+    """Small subprocess-shaped contract used by Linux and macOS playback."""
+
+    stdin: PlayerInput | None
+
+    def poll(self) -> int | None: ...
+
+    def terminate(self) -> Any: ...
+
+    def kill(self) -> Any: ...
+
+    def wait(self, timeout: float | None = None) -> int: ...
+
+
 class EspeakEngine:
     """Formant fallback: robotic, instant, zero Python dependencies."""
 
@@ -447,6 +468,95 @@ def _spawn_paplay(sample_rate: int) -> subprocess.Popen[bytes]:
     )
 
 
+class _CoreAudioPlayer:
+    """A ``Popen``-shaped raw PCM player backed by CoreAudio/PortAudio.
+
+    ``SpeechOutput`` already feeds stdin from an isolated worker thread.  A
+    blocking ``RawOutputStream.write`` therefore fits without changing its
+    cancellation or timeout machinery, while abort() gives stop_current() the
+    same immediate cut-off semantics as terminating paplay.
+    """
+
+    def __init__(self, sample_rate: int, sounddevice_module: Any | None = None) -> None:
+        if sounddevice_module is None:
+            from .backends.macos import _sounddevice_module
+
+            sounddevice_module = _sounddevice_module()
+        try:
+            self._stream = sounddevice_module.RawOutputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype="int16",
+            )
+            self._stream.start()
+        except Exception as exc:
+            raise RuntimeError(f"Unable to open the CoreAudio output: {exc}") from exc
+        self.stdin: PlayerInput | None = self
+        self._state_lock = threading.Lock()
+        self._done = threading.Event()
+        self._closing = False
+        self.returncode: int | None = None
+
+    def write(self, data: bytes) -> Any:
+        with self._state_lock:
+            if self._closing:
+                raise BrokenPipeError("CoreAudio player is closed")
+        try:
+            return self._stream.write(data)
+        except Exception as exc:
+            with self._state_lock:
+                closing = self._closing
+            if closing:
+                raise BrokenPipeError("CoreAudio playback was stopped") from exc
+            raise
+
+    def close(self) -> None:
+        self._finish(0, abort=False)
+
+    def poll(self) -> int | None:
+        with self._state_lock:
+            return self.returncode
+
+    def terminate(self) -> None:
+        self._finish(-15, abort=True)
+
+    def kill(self) -> None:
+        self._finish(-9, abort=True)
+
+    def wait(self, timeout: float | None = None) -> int:
+        if not self._done.wait(timeout):
+            raise subprocess.TimeoutExpired("CoreAudio", timeout)
+        with self._state_lock:
+            assert self.returncode is not None
+            return self.returncode
+
+    def _finish(self, returncode: int, *, abort: bool) -> None:
+        with self._state_lock:
+            if self._closing:
+                return
+            self._closing = True
+        try:
+            action = (
+                getattr(self._stream, "abort", None)
+                if abort
+                else getattr(self._stream, "stop", None)
+            )
+            if callable(action):
+                action()
+        finally:
+            with suppress(Exception):
+                self._stream.close()
+            with self._state_lock:
+                self.returncode = returncode
+            self._done.set()
+
+
+def _spawn_platform_player(sample_rate: int) -> PlayerProcess:
+    if sys.platform == "darwin":
+        return _CoreAudioPlayer(sample_rate)
+    return _spawn_paplay(sample_rate)
+
+
 async def _synthesize_without_shutdown_block(
     engine: SpeechEngine,
     text: str,
@@ -512,7 +622,7 @@ class SpeechOutput:
         engine: SpeechEngine,
         windows: SpeakWindows,
         report: Callable[[str], None],
-        spawn_player: Callable[[int], subprocess.Popen[bytes]] = _spawn_paplay,
+        spawn_player: Callable[[int], PlayerProcess] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.config = config
@@ -522,9 +632,12 @@ class SpeechOutput:
         self.queue: DropOldestQueue[_SpeakJob] = DropOldestQueue(config.queue_size)
         self.muted = False
         self.speaking = False
-        self._spawn_player = spawn_player
+        self._spawn_player = spawn_player or _spawn_platform_player
+        self._player_name = (
+            "CoreAudio" if spawn_player is None and sys.platform == "darwin" else "paplay"
+        )
         self._clock = clock
-        self._current: subprocess.Popen[bytes] | None = None
+        self._current: PlayerProcess | None = None
         self._state_lock = threading.Lock()
         self._cancel_generation = 0
 
@@ -596,7 +709,7 @@ class SpeechOutput:
 
     def _start_player(
         self, generation: int
-    ) -> subprocess.Popen[bytes] | None:
+    ) -> PlayerProcess | None:
         """Atomically reject a cancellation or install the new child."""
         with self._state_lock:
             if generation != self._cancel_generation or self.muted:
@@ -606,13 +719,13 @@ class SpeechOutput:
             self.speaking = True
             return proc
 
-    def _finish_player(self, proc: subprocess.Popen[bytes]) -> None:
+    def _finish_player(self, proc: PlayerProcess) -> None:
         with self._state_lock:
             if self._current is proc:
                 self._current = None
                 self.speaking = False
 
-    async def _reap_player(self, proc: subprocess.Popen[bytes]) -> None:
+    async def _reap_player(self, proc: PlayerProcess) -> None:
         """Stop and reap a live player without letting cleanup hang forever."""
         try:
             running = proc.poll() is None
@@ -682,7 +795,7 @@ class SpeechOutput:
         refresher = asyncio.create_task(
             self._refresh_claim(claim_done, claim_failed, generation)
         )
-        proc: subprocess.Popen[bytes] | None = None
+        proc: PlayerProcess | None = None
         feeder: asyncio.Task[None] | None = None
         audio_started = False
         window_published = False
@@ -732,7 +845,7 @@ class SpeechOutput:
             audio_since = self._clock()
             deadline = audio_since + duration + tail
             # Transition from the non-muting claim to an audible window before
-            # spawning paplay.  If the registry cannot be written, stay silent
+            # spawning the platform player. If the registry cannot be written, stay silent
             # rather than risk feeding our own answer back into the pipeline.
             if not self.windows.publish(
                 deadline,
@@ -749,7 +862,9 @@ class SpeechOutput:
             try:
                 proc = self._start_player(generation)
             except FileNotFoundError:
-                self.report("voice: paplay not found; cannot play speech")
+                self.report(
+                    f"voice: {self._player_name} not found; cannot play speech"
+                )
                 return
             except Exception as exc:
                 self.report(f"voice: playback failed to start: {exc}")
@@ -831,10 +946,10 @@ class SpeechOutput:
                 else:
                     if returncode not in (None, 0):
                         self.report(
-                            f"voice: paplay exited with status {returncode}"
+                            f"voice: {self._player_name} exited with status {returncode}"
                         )
         except FileNotFoundError:
-            self.report("voice: paplay not found; cannot play speech")
+            self.report(f"voice: {self._player_name} not found; cannot play speech")
         finally:
             claim_done.set()
             if not refresher.done():
@@ -864,7 +979,7 @@ class SpeechOutput:
                 self.windows.clear_window()
 
     @staticmethod
-    def _feed(proc: subprocess.Popen[bytes], pcm: bytes) -> None:
+    def _feed(proc: PlayerProcess, pcm: bytes) -> None:
         try:
             assert proc.stdin is not None
             proc.stdin.write(pcm)

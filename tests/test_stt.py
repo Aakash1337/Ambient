@@ -274,6 +274,30 @@ def test_cpu_runtime_errors_are_not_swallowed() -> None:
         transcriber._transcribe_sync(utterance())
 
 
+def test_macos_translates_shared_cuda_config_to_cpu(monkeypatch) -> None:
+    import faster_whisper
+
+    monkeypatch.setattr("ambientqa.stt.sys.platform", "darwin")
+
+    def cuda_must_not_run() -> None:
+        raise AssertionError("CUDA setup ran on macOS")
+
+    monkeypatch.setattr("ambientqa.stt.register_cuda_dll_dirs", cuda_must_not_run)
+    created: list[tuple[str, dict[str, str]]] = []
+
+    def model(name: str, **kwargs):
+        created.append((name, kwargs))
+        return object()
+
+    monkeypatch.setattr(faster_whisper, "WhisperModel", model)
+    transcriber = WhisperTranscriber(
+        STTConfig(device="cuda", compute_type="float16", cpu_compute_type="int8")
+    )
+    assert transcriber.device == "cpu"
+    transcriber._load_model()
+    assert created == [("large-v3-turbo", {"device": "cpu", "compute_type": "int8"})]
+
+
 def test_cuda_dll_dirs_are_registered_and_on_path() -> None:
     import os
     from ambientqa.stt import register_cuda_dll_dirs

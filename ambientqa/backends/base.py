@@ -3,7 +3,8 @@
 The pipeline in audio.py does not care where samples come from -- only that it
 can enumerate devices, open a blocking float32 stream per device, and unblock a
 reader from another thread. Everything platform-specific (pyaudiowpatch/WASAPI
-on Windows, pactl/parec on Linux) lives behind these three protocols.
+on Windows, pactl/parec on Linux, sounddevice/CoreAudio on macOS) lives behind
+these three protocols.
 """
 
 from __future__ import annotations
@@ -18,9 +19,9 @@ DeviceKind = Literal["mic", "loopback"]
 
 @dataclass(frozen=True, slots=True)
 class CaptureDevice:
-    # Backend-stable identifier: the stringified PyAudio device index on
-    # Windows, the PipeWire source name on Linux. Opaque to everything above
-    # the backend; only `name` is ever shown or written to config.
+    # Backend-stable identifier: the stringified PyAudio/CoreAudio device index
+    # on Windows/macOS, the PipeWire source name on Linux. Opaque to everything
+    # above the backend; only `name` is ever shown or written to config.
     id: str
     name: str
     kind: DeviceKind
@@ -69,8 +70,8 @@ class SourceStream(Protocol):
 
 class BackendSession(Protocol):
     """Holds whatever per-run resource the platform needs (a PyAudio instance
-    on Windows; nothing on Linux). Streams opened through it must be closed
-    before the session is."""
+    on Windows; lightweight factories on Linux/macOS). Streams opened through
+    it must be closed before the session is."""
 
     def mic_candidates(
         self,

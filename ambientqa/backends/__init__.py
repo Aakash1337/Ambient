@@ -1,7 +1,8 @@
 """Platform-selected audio capture backends.
 
 The concrete backends are imported lazily inside get_backend so that importing
-ambientqa never requires pyaudiowpatch off-Windows (or pactl on Windows).
+ambientqa never requires pyaudiowpatch off-Windows, sounddevice off-macOS, or
+PipeWire tools off-Linux.
 """
 
 from __future__ import annotations
@@ -26,7 +27,14 @@ __all__ = [
 def get_backend(audio_config: "AudioConfig") -> AudioBackend:
     choice = audio_config.backend
     if choice == "auto":
-        choice = "wasapi" if sys.platform == "win32" else "pipewire"
+        if sys.platform == "win32":
+            choice = "wasapi"
+        elif sys.platform == "darwin":
+            choice = "coreaudio"
+        else:
+            # Preserve the existing Linux/default path for all other POSIX
+            # hosts rather than changing a working PipeWire installation.
+            choice = "pipewire"
     if choice == "wasapi":
         from .windows import WasapiBackend
 
@@ -35,5 +43,12 @@ def get_backend(audio_config: "AudioConfig") -> AudioBackend:
         from .linux import PipewireBackend
 
         return PipewireBackend(latency_ms=audio_config.frame_ms)
+    if choice == "coreaudio":
+        from .macos import CoreAudioBackend
+
+        return CoreAudioBackend(frame_ms=audio_config.frame_ms)
     # validate_config rejects this earlier; kept for direct callers.
-    raise ValueError(f'audio.backend must be "auto", "wasapi", or "pipewire"; got {choice!r}')
+    raise ValueError(
+        'audio.backend must be "auto", "wasapi", "pipewire", or '
+        f'"coreaudio"; got {choice!r}'
+    )

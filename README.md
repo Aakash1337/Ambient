@@ -1,6 +1,6 @@
 # Ambient
 
-Ambient is a passive side pane for Windows and Linux that listens to the microphone and
+Ambient is a passive side pane for Windows, Linux, and macOS that listens to the microphone and
 system audio, transcribes speech locally, identifies real questions, and answers only those
 questions. It never prompts or interrupts you.
 
@@ -18,10 +18,12 @@ Moving development to a new machine? Follow the porting checklist at the end of
 
 ## Quickstart
 
-Both platforms need Ollama with the model named in `[gate] model` pulled (`gemma4:e2b` by
+All platforms need Ollama with the model named in `[gate] model` pulled (`gemma4:e2b` by
 default — the gate prompt was engineered against it; the earlier stand-in `qwen2.5:3b`
 measurably flips on real questions once transcript context is present), the Claude CLI signed
-in, and an NVIDIA GPU for the preferred Whisper configuration.
+in, and Python 3.11. Windows and Linux use an NVIDIA GPU for the preferred Whisper
+configuration; macOS runs faster-whisper on the CPU because CTranslate2 does not expose a
+Metal/MPS backend.
 
 **Windows** (Windows 11, Python 3.11 through the Python launcher):
 
@@ -49,6 +51,39 @@ microphone source, points CTranslate2 at the pip-installed CUDA libraries, and l
 pane. Because it bootstraps everything itself, it is also the right `Exec` target for a desktop
 app-menu entry (the pane is a TUI).
 
+**macOS** (Intel or Apple Silicon):
+
+```bash
+brew install python@3.11
+./setup-macos.sh
+./run-macos.sh
+```
+
+`setup-macos.sh` creates an isolated `.venv-macos`; `run-macos.sh` refreshes it whenever
+`requirements.txt` changes, starts Ollama when available, and launches the CoreAudio backend.
+The first live capture may make macOS ask for **Microphone** access for Terminal, iTerm, or the
+terminal application used to launch Ambient. Grant it under **System Settings → Privacy &
+Security → Microphone**, then relaunch.
+
+Microphone capture works with no extra audio driver. To hear the other side of a call, macOS
+needs a recordable system-audio input:
+
+1. Install [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole):
+   `brew install --cask blackhole-2ch`, then restart the Mac so CoreAudio loads the driver.
+2. Open **Audio MIDI Setup**, create a **Multi-Output Device**, and enable both the physical
+   headphones/speakers and **BlackHole 2ch**. Keep the physical output as clock source and enable
+   drift correction for BlackHole.
+3. Select that Multi-Output Device under **System Settings → Sound → Output**.
+4. Launch Ambient, press `d`, select the real microphone for `mic` and **BlackHole 2ch** for
+   `sys`, then play call audio and confirm both meters move.
+
+Without a loopback input, Ambient stays usable in microphone-only mode and shows an actionable
+system-audio warning. Web and voice launches are `./run-macos.sh --web` and
+`./run-macos.sh --voice`. The launcher uses `config.macos.toml`, which inherits every shared
+setting from `config.toml` but starts with blank device selections and CPU transcription. Press
+`d` once to choose this Mac's devices; those choices remain in the macOS overlay and do not
+overwrite Windows/Linux selections.
+
 On this KDE installation, opening **Ambient** from the app menu launches a pre-start splash
 with four guarded choices: **Assist** (answers stay on screen), **Voice** (screen plus spoken
 answers), **Web Console** (then **Web Assist** or **Web Voice** in the browser), or **Emergency
@@ -69,7 +104,7 @@ The first Ollama warmup can take about 67 seconds. Once warm, question classific
 normally well under a second.
 
 Use `python scripts/list_devices.py` to see input and system-audio endpoint names (WASAPI
-loopback on Windows, PipeWire monitor sources on Linux). Set `audio.mic_device` or
+loopback on Windows, PipeWire monitor sources on Linux, CoreAudio inputs on macOS). Set `audio.mic_device` or
 `audio.output_device` to a unique, case-insensitive substring when the platform default is
 not the desired source.
 
@@ -83,6 +118,7 @@ python -m pytest -q
 
 ```bash
 ./run.sh --voice
+# macOS: ./run-macos.sh --voice
 ```
 
 The app-menu splash selects this flag for you; no terminal is required for normal use.
@@ -95,8 +131,8 @@ the local Kokoro voice files (~340 MB into `models/`); synthesis runs on the CPU
 the gate keep the GPU. If Kokoro cannot load, the app falls back to `espeak-ng` (robotic but
 instant) and reports the fallback. Press `m` to mute or unmute speech. Press `r` to switch
 between **Normal** and **Conversational** delivery at runtime; the status bar shows the voice
-state and selected delivery together (for example `voice:on/conversational`). Linux only for
-now — playback runs through PipeWire's `paplay`.
+state and selected delivery together (for example `voice:on/conversational`). Playback runs
+through PipeWire's `paplay` on Linux and CoreAudio on macOS.
 
 Normal is the safe startup default: answers keep the glanceable cue-card format and voice reads
 only the opening sentence. Conversational mode asks for short, natural spoken prose and reads the
@@ -132,7 +168,7 @@ domain knowledge, vocabulary, and framing rather than deciding whether Agent is 
 An optional `## Customer Channel` selects exactly one driving speaker input: `mic` is convenient
 for an in-room role-play, while `sys` is the remote side of a real call. The other channel stays
 visible but cannot steer Agent answers. A remote caller still needs the call application's audio
-routing to hear local `paplay` output; Ambient does not silently inject itself into Teams or a
+routing to hear local voice output; Ambient does not silently inject itself into Teams or a
 telephony device.
 
 Keys `1` and `2` independently stop or resume microphone and system-audio transcription. The
@@ -285,7 +321,8 @@ Two rules do the heavy lifting and are easy to break:
 ## Hearing the other speaker
 
 `audio.output_device` should normally be **blank**. Blank opens *every* system-audio endpoint at
-once (WASAPI loopback endpoints on Windows, PipeWire monitor sources on Linux) and forwards
+once (WASAPI loopback endpoints on Windows, PipeWire monitor sources on Linux, recognized
+CoreAudio virtual inputs on macOS) and forwards
 whichever one is actually carrying speech, so it does not matter whether today's call plays
 through the headset, the monitor or the desktop speakers.
 
@@ -293,6 +330,11 @@ On Linux this needs no loopback driver or virtual cable: every output has a *mon
 (`Monitor of <sink>`) that carries whatever the machine plays through it — PipeWire's native
 equivalent of WASAPI loopback — so the `sys` channel works out of the box, and blank watches
 all the monitors exactly as it watches all the loopback endpoints on Windows.
+
+On macOS, CoreAudio has no built-in recordable view of speaker output. Ambient automatically
+classifies BlackHole, Soundflower, Loopback Audio, Background Music, and VB-Audio virtual inputs
+as `sys` endpoints. BlackHole 2ch plus a Multi-Output Device is the tested path. Less-common
+drivers can still be selected by explicitly pinning their input name in `audio.output_device`.
 
 Naming an endpoint pins it, and that is how a whole conversation gets lost. A loopback opened on an
 endpoint the call is not playing through does not error — it opens perfectly happily and captures
@@ -499,7 +541,7 @@ Suppression happens *before* the Ollama call, so it also saves ~700ms per rehear
 
 Platform audio lives behind a small backend layer (`ambientqa/backends/`):
 `[audio] backend = "auto"` selects the platform's native stack — WASAPI (PyAudioWPatch) on Windows,
-PipeWire (one `parec` subprocess per stream) on Linux — behind one device/stream contract, so
+PipeWire (one `parec` subprocess per stream) on Linux, and CoreAudio (`sounddevice`) on macOS — behind one device/stream contract, so
 everything above capture is platform-blind. Non-blocking capture threads — one per open stream —
 feed per-channel Silero VAD segmenters. One faster-whisper worker transcribes utterances
 serially. Free heuristics reject obvious non-questions and fast-accept explicit interrogatives
@@ -579,19 +621,21 @@ a demo.
 
 ## Configuration reference
 
-All settings load from `config.toml` (commented in place); any key left out of the file takes
-the default defined in `ambientqa/config.py`.
+All settings normally load from `config.toml` (commented in place); any key left out takes the
+default defined in `ambientqa/config.py`. The macOS launcher passes `--config
+config.macos.toml`; that small file uses `extends = "config.toml"`, so it overrides only
+platform-specific devices/STT while inheriting the shared tuning.
 
 | Section | Key | Meaning |
 |---|---|---|
-| `audio` | `backend` | `auto` (default) / `wasapi` / `pipewire` — capture stack; `auto` picks the platform's native one |
+| `audio` | `backend` | `auto` (default) / `wasapi` / `pipewire` / `coreaudio` — capture stack; `auto` picks the platform's native one |
 | | `mic_device`, `output_device` | Optional device-name substring |
 | | `sample_rate`, `frame_ms`, `queue_size` | Capture format and bounded frame queue |
 | | `silence_ms`, `pre_roll_ms` | Trailing silence and onset preservation |
 | | `min_utterance_ms`, `max_utterance_s` | Segment discard and force-flush limits |
 | | `silent_source_warn_s` | Flag an open-but-inaudible capture source in the status bar |
 | `stt` | `model` | faster-whisper model name |
-| | `device`, `compute_type`, `cpu_compute_type` | CUDA primary and CPU fallback |
+| | `device`, `compute_type`, `cpu_compute_type` | CUDA primary and CPU fallback; a shared `cuda` setting maps directly to CPU on macOS |
 | | `queue_size`, `language` | Bounded utterance queue and optional language |
 | | `hallucination_blocklist` | Normalized exact phrases discarded after STT |
 | `context` | `profile` | Markdown profile path; empty disables profile context |
@@ -656,6 +700,8 @@ person speaks. Tune the delay with `audio.silent_source_warn_s` (default 45 s).
 that matches nothing no longer drops you to microphone-only — it falls back to the default output
 and warns, since mic-only silently loses the side of the conversation worth answering. If no
 endpoint can be opened at all, the status bar warns and the app continues microphone-only.
+On macOS, install BlackHole 2ch and configure the Multi-Output Device described in Quickstart;
+physical CoreAudio outputs are not recordable inputs by themselves.
 
 **Status bar shows `mic:off` / every microphone fails to open (`-9996 Invalid device`,
 `-9999 Unanticipated host error`):** almost always the **Microsoft Store build of Python**.
@@ -700,8 +746,9 @@ automatic gain control, the class of processing Windows applies in its own audio
 `audio.mic_device` to it. If the app reports the mic unavailable, the module did not load: rerun
 `./run.sh`, or press `d` and pick the raw device (then turn its volume down).
 
-**Whisper says `cpu`:** CUDA/model initialization failed, so faster-whisper fell back to CPU
-`int8`. Read the warning text first. If it says GPU memory is exhausted, close GPU-heavy games,
+**Whisper says `cpu`:** this is expected on macOS, where the shared CUDA config is translated to
+CPU `int8` before model loading. On Windows or Linux it means CUDA/model initialization failed and
+faster-whisper fell back to CPU. Read the warning text first. If it says GPU memory is exhausted, close GPU-heavy games,
 another Whisper/dictation service, or unused Ollama models and relaunch; CPU fallback works but is
 far too slow for a conversational demo. Otherwise check the NVIDIA driver and the installed
 `nvidia-cublas-cu12`/`nvidia-cudnn-cu12` packages. The status bar deliberately makes this fallback

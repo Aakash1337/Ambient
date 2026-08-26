@@ -32,15 +32,16 @@ What you need and why each piece is non-negotiable:
 
 | Piece | Purpose | Notes |
 |---|---|---|
-| Windows 11 **or** Linux with PipeWire | the two first-class platforms | sys-audio capture is WASAPI loopback on Windows, PipeWire *monitor sources* on Linux (`pipewire-pulse` provides the `pactl`/`parec` tools the backend shells out to). macOS would need a third backend (BlackHole) that does not exist yet. |
-| Python 3.11 | runtime | Windows: `py -3.11`, **never the Microsoft Store Python** — it runs in an app container whose *separate* mic consent defaults to Deny. Symptom: every mic fails on every host API with `-9999`, while loopback works fine (loopback reads a render endpoint, which mic consent doesn't gate), and every Windows privacy setting *looks* correct. Cost hours to diagnose. Linux: whatever `python3` is; `run.sh` owns the bootstrap. |
-| A dedicated venv per platform | isolation | `.venv` on Windows (`setup.ps1` encodes the bootstrap), `.venv-linux` on Linux. `run.sh` builds the latter gated on a `.deps-installed` stamp written only *after* pip succeeds — gating on `bin/python` alone mistakes a Ctrl-C'd install for a finished one — and re-runs pip whenever `requirements.txt` is newer than the stamp. |
-| NVIDIA GPU + `nvidia-cublas-cu12`, `nvidia-cudnn-cu12` pip packages | Whisper at conversational speed | Windows: see Stage 3 for the DLL trap. Linux: `run.sh` exports `LD_LIBRARY_PATH` over the pip `nvidia/*/lib` dirs before exec. CPU int8 fallback works but is several× slower — too slow to feel live. |
+| Windows 11, Linux with PipeWire, **or macOS** | the three first-class platforms | sys-audio capture is WASAPI loopback on Windows, PipeWire *monitor sources* on Linux, and a virtual CoreAudio input (tested with BlackHole 2ch) on macOS. |
+| Python 3.11 | runtime | Windows: `py -3.11`, **never the Microsoft Store Python**. Linux: `run.sh` owns the bootstrap. macOS: install `python@3.11`; `setup-macos.sh` rejects a different interpreter version. |
+| A dedicated venv per platform | isolation | `.venv` on Windows, `.venv-linux` on Linux, `.venv-macos` on macOS. Both shell launchers gate pip on a success stamp and rerun it when requirements change. |
+| NVIDIA GPU + CUDA packages (Windows/Linux) | Whisper at conversational speed | Windows/Linux use CUDA. CTranslate2 has native Intel/Apple-Silicon wheels but no Metal backend; macOS intentionally uses CPU int8 and excludes NVIDIA-only packages. |
 | Ollama + `gemma4:e2b` | the question gate | The gate prompt was *engineered against this model*; qwen2.5:3b (the earlier stand-in) measurably flips on real questions once the transcript context block is present. ~0.6 s warm, ~67 s cold first load. Re-benchmark before trusting any substitute (see Stage 5). |
 | Claude CLI, signed in | the answerer | `claude -p "test"` from a terminal must work before anything in Stage 6 will. |
 
 Python packages (`requirements.txt`): `soxr numpy silero-vad onnxruntime faster-whisper
-textual` (+ `tomli` on <3.11), and `pyaudiowpatch` gated with `sys_platform == "win32"`.
+textual` (+ `tomli` on <3.11), `pyaudiowpatch` gated to Windows, and `sounddevice`
+gated to macOS.
 `pyaudiowpatch` specifically — it is the PyAudio fork that exposes WASAPI loopback
 devices; stock PyAudio cannot see them at all. On Linux it never installs: capture is
 parec subprocesses, with no PortAudio anywhere in the stack.
@@ -50,16 +51,18 @@ per platform: Windows — `py -3.11 --version` and
 `python -c "import pyaudiowpatch, soxr, faster_whisper, textual"` inside the venv;
 Linux — `python -c "import soxr, faster_whisper, textual"` inside `.venv-linux`, and
 `pactl --format=json list sources` prints JSON that includes at least one source whose
-`device.class` is `"monitor"`.
+`device.class` is `"monitor"`; macOS — the equivalent import succeeds inside
+`.venv-macos`, `sounddevice.query_hostapis()` includes Core Audio, and device enumeration
+shows the microphone plus BlackHole when system-audio capture is configured.
 
 ## Stage 1 — Audio backends + raw capture
 
 **Build in three layers: the contract first, then one backend per platform.** Nothing
 above the backends is allowed to know where samples come from, and that boundary is what
-makes one codebase serve both platforms.
+makes one codebase serve all three platforms.
 
 1. **The contract (`backends/base.py`).** Three protocols and a dataclass:
-   `CaptureDevice` (a backend-stable opaque `id` — stringified PyAudio index on Windows,
+   `CaptureDevice` (a backend-stable opaque `id` — stringified PortAudio index on Windows/macOS,
    PipeWire source name on Linux — plus name, kind `mic`/`loopback`, native
    channels/rate), `SourceStream` (blocking `read(frames)` returning interleaved
    float32; `stop()` unblocks a reader from any other thread; `close()` releases),
@@ -68,7 +71,7 @@ makes one codebase serve both platforms.
    ordering rule is written into the contract itself: **stop before close, always** —
    closing a stream under a live blocked reader is the native use-after-free class of
    crash. `get_backend()` selects by `sys.platform`; the config key
-   `[audio] backend = "auto" | "wasapi" | "pipewire"` exists for odd setups, not
+   `[audio] backend = "auto" | "wasapi" | "pipewire" | "coreaudio"` exists for odd setups, not
    day-to-day use.
 2. **WASAPI (`backends/windows.py`), via pyaudiowpatch.** Enumerate input devices plus
    everything from `get_loopback_device_info_generator()`; open each stream at the
@@ -102,6 +105,12 @@ makes one codebase serve both platforms.
    copy of this app before model load: it would duplicate capture, Whisper, and paid answer
    calls. Keep an explicit override only for diagnostics.
 
+4. **CoreAudio (`backends/macos.py`), via sounddevice.** Enumerate Core Audio inputs,
+   classify known virtual drivers as loopback, and open native-rate float32 blocking
+   streams. Prefer the default physical mic. A pinned output may select any input so an
+   unfamiliar virtual driver still works. `abort()` must unblock a reader before close.
+   If no virtual loopback exists, report how to install BlackHole and continue mic-only.
+
 Then the platform-neutral capture loop on top (`audio.py`): open a stream per candidate
 device, read 25 ms buffers, downmix to mono by averaging, resample to 16 kHz with
 `soxr.ResampleStream` when a stream arrives off-rate (streaming API, not one-shot — you
@@ -116,7 +125,7 @@ Key concepts you must come out of this stage understanding:
 - **A loopback endpoint / monitor source is a capture device that records what an
   *output* renders.** Which output your meeting app renders to is invisible to you and
   changes between sessions — this fact eventually forced the multi-endpoint design
-  (Stage 8), and it is identical on both platforms.
+  (Stage 8), and it is shared by all three backends.
 - **Capture must live on OS threads.** `stream.read()` blocks; asyncio comes later, and
   the bridge between the two worlds (a lock-guarded deque drained via
   `call_soon_threadsafe`) is worth building carefully once and never touching again.
@@ -586,6 +595,16 @@ Linux-specific:
   explicit `run.sh` and `run.sh --voice` paths so automation and terminal recovery never
   depend on the chooser, and keep the pinned emergency script independently callable even
   if the picker is broken.
+
+macOS-specific:
+
+- Run `./setup-macos.sh`, then `./run-macos.sh`; keep `.venv-macos` separate.
+- Grant the launching terminal Microphone permission.
+- Install the BlackHole 2ch cask, restart the Mac, create a Multi-Output Device containing BlackHole and the
+  physical output, then select BlackHole as Ambient's `sys` input with `d`.
+- Keep platform pins in `config.macos.toml`, an `extends = "config.toml"` overlay, so
+  shared tuning changes remain inherited without overwriting Windows/Linux devices.
+- Expect Whisper to report CPU int8; macOS CTranslate2 does not provide CUDA or Metal.
 
 ## Suggested rebuild exercises
 

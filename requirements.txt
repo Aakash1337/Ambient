@@ -1,4 +1,5 @@
 pyaudiowpatch; sys_platform == "win32"
+sounddevice; sys_platform == "darwin"
 soxr
 numpy
 silero-vad
@@ -7,6 +8,6 @@ kokoro-onnx; sys_platform != "win32"
 faster-whisper
 textual
 tomli
-nvidia-cublas-cu12
-nvidia-cudnn-cu12
+nvidia-cublas-cu12; sys_platform != "darwin"
+nvidia-cudnn-cu12; sys_platform != "darwin"
 pytest

@@ -9,6 +9,8 @@ stale dead markers are pruned by whichever instance sees them next.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import tempfile
 import time
 from contextlib import suppress
@@ -52,6 +54,28 @@ def _ambientqa_pid_alive(value: str) -> bool:
         os.kill(pid, 0)
     except (OSError, ValueError):
         return False
+    if sys.platform == "darwin":
+        # macOS has no /proc. `ps` is only consulted for a stale heartbeat (the
+        # normal fresh-heartbeat and lifetime-lock paths do not spawn it), and
+        # prevents a recycled PID from preserving an unrelated process marker.
+        try:
+            completed = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if completed.returncode != 0:
+            return False
+        arguments = completed.stdout.split()
+        return any(
+            argument == "-m"
+            and index + 1 < len(arguments)
+            and arguments[index + 1] == "ambientqa"
+            for index, argument in enumerate(arguments)
+        )
     # A stale marker can outlive its process and that PID can be reused by an
     # unrelated program. Preserve it only when Linux confirms the expected
     # module command; the lifetime lock is authoritative for current builds.

@@ -221,8 +221,11 @@ def test_audio_backend_defaults_to_auto_and_loads_explicit_values(
 ) -> None:
     assert default_config().audio.backend == "auto"
     path = tmp_path / "config.toml"
-    path.write_text('[audio]\nbackend = "pipewire"\n', encoding="utf-8")
-    assert load_config(path).audio.backend == "pipewire"
+    for backend in ("wasapi", "pipewire", "coreaudio"):
+        path.write_text(
+            f'[audio]\nbackend = "{backend}"\n', encoding="utf-8"
+        )
+        assert load_config(path).audio.backend == backend
 
 
 @pytest.mark.parametrize("backend", ["alsa", "WASAPI", ""])
@@ -231,3 +234,41 @@ def test_rejects_invalid_audio_backend(tmp_path: Path, backend: str) -> None:
     path.write_text(f'[audio]\nbackend = "{backend}"\n', encoding="utf-8")
     with pytest.raises(ValueError, match="audio.backend"):
         load_config(path)
+
+
+def test_platform_overlay_inherits_and_overrides_shared_config(tmp_path: Path) -> None:
+    base = tmp_path / "config.toml"
+    base.write_text(
+        '[audio]\nmic_device = "Linux mic"\nframe_ms = 30\n'
+        '[stt]\nmodel = "small"\ndevice = "cuda"\n',
+        encoding="utf-8",
+    )
+    overlay = tmp_path / "config.macos.toml"
+    overlay.write_text(
+        'extends = "config.toml"\n'
+        '[audio]\nmic_device = ""\noutput_device = "BlackHole"\n'
+        '[stt]\ndevice = "cpu"\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(overlay)
+
+    assert config.audio.mic_device == ""
+    assert config.audio.output_device == "BlackHole"
+    assert config.audio.frame_ms == 30
+    assert config.stt.model == "small"
+    assert config.stt.device == "cpu"
+
+
+def test_config_overlay_rejects_missing_base_and_cycles(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.toml"
+    missing.write_text('extends = "nowhere.toml"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="does not exist"):
+        load_config(missing)
+
+    first = tmp_path / "first.toml"
+    second = tmp_path / "second.toml"
+    first.write_text('extends = "second.toml"\n', encoding="utf-8")
+    second.write_text('extends = "first.toml"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="extends cycle"):
+        load_config(first)

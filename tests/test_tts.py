@@ -17,6 +17,7 @@ from ambientqa.segmenter import UtteranceSegmenter, segment_worker
 from ambientqa.tts import (
     SpeakWindows,
     SpeechOutput,
+    _CoreAudioPlayer,
     _SpeakJob,
     speakable,
     voice_followup_intent,
@@ -386,6 +387,90 @@ class HungProc:
         if self.returncode is None:
             raise subprocess.TimeoutExpired("paplay", timeout)
         return self.returncode
+
+
+class _RawOutput:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.started = False
+        self.stopped = False
+        self.aborted = False
+        self.closed = False
+        self.written = b""
+
+    def start(self) -> None:
+        self.started = True
+
+    def write(self, data: bytes) -> bool:
+        self.written += data
+        return False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def abort(self) -> None:
+        self.aborted = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _OutputSoundDevice:
+    def __init__(self) -> None:
+        self.streams: list[_RawOutput] = []
+
+    def RawOutputStream(self, **kwargs) -> _RawOutput:
+        stream = _RawOutput(**kwargs)
+        self.streams.append(stream)
+        return stream
+
+
+def test_coreaudio_player_exposes_the_existing_process_contract() -> None:
+    sounddevice = _OutputSoundDevice()
+    player = _CoreAudioPlayer(24000, sounddevice)
+    raw = sounddevice.streams[0]
+    assert raw.started
+    assert raw.kwargs == {"samplerate": 24000, "channels": 1, "dtype": "int16"}
+    assert player.stdin is not None
+    player.stdin.write(b"\x00\x01" * 20)
+    player.stdin.close()
+    assert raw.written == b"\x00\x01" * 20
+    assert raw.stopped and raw.closed
+    assert player.poll() == 0
+    assert player.wait(timeout=0.1) == 0
+
+
+def test_coreaudio_player_abort_matches_subprocess_termination() -> None:
+    sounddevice = _OutputSoundDevice()
+    player = _CoreAudioPlayer(24000, sounddevice)
+    player.terminate()
+    assert sounddevice.streams[0].aborted
+    assert sounddevice.streams[0].closed
+    assert player.wait(timeout=0.1) == -15
+
+
+def test_speech_output_defaults_to_coreaudio_player_on_macos(
+    tmp_path, monkeypatch
+) -> None:
+    created: list[int] = []
+    sentinel = object()
+
+    def coreaudio_player(sample_rate: int):
+        created.append(sample_rate)
+        return sentinel
+
+    monkeypatch.setattr(tts_module.sys, "platform", "darwin")
+    monkeypatch.setattr(tts_module, "_CoreAudioPlayer", coreaudio_player)
+    speech = SpeechOutput(
+        TtsConfig(),
+        FakeEngine(),
+        SpeakWindows(tmp_path, scan_interval_s=0.0),
+        report=lambda _message: None,
+    )
+
+    assert speech._player_name == "CoreAudio"
+    assert speech._spawn_player(24000) is sentinel
+    assert created == [24000]
 
 
 def make_speech(

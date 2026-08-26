@@ -25,6 +25,7 @@ from ambientqa.backends.linux import (
     _parse_sample_spec,
     _run_command,
 )
+from ambientqa.backends.macos import CoreAudioBackend
 from ambientqa.backends.windows import WasapiBackend
 from ambientqa.config import AudioConfig
 
@@ -296,7 +297,13 @@ def test_get_backend_honors_explicit_choices() -> None:
 
 
 def test_get_backend_auto_selects_the_platform_native_stack() -> None:
-    expected = WasapiBackend if sys.platform == "win32" else PipewireBackend
+    expected = (
+        WasapiBackend
+        if sys.platform == "win32"
+        else CoreAudioBackend
+        if sys.platform == "darwin"
+        else PipewireBackend
+    )
     assert isinstance(get_backend(AudioConfig(backend="auto")), expected)
 
 

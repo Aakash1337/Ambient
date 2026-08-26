@@ -32,7 +32,7 @@ An always-on listener for **live conversations the user is a participant in** �
 and primarily technical job interviews. It hears both sides (user's mic + the other
 speaker via system-audio loopback), transcribes continuously, decides which utterances are
 questions actually worth answering, and displays answers in a read-only terminal pane.
-Windows and Linux are both first-class: one codebase, one pipeline, with everything
+Windows, Linux, and macOS are first-class: one codebase, one pipeline, with everything
 platform-specific behind the capture backend contract in §5.
 
 Three properties dominate every design decision:
@@ -103,7 +103,7 @@ Three worlds coexist; understanding their boundaries explains most of the code's
 
 **1. OS threads (capture only).** The backend's blocking `SourceStream.read()` lives in
 dedicated daemon threads — one per open device stream (one mic + potentially many
-loopback endpoints). On Windows that read blocks in PortAudio; on Linux it blocks on a
+loopback endpoints). On Windows/macOS that read blocks in PortAudio; on Linux it blocks on a
 `parec` child's stdout — the thread neither knows nor cares (§5). Threads never touch
 asyncio objects directly; they hand frames across via
 `DropOldestQueue.put_from_thread()`, which appends to a thread-side `deque` under a lock
@@ -169,7 +169,7 @@ to fix a whole crash class along the way.
 
 Three protocols, deliberately tiny:
 
-- **`CaptureDevice`** — a backend-stable id (stringified PyAudio index on Windows,
+- **`CaptureDevice`** — a backend-stable id (stringified PortAudio index on Windows/macOS,
   PipeWire source name on Linux; opaque above the backend), a human name, a
   `mic`/`loopback` kind, and the native format. What `read()` actually delivers is
   described by the opened stream, which may differ — parec resamples in-process.
@@ -180,17 +180,17 @@ Three protocols, deliberately tiny:
   is the native use-after-free class of crash this contract exists to prevent: PortAudio
   forbids `close()`/`terminate()` while another thread sits in `Pa_ReadStream`.
 - **`BackendSession`** — holds whatever per-run resource the platform needs (a PyAudio
-  instance on Windows; nothing on Linux) and produces mic/loopback candidate lists,
+  instance on Windows; lightweight factories on Linux/macOS) and produces mic/loopback candidate lists,
   best-first. A pinned mic substring that matches nothing raises — guessing a microphone
   records the wrong room. A pinned *loopback* that matches nothing warns and falls back
   to the default instead: raising means mic-only, which silently loses the other half of
   the conversation — exactly the half worth answering.
 
 `get_backend()` selects by `sys.platform` when `[audio] backend = "auto"` (the
-default); `"wasapi"` and `"pipewire"` can be forced for odd setups. Concrete backends
-are imported lazily so importing `ambientqa` never requires pyaudiowpatch off-Windows;
-`requirements.txt` gates it with `sys_platform == "win32"`, and Linux involves no
-PortAudio at all.
+default); `"wasapi"`, `"pipewire"`, and `"coreaudio"` can be forced for diagnostics.
+Concrete backends are imported lazily so importing `ambientqa` never requires a
+platform audio package on the wrong OS. `requirements.txt` gates pyaudiowpatch to
+Windows and sounddevice to macOS; Linux involves no PortAudio at all.
 
 ### Windows — WASAPI via pyaudiowpatch (backends/windows.py)
 
@@ -259,6 +259,21 @@ not conflict with other applications. Multiple full app processes are neverthele
 they duplicate capture, Whisper, and paid answer work. Startup therefore holds a shared
 process-lifetime OS lock (with heartbeats retained for status and legacy detection) and
 refuses a second pipeline by default; `--allow-multiple` is diagnostic.
+
+### macOS — CoreAudio via sounddevice (backends/macos.py)
+
+`sounddevice` enumerates only input-capable devices on the Core Audio host API and opens
+blocking native-rate float32 `RawInputStream`s. The default physical input is tried first;
+`abort()` is the cross-thread unblock used before `close()`. CTranslate2's macOS wheels are
+CPU-only, so a shared `stt.device = "cuda"` configuration is translated to CPU `int8` before
+model construction rather than failing once on every launch.
+
+CoreAudio does not expose physical speaker outputs as recordable inputs. System audio comes
+from a virtual input: BlackHole, Soundflower, Loopback Audio, Background Music, and VB-Audio
+names are recognized automatically, while an explicitly pinned output name can select any
+other CoreAudio input. With no virtual loopback the `sys` channel reports an actionable error
+and the established orchestrator path continues mic-only. BlackHole 2ch plus a Multi-Output
+Device is the documented setup, so the user can hear and capture the same call audio.
 
 ### The orchestrator (audio.py)
 
@@ -344,6 +359,12 @@ does five things:
   libraries (the Linux counterpart of the Windows DLL-path trap in §7), then execs
   `python -m ambientqa`.
 
+macOS uses `setup-macos.sh` and `run-macos.sh` with a separate `.venv-macos`. The
+launcher loads `config.macos.toml`, a small overlay that inherits shared tuning from
+`config.toml` while keeping Mac device choices and CPU STT separate. It omits Linux
+PipeWire/CUDA setup, starts Ollama when available, downloads Kokoro models for `--voice`,
+and plays synthesized PCM through a CoreAudio RawOutputStream.
+
 ## 6. segmenter.py
 
 **Silero VAD** via ONNX Runtime on **CPU** — it is tiny, and it must not contend with
@@ -364,13 +385,14 @@ Mechanics per channel:
 
 ## 7. stt.py
 
-**faster-whisper** (CTranslate2), model `large-v3-turbo`, CUDA fp16, single worker.
-One worker because there is one GPU; utterances are transcribed serially off a bounded
-queue and parallel STT would just thrash VRAM.
+**faster-whisper** (CTranslate2), model `large-v3-turbo`, one worker. Windows/Linux use
+CUDA fp16; macOS uses CPU int8 because CTranslate2 has native Mac wheels but no Metal/MPS
+device. Utterances are transcribed serially off a bounded queue; parallel STT would either
+thrash VRAM or contend for the same CPU cores.
 
 Windows CUDA-specific traps, both **[measured]** and both handled in
 `register_cuda_dll_dirs()` (a no-op off Windows — Linux gets the equivalent via
-`run.sh`'s `LD_LIBRARY_PATH`, §5):
+`run.sh`'s `LD_LIBRARY_PATH`, while macOS deliberately uses CPU, §5):
 
 - Pip-installed `nvidia-cublas-cu12`/`nvidia-cudnn-cu12` drop DLLs in
   `site-packages/nvidia/*/bin`, which Python ≥3.8 does **not** search. Worse, CTranslate2

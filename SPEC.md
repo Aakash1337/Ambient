@@ -7,9 +7,9 @@ continuously, decides which utterances are **actual questions worth answering**,
 answers as text in a **separate live pane**. It must never block, prompt, or interrupt the
 user's flow — it is a passive side-channel display only.
 
-Name: `ambientqa`. Python 3.11. **Windows 11 and Linux are both first-class targets**: one
+Name: `ambientqa`. Python 3.11. **Windows 11, Linux, and macOS are first-class targets**: one
 codebase, with every platform difference confined to `ambientqa/backends/` plus a launch
-wrapper (`run.sh` on Linux, `setup.ps1` + `.venv` on Windows).
+wrapper (`run.sh` on Linux, `setup.ps1` + `.venv` on Windows, and the macOS shell scripts).
 
 ---
 
@@ -27,7 +27,7 @@ These were benchmarked on the actual target machines. Build to them; do not rede
 | `gemma4:e2b` confidence field | Always returns `0.95` regardless of input — uncalibrated | Do **not** threshold on model-reported confidence. Tune strictness via the **prompt**, not a numeric cutoff. |
 | Ollama cold model load | ~67 s first load, ~0.7 s warm | Send a warmup request at startup and set `keep_alive: "30m"` on every call. The warmup must be **cancellable** (see gate). |
 | GPU | RTX 4080, 16 GB VRAM | faster-whisper `large-v3-turbo` fp16 (~1.5 GB) + gemma4:e2b (7.2 GB) fit together comfortably. |
-| Python on Windows | 3.11.9 via `py -3.11`. The `python` on PATH is a **hermes venv — do not install into it**. | Dedicated `.venv` on Windows, `.venv-linux` on Linux (they are different environments and must not be shared). |
+| Python on Windows | 3.11.9 via `py -3.11`. The `python` on PATH is a **hermes venv — do not install into it**. | Dedicated `.venv` on Windows, `.venv-linux` on Linux, and `.venv-macos` on macOS (never share them). |
 | `parec` with server-default buffering | ~2 s to the first byte, then **~1 s bursts** | Useless for live segmentation. `--latency-msec=<frame_ms>` is mandatory on every parec spawn; with it the first frame lands in ~50 ms, one frame per read. |
 | Raw USB mic at 100% PipeWire volume | Sits **~34 dB above hardware-neutral**; loud speech clipped **1.7% of samples** | Clipping and boosted room noise both garble Whisper. `run.sh` loads PipeWire `module-echo-cancel` (WebRTC noise suppression + AGC) exposing an `ec_mic` source; config pins `mic_device` to it. |
 | Audio devices | Several endpoints per machine, names differ per OS | Devices must be selectable by case-insensitive substring, never a hardcoded index. |
@@ -55,7 +55,7 @@ Queues: frames (256) → utterances (12) → transcripts (24) → answer jobs (1
 library**:
 
 - `CaptureDevice` — frozen dataclass: `id` (backend-stable opaque identifier: stringified
-  PyAudio index on Windows, PipeWire source name on Linux), `name` (the only thing ever
+  PortAudio index on Windows/macOS, PipeWire source name on Linux), `name` (the only thing ever
   shown or written to config), `kind` (`"mic" | "loopback"`), `channels`, native
   `sample_rate` (informational — what `read()` delivers is described by the opened stream).
 - `SourceStream` (Protocol) — `rate`, `channels`, blocking `read(frames) -> float32
@@ -73,9 +73,9 @@ library**:
   loopbacks; powers the pickers), `open_session()`.
 
 `__init__.py: get_backend(audio_config)` selects by `[audio] backend =
-"auto" | "wasapi" | "pipewire"`; `auto` picks `wasapi` on `sys.platform == "win32"`,
-`pipewire` otherwise. Concrete backends import lazily so importing `ambientqa` never
-requires pyaudiowpatch off-Windows or pactl on Windows.
+"auto" | "wasapi" | "pipewire" | "coreaudio"`; `auto` maps Windows to WASAPI,
+Darwin to CoreAudio, and the existing Linux/default path to PipeWire. Concrete backends
+import lazily so importing `ambientqa` never requires a platform audio dependency elsewhere.
 
 **`windows.py` — WASAPI via `pyaudiowpatch`.** Enumerate WASAPI host-API devices;
 `isLoopbackDevice` marks the loopback endpoints. Clamp advertised channel counts to 1–2
@@ -109,6 +109,13 @@ which is how the suite passes on Linux.
   A second copy of this app is different: it duplicates Whisper, gating, and paid answer
   calls, so startup must acquire a process-lifetime per-user OS lock and refuse it by
   default before loading models. An explicit unsafe override may exist for diagnostics.
+
+**`macos.py` — CoreAudio via `sounddevice`.** Enumerate input-capable Core Audio devices,
+classify established virtual loopback drivers (BlackHole, Soundflower, Loopback Audio,
+Background Music, VB-Audio), prefer the default physical microphone, and open blocking
+native-rate float32 `RawInputStream`s. `abort()` unblocks cross-thread reads before close.
+CoreAudio physical outputs are not recordable, so system audio requires a virtual input;
+missing loopback is an actionable warning and the pipeline continues microphone-only.
 
 ### 1. `audio.py` — capture orchestration (backend-neutral)
 
@@ -530,9 +537,11 @@ the sweep independently rejects speech genuinely addressed to another human.
 
 `config.toml` at project root, loaded at startup into typed dataclasses; unknown sections
 and keys are hard errors, as are invalid values (`validate_config`). Ship a fully-commented
-default. Structure and keys (defaults in parentheses):
+default. A platform overlay may set top-level `extends` to a relative base config; nested
+sections merge recursively before the same strict validation. Structure and keys (defaults
+in parentheses):
 
-- `[audio]` — `backend` ("auto" | "wasapi" | "pipewire"), `mic_device` (""),
+- `[audio]` — `backend` ("auto" | "wasapi" | "pipewire" | "coreaudio"), `mic_device` (""),
   `output_device` (""), `sample_rate` (16000, enforced), `frame_ms` (25, must be 20–30),
   `queue_size` (256), `silence_ms` (900), `pre_roll_ms` (300), `min_utterance_ms` (400),
   `max_utterance_s` (20.0), `silent_source_warn_s` (45.0)
@@ -581,7 +590,7 @@ Q&A/
   scripts/    list_devices.py pick_mic.py eval_gate.py render_session.py
   tests/      test_answer.py test_answer_channels.py test_answer_echo.py
               test_answer_style.py test_audio_devices.py test_audio_health.py
-              test_backends.py test_code_answers.py test_config.py
+              test_backends.py test_macos_backend.py test_code_answers.py test_config.py
               test_config_write.py test_context.py test_continuity.py
               test_gate_heuristics.py test_mode_picker.py
               test_pause_and_fragments.py test_profile.py
@@ -591,10 +600,9 @@ Q&A/
               test_voice_controller.py test_web_lookup.py
 ```
 
-- `requirements.txt`: `pyaudiowpatch; sys_platform == "win32"` (Windows-only — Linux
-  captures natively through PipeWire and must not install it), `soxr numpy silero-vad
-  onnxruntime faster-whisper textual tomli pytest`, plus `nvidia-cublas-cu12
-  nvidia-cudnn-cu12` for CUDA.
+- `requirements.txt`: `pyaudiowpatch` gated to Windows, `sounddevice` gated to macOS;
+  shared packages are `soxr`, `numpy`, `silero-vad`, `onnxruntime`, `faster-whisper`,
+  `textual`, `tomli`, and `pytest`; NVIDIA CUDA packages are excluded on macOS.
 - `setup.ps1` (Windows): creates `.venv` with **`py -3.11`** (not the PATH python — that is
   a hermes venv), installs requirements, warms the Ollama model, prints the device list.
 - `run.sh` (Linux): bootstraps `.venv-linux` gated on a `.deps-installed` **stamp written
@@ -609,6 +617,10 @@ Q&A/
   process-lifetime per-user lock before model load, retains heartbeats for status/legacy
   detection, and refuses a second full pipeline unless the diagnostic `--allow-multiple`
   escape hatch is explicitly supplied.
+- `setup-macos.sh` / `run-macos.sh`: create and maintain `.venv-macos`, load the
+  `config.macos.toml` overlay, omit NVIDIA packages, start Ollama when available, and launch
+  the CoreAudio path. Voice playback uses a sounddevice RawOutputStream; system audio uses a
+  separately installed virtual input.
 - `scripts/`: `list_devices.py` prints inputs/loopbacks per backend; `pick_mic.py`
   interactively meters and selects a device; `eval_gate.py` replays labelled cases against
   the gate (run it after touching heuristics or Stage B prompts); `render_session.py`
@@ -616,7 +628,7 @@ Q&A/
 - `README.md`: quickstart per platform, config reference, troubleshooting (no loopback
   device, CUDA fallback, Ollama not running, empty gate responses → `think:false`,
   missing `ec_mic`).
-- Run with `python -m ambientqa` (or `./run.sh` on Linux).
+- Run with `python -m ambientqa`, `./run.sh` on Linux, or `./run-macos.sh` on macOS.
 - **Opt-in web console** (`webui.py` + `webstatic/`, launched via `--web` /
   `run-web.sh`, rehearsed offline with `scripts/webui_demo.py`, tested by
   `tests/test_webui.py`): a browser rendering of the same pipeline behind the
@@ -649,9 +661,9 @@ Q&A/
 
 ## Acceptance
 
-- `pytest`: **514 passed, 1 skipped** (the skip is an environment guard in
-  `tests/test_stt.py` that needs pip-installed CUDA libraries). Heuristic gate tests cover
-  every Stage A rule above **and their ordering**.
+- `pytest` covers all three backend selectors; the CoreAudio suite uses injected
+  sounddevice fakes so enumeration, stream lifecycle, and stop-unblocks-read behavior are
+  verified from any host. Heuristic gate tests cover every Stage A rule above **and their ordering**.
 - App starts, shows `listening`, transcribes both channels on the current platform's
   backend, and leaves non-questions unanswered while answering real ones.
 - Long monologue containing one embedded question → exactly one answer card.
