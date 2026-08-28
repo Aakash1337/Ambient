@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -100,6 +101,122 @@ def test_updates_valid_quoted_key_without_inserting_duplicate(tmp_path: Path) ->
     set_audio_device(path, "mic_device", "New")
     assert path.read_text() == '[audio]\n"mic_device" = "New"\n'
     assert load_config(path).audio.mic_device == "New"
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        'mic_device = """Old\nMic"""',
+        "mic_device = '''Old\nMic'''",
+        'mic_device = ["Old", "Mic"]',
+    ],
+)
+def test_non_single_line_device_assignment_fails_without_corrupting_config(
+    tmp_path: Path,
+    assignment: str,
+) -> None:
+    path = tmp_path / "config.toml"
+    original = f"[audio]\n{assignment}\noutput_device = \"Speakers\"\n"
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Cannot safely rewrite"):
+        set_audio_device(path, "mic_device", "New")
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_mixed_simple_and_multiline_device_assignments_are_rejected_unchanged(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    original = '[audio]\nmic_device = "Old"\nmic_device = """Other\nMic"""\n'
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Duplicate audio.mic_device"):
+        set_audio_device(path, "mic_device", "New")
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_table_header_inside_unrelated_multiline_value_cannot_misdirect_update(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    original = (
+        '[audio]\noutput_device = """\n[gate]\n"""\nmic_device = "Old"\n'
+    )
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Cannot safely locate audio.mic_device"):
+        set_audio_device(path, "mic_device", "New")
+
+    assert path.read_text(encoding="utf-8") == original
+    assert load_config(path).audio.mic_device == "Old"
+
+
+def test_idempotent_target_cannot_hide_unrelated_multiline_value_corruption(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    original = (
+        '[audio]\noutput_device = """\n[gate]\n"""\nmic_device = "New"\n'
+    )
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Cannot safely locate audio.mic_device"):
+        set_audio_device(path, "mic_device", "New")
+
+    assert path.read_text(encoding="utf-8") == original
+    config = load_config(path)
+    assert config.audio.mic_device == "New"
+    assert config.audio.output_device == "[gate]\n"
+
+
+def test_device_and_profile_writes_share_one_config_transaction_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ambientqa.config_write as config_write
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[audio]\nmic_device = "Old"\n[context]\nprofile = "old.md"\n',
+        encoding="utf-8",
+    )
+    original_update = config_write._updated_text
+    device_inside = threading.Event()
+    release_device = threading.Event()
+    profile_inside = threading.Event()
+
+    def delayed_update(text: str, section: str, key: str, value: str) -> str:
+        if key == "mic_device":
+            device_inside.set()
+            assert release_device.wait(2)
+        elif key == "profile":
+            profile_inside.set()
+        return original_update(text, section, key, value)
+
+    monkeypatch.setattr(config_write, "_updated_text", delayed_update)
+    device = threading.Thread(
+        target=set_audio_device,
+        args=(path, "mic_device", "New"),
+    )
+    profile = threading.Thread(
+        target=set_context_profile,
+        args=(path, "new.md"),
+    )
+    device.start()
+    assert device_inside.wait(2)
+    profile.start()
+    assert not profile_inside.wait(0.1), "profile write bypassed device transaction"
+    release_device.set()
+    device.join(2)
+    profile.join(2)
+
+    assert not device.is_alive() and not profile.is_alive()
+    config = load_config(path)
+    assert config.audio.mic_device == "New"
+    assert config.context.profile == "new.md"
 
 
 def test_context_profile_round_trip_preserves_comments(tmp_path: Path) -> None:

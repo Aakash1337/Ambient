@@ -18,6 +18,11 @@ requests, uses recent conversation context, and presents concise answer cards. T
 agent search time and cognitive load while creating an interaction record for quality review,
 coaching, and future workflow automation.
 
+“Transcribes locally” is not “all transcript data stays local”: primary answers send Claude the
+accepted turn plus recent transcript/history/profile/grounding, and the default missed-question
+sweep sends rejected candidates with wider context. Local logs are plaintext. Use only with every
+participant's informed consent for capture, logging, and external text processing.
+
 ## Connecting This to Raj's Call Center Problem
 
 The connection to Raj's call-center problem is focused rather than complete: the demo shows

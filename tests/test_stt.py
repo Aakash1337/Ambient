@@ -38,6 +38,7 @@ def test_keeps_question_punctuation_and_disables_previous_text() -> None:
     assert result.text == "How does this work?"
     assert result.started_at == 0.0
     assert transcriber.model.kwargs["condition_on_previous_text"] is False
+    assert transcriber.model.kwargs["vad_filter"] is True
 
 
 # --- regression: the hallucination blocklist is exact-match only ---
@@ -172,7 +173,9 @@ def test_active_profile_passes_hotwords_and_short_topic_prompt() -> None:
         ["Bedrock", "PrivateLink", "FastAPI"],
         "",
     )
-    transcriber = WhisperTranscriber(STTConfig(), profile=profile)
+    transcriber = WhisperTranscriber(
+        STTConfig(profile_hints=True), profile=profile
+    )
     transcriber.model = FakeWhisper("How does Bedrock security work?")
     result = transcriber._transcribe_sync(utterance())
     assert result is not None
@@ -190,9 +193,22 @@ def test_no_profile_omits_hotwords_and_initial_prompt() -> None:
     assert "initial_prompt" not in transcriber.model.kwargs
 
 
+def test_profile_hints_are_safe_opt_in() -> None:
+    profile = Profile("AWS", "Amazon Bedrock", "", ["IAM", "Bedrock"], "")
+    transcriber = WhisperTranscriber(STTConfig(), profile=profile)
+    transcriber.model = FakeWhisper("I am reviewing an agentic AI pattern.")
+
+    transcriber._transcribe_sync(utterance())
+
+    assert "hotwords" not in transcriber.model.kwargs
+    assert "initial_prompt" not in transcriber.model.kwargs
+
+
 def test_silent_transcription_stays_empty_with_profile_active() -> None:
     profile = Profile("AWS", "Amazon Bedrock", "", ["Bedrock"], "")
-    transcriber = WhisperTranscriber(STTConfig(), profile=profile)
+    transcriber = WhisperTranscriber(
+        STTConfig(profile_hints=True), profile=profile
+    )
     transcriber.model = FakeWhisper("")
     assert transcriber._transcribe_sync(utterance()) is None
     assert transcriber.model.kwargs["hotwords"] == "Bedrock"
@@ -324,6 +340,7 @@ def test_warmup_loads_the_model_once_and_swallows_failure() -> None:
     transcriber._load_model = fake_load  # type: ignore[method-assign]
     asyncio.run(transcriber.warmup())
     assert transcriber.model is not None and calls == [1]
+    assert transcriber.model.kwargs["vad_filter"] is False
     asyncio.run(transcriber.warmup())
     assert calls == [1]  # already loaded: no second load
 

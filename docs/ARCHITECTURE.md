@@ -2,8 +2,11 @@
 
 This document explains how the system works internally, module by module, and — more
 importantly — *why* it is shaped the way it is. Nearly every non-obvious decision here was
-forced by something measured on real hardware or paid for with a real failed session. Those
-measurements are called out inline as **[measured]**; treat them as the load-bearing walls.
+forced by something measured on the original development hardware or paid for with a real failed
+session. Those measurements are called out inline as **[measured]**; treat them as load-bearing
+for the environment named, not as cross-platform benchmarks. In particular, this repository has
+no recorded live Apple-Silicon acceptance run; Intel is blocked by the release setup, not an
+unvalidated secondary target.
 If you rebuild this from scratch (see `REBUILD-GUIDE.md`), the code is the easy part — the
 measurements are what you'd otherwise have to rediscover the hard way.
 
@@ -32,18 +35,21 @@ An always-on listener for **live conversations the user is a participant in** �
 and primarily technical job interviews. It hears both sides (user's mic + the other
 speaker via system-audio loopback), transcribes continuously, decides which utterances are
 questions actually worth answering, and displays answers in a read-only terminal pane.
-Windows, Linux, and macOS are first-class: one codebase, one pipeline, with everything
-platform-specific behind the capture backend contract in §5.
+Windows, Linux, and macOS 14+ on Apple Silicon share one codebase and pipeline, with capture
+differences behind the backend contract in §5. The macOS implementation is a release candidate
+until §5's CoreAudio path and the end-to-end flow pass on real Apple-Silicon hardware. Intel and
+Rosetta Python are rejected because the required PyTorch stack has no current security-supported
+x86_64 wheel.
 
 Three properties dominate every design decision:
 
 1. **It must never block or interrupt.** It is a side channel. No prompts, no focus
    stealing, no modal anything. Every stage degrades gracefully; audio capture can never
    stall on a slow consumer.
-2. **Latency is correctness.** The user is mid-conversation. An answer that arrives 10
-   seconds after the question is worthless even if perfect. This is why the gate is local
-   (Ollama, ~0.5–1 s) and the expensive model (Claude) is reserved for confirmed
-   questions only.
+2. **Latency determines usefulness.** The user is mid-conversation, and an answer that arrives
+   after the discussion has moved on may be unusable. The local gate avoids adding Claude to every
+   utterance, but the external answer path has exceeded 10 seconds in real sessions; asynchronous
+   delivery limits queueing, it does not guarantee conversational latency.
 3. **One-glance readability.** The user reads answers in peripheral vision while already
    speaking. This produced the `cue` answer style (a sayable opening line + keyword
    bullets) after prose answers measured 60–90 words proved unreadable in the moment.
@@ -58,7 +64,7 @@ questions they ask aloud must still be answered. See §10 (channel policy).
  mic ──────┐
            ├─► capture ─► segmenter ─► STT ─► [consumer loop] ─► gate ─► answerer ─► UI
  loopback ─┘   (threads)  (Silero VAD) (Whisper)   │              (Ollama)  (claude -p │ pane
-  (× N endpoints,          CPU/ONNX     CUDA        │  ordered:    detached   pool)    │ +
+  (× N endpoints,          CPU/ONNX   CUDA or CPU   │  ordered:    detached   pool)    │ +
    arbiter picks one)                               │  context,    tasks               │ JSONL
                                                     │  echo, merge                     │ log
 ```
@@ -85,8 +91,8 @@ Data types flowing through (all in `bus.py`):
 | `GateResult` | gate | transcript, accepted?, reason, rewritten query, latency |
 | `AnswerResult` | answerer | question id, answer text, status, latency, searched? |
 
-Latency budget for a question from the *other* speaker, end of speech → answer text
-starts appearing (all **[measured]**):
+Latency observations for a question from the *other* speaker, end of speech → answer text starts
+appearing (measured on the original CUDA/RTX development host, **not on macOS**):
 
 | Stage | Cost |
 |---|---|
@@ -96,6 +102,10 @@ starts appearing (all **[measured]**):
 | gate stage B (gemma4:e2b, warm) | ~530–950 ms |
 | `claude -p` one-shot | 3.5–9 s (6–9 s floor is CLI+network overhead) |
 | with `web_lookup` triggered | 15–17 s |
+
+These figures are diagnostic observations, not a delivery guarantee. A later audited live session
+showed first-pass answers spanning 3.8–21.8 s end to end, with 6 of 12 over 10 s. Apple-Silicon
+macOS CPU STT still needs its own measured table.
 
 ## 3. Concurrency model
 
@@ -189,8 +199,9 @@ Three protocols, deliberately tiny:
 `get_backend()` selects by `sys.platform` when `[audio] backend = "auto"` (the
 default); `"wasapi"`, `"pipewire"`, and `"coreaudio"` can be forced for diagnostics.
 Concrete backends are imported lazily so importing `ambientqa` never requires a
-platform audio package on the wrong OS. `requirements.txt` gates pyaudiowpatch to
-Windows and sounddevice to macOS; Linux involves no PortAudio at all.
+platform audio package on the wrong OS. `requirements.txt` declares pyaudiowpatch for Windows and
+sounddevice for macOS; the Mac release resolves its full environment through the hash-locked arm64
+requirements. Linux involves no PortAudio at all.
 
 ### Windows — WASAPI via pyaudiowpatch (backends/windows.py)
 
@@ -262,6 +273,12 @@ refuses a second pipeline by default; `--allow-multiple` is diagnostic.
 
 ### macOS — CoreAudio via sounddevice (backends/macos.py)
 
+The supported dependency floor is macOS 14+ because the required Ollama build supports Sonoma or
+newer. The release supports native Apple Silicon only and has not yet demonstrated that path with
+a recorded live-hardware acceptance run. The CoreAudio module may enumerate on Intel, but the
+release launcher deliberately stops first because its PyTorch dependency is not security-supportable
+there.
+
 `sounddevice` enumerates only input-capable devices on the Core Audio host API and opens
 blocking native-rate float32 `RawInputStream`s. The default physical input is tried first;
 `abort()` is the cross-thread unblock used before `close()`. CTranslate2's macOS wheels are
@@ -274,6 +291,9 @@ names are recognized automatically, while an explicitly pinned output name can s
 other CoreAudio input. With no virtual loopback the `sys` channel reports an actionable error
 and the established orchestrator path continues mic-only. BlackHole 2ch plus a Multi-Output
 Device is the documented setup, so the user can hear and capture the same call audio.
+Automated tests inject a fake sounddevice module to verify enumeration, lifecycle, and
+stop-unblocks-read behavior. They do not validate real CoreAudio permissions, BlackHole routing,
+device recovery, sample-rate conversion, or end-to-end latency.
 
 ### The orchestrator (audio.py)
 
@@ -359,11 +379,16 @@ does five things:
   libraries (the Linux counterpart of the Windows DLL-path trap in §7), then execs
   `python -m ambientqa`.
 
-macOS uses `setup-macos.sh` and `run-macos.sh` with a separate `.venv-macos`. The
-launcher loads `config.macos.toml`, a small overlay that inherits shared tuning from
-`config.toml` while keeping Mac device choices and CPU STT separate. It omits Linux
-PipeWire/CUDA setup, starts Ollama when available, downloads Kokoro models for `--voice`,
-and plays synthesized PCM through a CoreAudio RawOutputStream.
+macOS uses `setup-macos.sh` and `run-macos.sh` with a separate `.venv-macos`. Setup rejects
+Intel/Rosetta, installs only hash-locked binary arm64 wheels, and installs plus WAV-probes
+`espeak-ng` before writing its dependency stamp. The launcher loads `config.macos.toml`, which
+keeps Mac devices/CPU STT separate and starts with no active profile while inheriting shared
+knowledge and answer settings. It omits Linux PipeWire/CUDA setup, starts an already-installed
+Ollama CLI as a managed per-run child on a random loopback port, proves the spawned PID owns that
+listener before use, downloads checksum-verified Kokoro models for `--voice`, and plays
+synthesized PCM through a CoreAudio RawOutputStream. Neither script installs/authenticates Claude,
+installs Ollama, or pulls the configured gate model. If Kokoro fails, the already-probed
+`espeak-ng` fallback remains; later playback failures do not remove visual answers.
 
 ## 6. segmenter.py
 
@@ -417,8 +442,10 @@ Hygiene, all of which exists because Whisper hallucinates on silence and ambient
   Whisper invents ("Thank you very much", "Subtitles by the Amara.org community", …).
 - Whisper's punctuation is preserved **exactly** — the trailing `?` is the single
   strongest gate signal (it encodes rising intonation, which survives disfluency).
-- Profiles (see §15) inject `hotwords` (vocabulary spelling bias) and a ≤120-char
-  `initial_prompt` (domain context, kept short to avoid prompt-echo hallucinations).
+- When the deliberately opt-in `stt.profile_hints` is true, profiles (see §15) inject `hotwords`
+  (vocabulary spelling bias) and a ≤120-char `initial_prompt` (domain context, kept short to avoid
+  prompt-echo hallucinations). The default is false because a mismatched profile can bias unrelated
+  speech.
 
 ## 8. continuity.py
 
@@ -551,7 +578,7 @@ Ordered; first match wins:
    the vocative reject (which keys on the first token — "Okay, can you explain the CAP
    theorem?" would otherwise be rejected without the question ever being read) and
    before the content-word check ("How are you?" is almost all stopwords).
-6. **Accept** `imperative_request` — command-form asks. "Talk about evaluation
+6. **Recognize** `imperative_request` — command-form asks. "Talk about evaluation
    metrics." carries no `?` and no interrogative, so on an `explicit` channel it was
    structurally unanswerable — yet interviews *open* with imperatives ("Tell me about
    yourself."), and a deliberate re-articulation ("Evaluation metrics. Talk about
@@ -559,8 +586,9 @@ Ordered; first match wins:
    `REQUEST_VERBS` entry (explain/describe/talk/tell/walk/give/…, after stripping
    prefixes and "please") is a direct ask; a request bigram ("talk about", "tell me",
    "walk me") anywhere in the text is the fallback for punctuation-less transcriptions
-   where Whisper dropped the sentence boundary. Because this accept skips the semantic
-   gate entirely, it is fenced by four guards: everyday idioms sharing the shape but
+   where Whisper dropped the sentence boundary. On an `explicit` channel this recognition is a
+   zero-call accept; on a `full` channel it becomes a semantic candidate as described below.
+   The structural recognition is fenced by four guards: everyday idioms sharing the shape but
    requesting nothing ("tell me about it", "give me a second") are exempted by exact
    match; plan markers (I/we/'ll/gonna/later…) disqualify the bigram path — "we'll talk
    about that later" asks nothing; a vocative wins — "Sarah, tell me…" is aimed at
@@ -580,7 +608,7 @@ Ordered; first match wins:
    "uh, um, so, the thing is" reaches the LLM, which invents a question from
    surrounding context. This rule is the single most important false-positive guard.
 
-Everything surviving goes to Stage B — with two `evaluate()`-level wrinkles first:
+Everything surviving goes to Stage B — with three `evaluate()`-level wrinkles first:
 
 - **Vocative demotion.** On a `full`-policy channel, a `human_vocative` reject is
   *demoted* to the semantic gate rather than upheld: a vocative there is usually the
@@ -590,6 +618,12 @@ Everything surviving goes to Stage B — with two `evaluate()`-level wrinkles fi
   questions aimed at another human, so it is the right judge. On the mic channel the
   hard reject stands: the *user* hailing someone by name is definitionally talking to
   another human.
+- **Imperative demotion.** On a `full`-policy channel, an `imperative_request` recognition also
+  goes to the semantic gate. Request verbs occur in incoherent STT word salad, and the permissive
+  other-speaker channel must not turn that shape alone into a paid answer. The final reason is
+  `ollama_accept`, `ollama_reject`, or `ollama_unavailable`; gate unavailability fails closed. On
+  the operator's `explicit` channel, a clear command such as "Explain RAG" keeps the zero-call
+  `imperative_request` result. Explicit interrogatives remain zero-call under either policy.
 - **`answer_echo`** — the user reading a recent *answer* aloud (rehearsing it) must not
   be re-gated as a question. Checked just before the LLM call (saving the ~700 ms):
   one-directional containment — fraction of the utterance's content words appearing in
@@ -621,8 +655,9 @@ swap one and re-run `scripts/eval_gate.py`.
   **cancellable**: run via `asyncio.to_thread`, `Task.cancel` cannot interrupt the
   running executor future, and `asyncio.run` joins the default executor on exit — so
   quitting during a cold Ollama load kept the process alive for up to the full 90 s
-  after the UI was gone. The warmup therefore runs on a daemon thread that signals back
-  into the loop: the await is cancellable, and a daemon cannot block interpreter exit.
+  after the UI was gone. Every gate call therefore runs on a bounded daemon thread that signals
+  back into the loop and has an independent asyncio wall-clock deadline: cancellation or a
+  drip-fed response cannot block interpreter exit, and detached workers cannot grow without bound.
 - Model-reported confidence is **ignored** — **[measured]** it returns 0.95 for
   everything. Strictness is tuned by swapping the TRUE/FALSE definitions in the prompt
   (`strict`/`balanced`/`eager`), never by numeric threshold.
@@ -634,16 +669,26 @@ supply a topic the current utterance lacks; (2) the decisive test is that the sp
 narrating is not asking. The rewrite (`query`) inlines referents from context ("what
 about the second one?" → self-contained question) and is what gets sent to Claude.
 
-On any Ollama failure: fall back to heuristics-only, warn in the status bar, keep
-running.
+On any Ollama failure: warn in the status bar and keep running. Final zero-call heuristic accepts
+still work; every route that requires semantic judgment rejects safely. In particular, a
+full-policy command-form candidate finishes as `ollama_unavailable`, while an explicit
+interrogative or explicit-policy command still passes without Ollama.
+
+The gate URL is restricted to literal HTTP loopback `/api/chat`, and its client explicitly ignores
+proxy environment variables and reads at most 1 MiB. On macOS, `run-macos.sh` never trusts the
+conventional shared port: it starts a child on an ephemeral port, checks with `lsof` that the exact
+PID owns the listener before startup and before each request, and stops Ambient if the child exits.
+The unique mode-`0600` server log and child are removed/reaped with the launcher.
 
 ## 11. answer.py
 
-One fresh `claude -p <prompt>` subprocess per confirmed question. **Never** a persistent
+One fresh `claude -p` subprocess per confirmed question, with conversation text on stdin and the
+system/profile prompt in a private, promptly deleted mode-`0600` file. **Never** a persistent
 `--input-format stream-json` session — **[measured]** messages sent while a turn is in
 flight get merged into a single turn (3 sends produced 2 results, one containing two
-answers). The 6–9 s one-shot overhead is acceptable because answering is async; the
-merge bug is not acceptable ever. Isolation flags (`--allowed-tools ""`,
+answers). A controlled one-shot benchmark measured 6–9 s, but live answer latency varies and has
+run substantially longer; async answering prevents serialization without promising a deadline.
+The merge bug is not acceptable ever. Isolation flags (`--allowed-tools ""`,
 `--strict-mcp-config --mcp-config {"mcpServers":{}}`) keep the CLI from loading the
 user's tools/MCP servers — cost and latency.
 
@@ -704,6 +749,18 @@ for this, search FIRST, do not answer from memory". (2) A lookup costs 15–17 s
 (renamed/rebranded/"called now"/latest/current version/pricing…) that fires on **3 of
 569** recorded questions (0.5%). A bare "now" is discourse filler and must not trigger.
 The `searched` flag is threaded into the JSONL to explain latency outliers.
+The tool-enabled process receives only that current question and a profile-free system prompt.
+Recent transcript, Q&A/dialogue history, standing profile, grounding, repository files, and local
+logs are absent, so speech that triggers a lookup cannot instruct the model to copy unrelated
+conversation data into a search query. Context-dependent current-fact questions may fail closed.
+
+Every Claude subprocess uses a private empty cwd, no session persistence, safe/restricted mode,
+no user/project/local settings, an empty strict MCP config, `dontAsk`, and an exact `--tools` set.
+Non-lookup answers, audits, and sweeps expose no tools; the isolated lookup exposes WebSearch only.
+Conversation data is written to stdin rather than argv. System/profile text lives only in a
+mode-`0600` file inside that private cwd and is unlinked after the call; fallback `espeak-ng` text
+also travels over stdin. All error paths kill and reap a still-running child, including one that
+stops reading stdin, and stream-json lines are bounded at 4 MiB.
 
 **Answer styles** (`cue` default): the prompt formats are in the code with worked
 examples, because **[measured]** examples anchor length far better than word counts —
@@ -716,6 +773,30 @@ The runtime `agent` style is orthogonal to the knowledge profile: it produces on
 three short, direct spoken sentences, uses active dialogue history, and applies the
 courtesy guard before final text is displayed or spoken. Raw Agent streaming deltas
 are withheld because they have not passed that guard.
+
+### External data boundary
+
+“Local transcription” describes where audio becomes text; it does not mean all transcript-derived
+data remains on the machine:
+
+- Capture frames, VAD, Whisper, and the primary Ollama gate are local. Raw audio is not placed in
+  the Claude prompt.
+- A primary answer/Agent call sends Claude the accepted or rewritten turn, recent transcript
+  context, recent Q&A/dialogue history, active profile topic/background, and retrieved grounding
+  excerpts. Profile and knowledge data can therefore leave the machine too.
+- The default-on missed-question sweep (§12) sends rejected candidate text, wider transcript
+  context, and answered/in-flight questions to Claude. The optional verifier sends the raw
+  transcribed utterance, delivered answer, wider context/history, profile data, and grounding.
+- When WebSearch is granted, only the current question enters that tool-enabled process; search
+  queries and results still add another external boundary. The Claude account/organization's
+  provider terms govern remote retention and training treatment.
+- JSONL logs remain local plaintext; loopback web binding does not encrypt them or change the
+  Claude paths above.
+
+Operators must obtain informed consent from every participant for capture, transcription, local
+logging, and external text processing before a session, provide required notices, and comply with
+applicable law, contract, employer policy, and meeting-platform rules. Ambient must not be used or
+marketed as covert or fully local transcription.
 
 ## 12. The second pass — audit and sweep
 
@@ -770,7 +851,12 @@ re-judges the recent **judgment-stage** rejections —
 `not_a_direct_question` / `ollama_reject` / `ollama_unavailable` / `human_vocative`, the
 reasons meaning "this reached judgment and got voted down". Mechanical rejections
 (filler, dedupe, echo, tags, pause) are not misses and never enter the buffer (a deque of 24, cleared after a
-successful sweep; nothing runs while paused). The vocative case is included because
+successful sweep; nothing runs while paused). The captured transcript timestamp anchors a hard
+`sweep_max_age_s` deadline (60 s by default): pruning happens before classification, recovery is
+rechecked afterward, and queue wait/generation are bounded so no late result mutates the card,
+history, or speech. The 25 s interval is scheduling cadence, not a recovery promise; sweep failures
+and misses remain possible. The
+vocative case is included because
 Whisper's sentence-initial capitalization made "Again, describe RAG pipelines" look like
 a request addressed to a person named Again; the sweep independently rejects genuine
 human-directed speech.
@@ -837,6 +923,10 @@ the only seam in the main path is an optional `app_factory` argument on
 
 Design points that mirror hard-won pipeline rules:
 
+- **Loopback is not authentication.** Each server gets an independent access capability. Ambient
+  prints/opens `/?access=...`; bare `/`, state/session APIs, SSE, and commands reject requests
+  without it. Authorized HTML injects the token for API headers and the EventSource query, while
+  health/static routes remain public and request logs strip query strings. Keep the URL private.
 - **The gate-decision panel taps the session logger**, not a new reporting path: the
   logger's `append` is wrapped so every rejection (with its reason) that reaches the
   JSONL also reaches the browser. One record, two sinks, no drift.
@@ -854,7 +944,8 @@ Design points that mirror hard-won pipeline rules:
 - **Streaming deltas carry a running length** so a page that connects mid-answer
   detects the gap and resyncs from the snapshot instead of showing spliced text.
 - The server binds loopback only; the session-log endpoint whitelists
-  `session-*.jsonl` names rather than joining paths.
+  `session-*.jsonl` names rather than joining paths. This confines the browser surface, not the
+  Claude answer/sweep/verify traffic described in §11.
 
 `scripts/webui_demo.py` drives the real console against a scripted stub controller —
 no audio, models, or Claude — for rehearsal and offline demo fallback.
@@ -936,17 +1027,21 @@ ways. All three were paid for:
 
 ## 15. Config, profiles, logging
 
-**config.py** — typed dataclasses per section (`[audio] [stt] [context] [gate] [merge]
-[answer] [ui]`), loaded from `config.toml`, unknown keys and invalid values rejected at
+**config.py** — typed dataclasses per section (`[audio] [stt] [context] [knowledge] [gate]
+[merge] [answer] [tts] [ui]`), loaded from `config.toml`, unknown keys and invalid values rejected at
 startup with named errors. Every tunable mentioned in this document lives here,
 including the backend selector (`audio.backend`), the dedupe cooldown
 (`gate.reask_cooldown_s`) and the second-pass switches (`answer.verify`,
-`answer.sweep`, `answer.sweep_model`, `answer.verify_context_turns`,
-`answer.history_turns`).
+`answer.sweep`, `answer.sweep_model`, `answer.sweep_max_age_s`,
+`answer.verify_context_turns`, `answer.history_turns`). Residual STT filtering and profile bias
+are explicit (`stt.vad_filter = true`, `stt.profile_hints = false`). Knowledge cache and grounding
+require an authored phrasing with the same normalized subject and compatible question intent;
+`knowledge.grounding_threshold` is a secondary floor after those fail-closed checks.
 
 **profile.py / profiles/*.md** — optional standing context (Topic / Background /
-Vocabulary sections). Vocabulary → Whisper hotwords; Topic → gate referent
-disambiguation (with explicit prompt language forbidding its use as a relevance filter
+Vocabulary sections). With `stt.profile_hints = true`, Vocabulary → Whisper hotwords and a short
+Topic hint → Whisper's initial prompt; the default false sends neither to STT. Topic still supports
+gate referent disambiguation (with explicit prompt language forbidding its use as a relevance filter
 or topic-injector); Topic+Background → answer pitch, explicitly subordinate to the
 recent transcript (§11). Profiles are data, never instructions — the prompts say so
 explicitly, which is the injection defence. Profiles may also supply an Agent greeting
@@ -959,19 +1054,23 @@ record, lock-guarded): channel, text, gate decision + reason, query, answer, sta
 `web_lookup`, per-stage latencies. Crash-safe by construction; the file is the ground
 truth every analysis and replay in this project's history was mined from. The
 second pass added to the vocabulary: `gate_reason` now also carries
-`imperative_request`, `reask_of_recent`, `second_pass_recovery` and `verify_revision`
+`imperative_request` (the `explicit`-policy zero-call path; full-policy commands finish with an
+`ollama_*` reason), `reask_of_recent`, `second_pass_recovery` and `verify_revision`
 (the last with `answer_status: "revised"`, as a second record for the same utterance
 id). Render any session into a styled HTML replay with `scripts/render_session.py`, or
 browse it in-app with `l`. Runtime diagnostics go separately to `logs/ambientqa.log`
-(§14).
+(§14). Session logs are plaintext sensitive data; git-ignore is neither encryption nor a
+retention/access-control policy.
 
 ## 16. The empirical foundation
 
-Everything above, compressed into the table you would otherwise rediscover by pain:
+Everything above, compressed into the table you would otherwise rediscover by pain. Values are
+from the original named development environment/session unless stated otherwise; none is a Mac
+benchmark:
 
 | # | Fact | Measured value | Consequence |
 |---|---|---|---|
-| 1 | `claude -p` one-shot latency | 6–9 s regardless of flags/model | never in the gate path; async answering only |
+| 1 | `claude -p` controlled one-shot latency | 6–9 s regardless of flags/model on the measured host; a later live session ranged 3.8–21.8 s end-to-end (6/12 over 10 s) | never in the gate path; async avoids queueing but is not a latency guarantee |
 | 2 | persistent claude stream-json session | merges concurrent messages into one turn | one-shot per question, always |
 | 3 | gemma4 without `"think": false` | returns empty content | mandatory on every Ollama call |
 | 4 | gemma4 self-reported confidence | always 0.95 | tune via prompt, never threshold |

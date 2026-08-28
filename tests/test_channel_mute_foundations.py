@@ -22,6 +22,7 @@ class _Stream:
 
     def __init__(self) -> None:
         self.stopped = threading.Event()
+        self.closed = False
 
     def read(self, frames: int) -> np.ndarray:
         if self.stopped.wait(0.001):
@@ -32,13 +33,15 @@ class _Stream:
         self.stopped.set()
 
     def close(self) -> None:
-        pass
+        self.closed = True
 
 
 class _Session:
     def __init__(self) -> None:
         self.mic = CaptureDevice("mic-1", "Test microphone", "mic", 1, 16000)
         self.sys = CaptureDevice("sys-1", "Test loopback", "loopback", 1, 16000)
+        self.streams: list[_Stream] = []
+        self.closed = False
 
     def mic_candidates(self, _substring: str, _report: Callable[[str], None]):
         return [self.mic]
@@ -49,18 +52,25 @@ class _Session:
         return [self.sys]
 
     def open(self, _device: CaptureDevice) -> _Stream:
-        return _Stream()
+        stream = _Stream()
+        self.streams.append(stream)
+        return stream
 
     def close(self) -> None:
-        pass
+        self.closed = True
 
 
 class _Backend:
     name = "test"
     has_system_audio = True
 
+    def __init__(self) -> None:
+        self.sessions: list[_Session] = []
+
     def open_session(self) -> _Session:
-        return _Session()
+        session = _Session()
+        self.sessions.append(session)
+        return session
 
 
 class _BlockedFirstReadStream:
@@ -175,6 +185,42 @@ def test_channel_enable_rejects_unknown_names() -> None:
         capture.set_channel_enabled("radio", False)
     with pytest.raises(ValueError, match="Unknown audio channel"):
         capture.channel_enabled("radio")
+
+
+def test_capture_thread_start_failure_unwinds_every_open_stream(monkeypatch) -> None:
+    original_thread = threading.Thread
+    started_threads: list[threading.Thread] = []
+
+    class BrokenThread(original_thread):
+        starts = 0
+
+        def start(self) -> None:
+            type(self).starts += 1
+            if type(self).starts == 2:
+                raise RuntimeError("thread capacity exhausted")
+            super().start()
+            started_threads.append(self)
+
+    monkeypatch.setattr("ambientqa.audio.threading.Thread", BrokenThread)
+    backend = _Backend()
+    reports: list[str] = []
+    capture = AudioCapture(
+        AudioConfig(), status_callback=reports.append, backend=backend
+    )
+    loop = asyncio.new_event_loop()
+    try:
+        capture.start(loop, DropOldestQueue(8))
+    finally:
+        loop.close()
+
+    session = backend.sessions[0]
+    assert len(session.streams) == 2
+    assert all(stream.stopped.is_set() and stream.closed for stream in session.streams)
+    assert session.closed
+    assert started_threads and all(not thread.is_alive() for thread in started_threads)
+    assert capture._session is None
+    assert capture._streams == []
+    assert any("thread capacity exhausted" in report for report in reports)
 
 
 def test_read_spanning_fast_off_on_cycle_is_never_forwarded() -> None:

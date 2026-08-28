@@ -2,16 +2,76 @@
 
 from __future__ import annotations
 
+import contextlib
+import copy
+import errno
 import os
 import re
 import stat
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Literal
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib
 
 AudioDeviceKey = Literal["mic_device", "output_device"]
 
 _TABLE_HEADER = re.compile(r"^[ \t]*\[[^\]\r\n]+\][ \t]*(?:#.*)?(?:\r?\n|\r)?$")
+
+_PATH_LOCKS: dict[str, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock(path: Path) -> threading.Lock:
+    key = os.path.normcase(str(path.resolve(strict=False)))
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(key, threading.Lock())
+
+
+@contextlib.contextmanager
+def _process_file_lock(path: Path):
+    """Serialize config replacement across app workers and helper processes."""
+    lock_path = path.with_name(f".{path.name}.ambientqa.lock")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        if os.name == "nt":  # pragma: no cover - exercised on Windows CI/users
+            import msvcrt
+
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+            while True:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def _basic_string(value: str) -> str:
@@ -58,6 +118,18 @@ def _assignment_pattern(key: str) -> re.Pattern[str]:
     )
 
 
+def _assignment_start_pattern(key: str) -> re.Pattern[str]:
+    """Recognize the key even when its TOML value spans multiple lines.
+
+    The updater intentionally rewrites only simple, single-line strings so it
+    can preserve formatting exactly.  Still, a valid multiline/array/inline
+    value for the same key must not be mistaken for a missing assignment: that
+    would insert a duplicate key and corrupt an otherwise valid config.
+    """
+    key_token = rf"(?:{re.escape(key)}|\"{re.escape(key)}\"|'{re.escape(key)}')"
+    return re.compile(rf"^[ \t]*{key_token}[ \t]*=")
+
+
 def _updated_text(text: str, section: str, key: str, value: str) -> str:
     lines = text.splitlines(keepends=True)
     section_start: int | None = None
@@ -74,13 +146,19 @@ def _updated_text(text: str, section: str, key: str, value: str) -> str:
                 break
 
         pattern = _assignment_pattern(key)
+        assignment_start = _assignment_start_pattern(key)
+        assignments = [
+            index
+            for index in range(section_start + 1, section_end)
+            if assignment_start.match(lines[index])
+        ]
+        if len(assignments) > 1:
+            raise ValueError(f"Duplicate {section}.{key} assignments")
         matches = [
             index
             for index in range(section_start + 1, section_end)
             if pattern.match(lines[index])
         ]
-        if len(matches) > 1:
-            raise ValueError(f"Duplicate {section}.{key} assignments")
         if matches:
             index = matches[0]
             match = pattern.match(lines[index])
@@ -93,6 +171,10 @@ def _updated_text(text: str, section: str, key: str, value: str) -> str:
                 + (match.group("newline") or "")
             )
             return "".join(lines)
+        if assignments:
+            raise ValueError(
+                f"Cannot safely rewrite non-single-line {section}.{key} assignment"
+            )
 
         newline = "\r\n" if "\r\n" in text else "\n"
         insertion = f"{key} = {_quoted_value(value)}{newline}"
@@ -110,13 +192,33 @@ def _updated_text(text: str, section: str, key: str, value: str) -> str:
     return text + prefix + f"[{section}]{newline}{key} = {_quoted_value(value)}{newline}"
 
 
-def _set_string(path: str | Path, section: str, key: str, value: str) -> None:
-    config_path = Path(path)
+def _set_string_unlocked(
+    config_path: Path,
+    section: str,
+    key: str,
+    value: str,
+) -> None:
     original = config_path.read_bytes() if config_path.exists() else b""
     has_bom = original.startswith(b"\xef\xbb\xbf")
     body = original[3:] if has_bom else original
     text = body.decode("utf-8")
     candidate = _updated_text(text, section, key, value)
+    try:
+        parsed_original = tomllib.loads(text)
+        parsed_candidate = tomllib.loads(candidate)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"Cannot safely update invalid TOML: {exc}") from exc
+    expected_candidate = copy.deepcopy(parsed_original)
+    expected_section = expected_candidate.setdefault(section, {})
+    if not isinstance(expected_section, dict):
+        raise ValueError(f"Cannot safely locate {section}.{key} assignment")
+    expected_section[key] = value
+    if parsed_candidate != expected_candidate:
+        # Text scanning is deliberately formatting-preserving, but table-like
+        # text can legally occur inside an unrelated multiline TOML string.
+        # Parse the finished candidate and prove the requested semantic change
+        # is its ONLY semantic change before creating or publishing a temp file.
+        raise ValueError(f"Cannot safely locate {section}.{key} assignment")
     encoded = (b"\xef\xbb\xbf" if has_bom else b"") + candidate.encode("utf-8")
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,6 +242,16 @@ def _set_string(path: str | Path, section: str, key: str, value: str) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _set_string(path: str | Path, section: str, key: str, value: str) -> None:
+    config_path = Path(path)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    # The controller has separate profile/device lifecycle locks because those
+    # operations own different runtime state. Persistence is one shared TOML
+    # document, so it needs its own path-wide transaction lock as well.
+    with _thread_lock(config_path), _process_file_lock(config_path):
+        _set_string_unlocked(config_path, section, key, value)
 
 
 def set_audio_device(

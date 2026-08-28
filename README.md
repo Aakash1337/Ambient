@@ -1,8 +1,8 @@
 # Ambient
 
-Ambient is a passive side pane for Windows, Linux, and macOS that listens to the microphone and
-system audio, transcribes speech locally, identifies real questions, and answers only those
-questions. It never prompts or interrupts you.
+Ambient is a passive side pane for Windows, Linux, and macOS 14+ on Apple Silicon that listens to
+the microphone and system audio, transcribes speech locally, identifies real questions, and
+answers only those questions. It never prompts or interrupts you.
 
 ## Documentation
 
@@ -18,12 +18,21 @@ Moving development to a new machine? Follow the porting checklist at the end of
 
 ## Quickstart
 
-All platforms need Ollama with the model named in `[gate] model` pulled (`gemma4:e2b` by
-default — the gate prompt was engineered against it; the earlier stand-in `qwen2.5:3b`
-measurably flips on real questions once transcript context is present), the Claude CLI signed
-in, and Python 3.11. Windows and Linux use an NVIDIA GPU for the preferred Whisper
-configuration; macOS runs faster-whisper on the CPU because CTranslate2 does not expose a
-Metal/MPS backend.
+All platforms need Python 3.11, Ollama, and an authenticated Claude CLI. Before launching
+Ambient, install Ollama, pull the model named in `[gate] model` (`gemma4:e2b` by default), and
+confirm both external prerequisites work:
+
+```bash
+ollama pull gemma4:e2b
+ollama run gemma4:e2b "reply ok"
+claude -p "say ok"
+```
+
+The gate prompt was engineered against `gemma4:e2b`; do not silently substitute another model.
+The setup scripts install Ambient's Python dependencies, but they do **not** install Ollama or
+Claude, pull the gate model, or authenticate Claude. Windows and Linux use an NVIDIA GPU for the
+preferred Whisper configuration; macOS runs faster-whisper on the CPU because CTranslate2 does
+not expose a Metal/MPS backend.
 
 **Windows** (Windows 11, Python 3.11 through the Python launcher):
 
@@ -51,7 +60,9 @@ microphone source, points CTranslate2 at the pip-installed CUDA libraries, and l
 pane. Because it bootstraps everything itself, it is also the right `Exec` target for a desktop
 app-menu entry (the pane is a TUI).
 
-**macOS** (Intel or Apple Silicon):
+**macOS 14 (Sonoma) or newer on Apple Silicon** (Intel and Rosetta Python are explicitly blocked;
+the OS floor comes from
+[Ollama's current macOS requirement](https://docs.ollama.com/macos)):
 
 ```bash
 brew install python@3.11
@@ -59,8 +70,20 @@ brew install python@3.11
 ./run-macos.sh
 ```
 
-`setup-macos.sh` creates an isolated `.venv-macos`; `run-macos.sh` refreshes it whenever
-`requirements.txt` changes, starts Ollama when available, and launches the CoreAudio backend.
+`setup-macos.sh` creates an isolated `.venv-macos` from the hash-locked
+`requirements-macos-arm64.txt`, downloads the ~1.6 GB faster-whisper snapshot pinned to an
+immutable Hugging Face commit and verifies every runtime file (including the weight SHA-256),
+installs and smoke-tests `espeak-ng`, and rejects macOS below 14, Intel, or a Rosetta/x86_64
+Python. Allow roughly 2 GB of free disk plus the Python environment and an uninterrupted HTTPS
+connection for first setup; later runs reuse and re-verify the local snapshot. `run-macos.sh`
+refreshes the environment when the lock digest or setup script changes, starts an
+Ambient-owned Ollama server on a random loopback port when the CLI is available, verifies that
+the spawned PID owns that listener before every transcript-bearing gate request, and launches the
+CoreAudio backend. It never trusts a service merely because it answered on Ollama's conventional
+shared port; if the private child is unavailable or exits, semantic gating fails closed. Neither
+script installs Ollama/Claude, pulls the gate model, or authenticates Claude, so run the
+prerequisite checks above first. The user-pulled Ollama tag remains a mutable external
+prerequisite; the Python and Whisper pins do not claim reproducibility for that separate model.
 The first live capture may make macOS ask for **Microphone** access for Terminal, iTerm, or the
 terminal application used to launch Ambient. Grant it under **System Settings → Privacy &
 Security → Microphone**, then relaunch.
@@ -80,11 +103,23 @@ needs a recordable system-audio input:
 Without a loopback input, Ambient stays usable in microphone-only mode and shows an actionable
 system-audio warning. Web and voice launches are `./run-macos.sh --web` and
 `./run-macos.sh --voice`. The launcher uses `config.macos.toml`, which inherits every shared
-setting from `config.toml` but starts with blank device selections and CPU transcription. Press
-`d` once to choose this Mac's devices; those choices remain in the macOS overlay and do not
-overwrite Windows/Linux selections.
+setting from `config.toml` but starts with blank device selections, CPU transcription, and no
+active profile. Press `d` once to choose this Mac's devices; those choices remain in the macOS
+overlay and do not overwrite Windows/Linux selections. It still inherits shared answer and
+knowledge settings; press `x` to select a profile deliberately when one is appropriate.
 
-On this KDE installation, opening **Ambient** from the app menu launches a pre-start splash
+**macOS validation status:** the CoreAudio backend has automated lifecycle/enumeration tests
+using injected `sounddevice` fakes, but this repository does not include a recorded live
+acceptance run on Apple Silicon hardware. Treat this build as a macOS release
+candidate until the real-hardware checklist in
+[docs/REBUILD-GUIDE.md](docs/REBUILD-GUIDE.md#porting-checklist-for-a-new-machine) passes on the
+machine being shipped. That checklist must include the first setup download and an offline
+relaunch using the verified local Whisper snapshot. Whisper is CPU-only; Ollama can use Apple
+Silicon's GPU. Intel is not a
+release target because the required PyTorch stack has no current security-supported x86_64 wheel.
+
+**Linux/KDE desktop launcher:** on the configured Linux installation, opening **Ambient** from the
+app menu launches a pre-start splash
 with four guarded choices: **Assist** (answers stay on screen), **Voice** (screen plus spoken
 answers), **Web Console** (then **Web Assist** or **Web Voice** in the browser), or **Emergency
 Fallback** (the pinned pre-voice build, behind a second confirmation). Web Assist is focused by
@@ -100,19 +135,66 @@ control over the raw microphone. The raw USB mic at full PipeWire volume sits ~3
 hardware-neutral level — loud speech clipped 1.7% of samples and garbled Whisper — so
 `config.toml` pins `audio.mic_device` to the processed source instead.
 
-The first Ollama warmup can take about 67 seconds. Once warm, question classification is
-normally well under a second.
+On the original development host, the first Ollama warmup took about 67 seconds and warm question
+classification was normally under a second. Those are observations, not Mac guarantees; record
+warmup/gate latency on the actual Apple-Silicon target.
 
-Use `python scripts/list_devices.py` to see input and system-audio endpoint names (WASAPI
-loopback on Windows, PipeWire monitor sources on Linux, CoreAudio inputs on macOS). Set `audio.mic_device` or
-`audio.output_device` to a unique, case-insensitive substring when the platform default is
-not the desired source.
+Use the interpreter belonging to the platform environment to see input and system-audio endpoint
+names (WASAPI loopback on Windows, PipeWire monitor sources on Linux, CoreAudio inputs on macOS):
+
+```bash
+# Linux
+.venv-linux/bin/python scripts/list_devices.py
+# macOS
+.venv-macos/bin/python scripts/list_devices.py
+```
+
+On activated Windows PowerShell, use `python scripts\list_devices.py`. Set
+`audio.mic_device` or `audio.output_device` to a unique, case-insensitive substring when the
+platform default is not the desired source.
 
 Run the test suite with:
 
-```powershell
-python -m pytest -q
+```bash
+# Linux
+.venv-linux/bin/python -m pytest -q
+# macOS
+.venv-macos/bin/python -m pytest -q
 ```
+
+On activated Windows PowerShell, use `python -m pytest -q`.
+
+## Data handling, privacy, and consent
+
+Ambient's audio path is local, but Ambient is **not an all-local transcript system**. The exact
+boundary is:
+
+| Path | Data handling |
+|---|---|
+| Capture, VAD, Whisper STT, and the primary Ollama gate | Run locally. Ambient does not send raw audio to Claude. On macOS the launcher uses a per-run Ollama child on a random loopback port, with PID/listener ownership checks; gate HTTP also bypasses proxy environment variables and accepts only a literal loopback URL. |
+| Primary answer or Agent reply | Sends the accepted or rewritten question/speaker turn to Claude, together with a bounded recent transcript window, recent Q&A/dialogue history, active profile topic/background, and any retrieved knowledge-pack excerpts used for grounding. |
+| Missed-question sweep | Enabled by default. Periodically sends rejected transcript candidates, a wider recent transcript window, and answered/in-flight question text to Claude. A rejection by the local gate therefore does not guarantee that its text stays local. |
+| Answer verification | Off by default. If enabled, sends a wider transcript window, the raw transcribed utterance, rewritten question, delivered answer, Q&A history, profile context, and grounding to Claude. |
+| Web lookup | When enabled and triggered, a separate tool-enabled one-shot receives **only the current question**—not transcript context, history, profile, grounding, repository files, or local logs. Its model-generated search queries and resulting traffic leave the machine. A context-dependent current-fact question may therefore fail rather than export unrelated conversation data. |
+| UI and logs | The web server binds to loopback and requires its printed unguessable access URL for transcript/session/API routes. JSONL session logs stay on the local filesystem, but logs are plaintext and contain transcript/answer data. Git-ignore is not encryption, access control, or a retention policy. |
+
+Claude-side storage, retention, and training treatment depend on the account, organization, and
+provider terms used by the installed CLI; verify those terms before processing sensitive calls.
+Every Ambient Claude invocation disables session persistence and project/user customizations,
+uses an empty private working directory, supplies an empty MCP configuration, runs in restricted
+non-interactive permission mode, and exposes an exact tool set (none except `WebSearch` for the
+isolated lookup above). Conversation prompts travel over standard input, while system/profile
+prompts use a mode-`0600` temporary file that is deleted after the child exits; their contents are
+not placed in process arguments. The `espeak-ng` fallback likewise receives spoken answer text on
+standard input. These controls reduce local process, tool, and configuration exposure; they do
+not change the remote provider boundary described in the table.
+The `1`/`2` input controls stop new muted-channel audio from entering transcript/context/log paths,
+but they do not retract data already logged or sent.
+
+Before enabling capture, obtain informed consent from **every participant** for audio capture,
+transcription, local logging, and the external text processing described above. Provide any
+required recording/AI notices and comply with applicable law, contracts, employer policy, and
+meeting-platform rules. Do not use Ambient for covert transcription.
 
 ## Voice mode
 
@@ -121,15 +203,18 @@ python -m pytest -q
 # macOS: ./run-macos.sh --voice
 ```
 
-The app-menu splash selects this flag for you; no terminal is required for normal use.
+On the configured Linux/KDE desktop, the app-menu splash selects this flag; the macOS path is the
+explicit `./run-macos.sh --voice` command above.
 
 Voice mode is a per-launch role, not a config switch. Start exactly one copy with `--voice`:
 that same pane shows the answer card and speaks it aloud. Do not run a silent copy beside it;
 each process would independently capture, transcribe, gate, and call Claude for the same
 question. The app refuses a second live pipeline by default. The first voice launch downloads
 the local Kokoro voice files (~340 MB into `models/`); synthesis runs on the CPU so Whisper and
-the gate keep the GPU. If Kokoro cannot load, the app falls back to `espeak-ng` (robotic but
-instant) and reports the fallback. Press `m` to mute or unmute speech. Press `r` to switch
+the gate keep the GPU. If Kokoro cannot load, the app selects the `espeak-ng` fallback and reports
+it. On macOS, setup installs `espeak-ng` through Homebrew when needed and refuses to finish unless
+a WAV synthesis probe succeeds, so the fallback is validated before launch. A later runtime
+playback failure still leaves visual answers available. Press `m` to mute or unmute speech. Press `r` to switch
 between **Normal** and **Conversational** delivery at runtime; the status bar shows the voice
 state and selected delivery together (for example `voice:on/conversational`). Playback runs
 through PipeWire's `paplay` on Linux and CoreAudio on macOS.
@@ -200,19 +285,26 @@ testing, but that mode duplicates GPU and Claude work and is unsafe for a demo.
 ## Web console (opt-in)
 
 ```bash
-./run-web.sh            # or: ./run.sh --web
-./run-web.sh --voice    # browser UI plus spoken answers
+# Linux only (run-web.sh delegates to run.sh)
+./run-web.sh
+./run-web.sh --voice
+
+# macOS
+./run-macos.sh --web
+./run-macos.sh --web --voice
 ```
 
-From the desktop shortcut, the launch splash (`--choose`) now offers **Web
+On the configured Linux/KDE desktop, the launch splash (`--choose`) offers **Web
 console** alongside Assist, Voice, and the emergency fallback (`w` or `3`
 selects it), then asks for **Web Assist** or **Web Voice**. Picked that way it
 also opens your default browser on the console URL, since the app-menu launch
 has no terminal to read it from. Assist remains the first, default-focused
 choice at both safety boundaries.
 
-The same pipeline normally renders at `http://127.0.0.1:8802`, styled after the
-design exploration in `docs/UI/` and with larger,
+The same pipeline normally listens on `127.0.0.1:8802`, but bare `/` is intentionally
+unauthorized. Ambient prints (or opens) a per-run capability URL such as
+`http://127.0.0.1:8802/?access=...`; use that exact URL and keep it private. It is styled after
+the design exploration in `docs/UI/` and has larger,
 more readable type than the terminal pane. It shows the live transcript with both
 channels labelled, the question queue, streaming cue cards with REVISED / LATE /
 FORCED / WEB LOOKUP badges, a gate-decisions panel listing every rejection *and its
@@ -230,12 +322,13 @@ permission to close an externally opened tab; when that security rule applies, t
 disconnected console is replaced by an unmistakable **Ambient has stopped** page
 instead of looking live or silently doing nothing.
 
-The app-menu launch verifies the Ambient health endpoint before opening the
-browser. If another local service owns 8802, it selects the next free loopback port
-and opens that actual URL; the terminal also prints it. An explicit `--web-port N`
+The app-menu launch verifies the public, identity-specific Ambient health endpoint before opening
+the authorized URL. If another local service owns 8802, it selects the next free loopback port
+and opens that actual capability URL; the terminal also prints it. An explicit `--web-port N`
 remains pinned and fails with a concise message when occupied. Do not assume a
 different service on a familiar port is this console—the health identity prevents
-that mix-up.
+that mix-up. Health and static assets are intentionally public so startup works; index, state,
+session replay, events, and commands reject requests without the separate access capability.
 
 The console is deliberately **not** the default surface:
 
@@ -243,23 +336,29 @@ The console is deliberately **not** the default surface:
   `--web` is the only way to get the console, and the flag does nothing else.
 - It is stdlib-only — nothing was added to `requirements.txt`, so run.sh's install
   stamp, the Windows setup, and the emergency fallback are all untouched.
-- The pinned emergency build (`./run-emergency.sh`) predates the web console
-  entirely; if the console misbehaves mid-demo, quit it and launch either the
-  normal pane or the fallback.
-- The server binds `127.0.0.1` only. Transcripts never leave the machine.
+- The pinned emergency build (`./run-emergency.sh`) is Linux-only and predates the web console.
+  On Linux, quit the console before starting it. macOS has no pinned emergency launcher; quit the
+  console and return to the normal pane with `./run-macos.sh`.
+- The server binds `127.0.0.1` only and sensitive routes also require the per-run access
+  capability. Answering and the default missed-question sweep can still send transcript-derived text to Claude as described in
+  [Data handling, privacy, and consent](#data-handling-privacy-and-consent).
 
 To rehearse the console with no microphone, models, or Claude at all:
 
 ```bash
-.venv-linux/bin/python scripts/webui_demo.py        # scripted conversation, loops
+# Linux
+.venv-linux/bin/python scripts/webui_demo.py
+# macOS
+.venv-macos/bin/python scripts/webui_demo.py
 ```
 
 which serves the real console fed by a canned call — useful as an offline demo
 surface that audio problems cannot break.
 
-## Demo emergency fallback
+## Demo emergency fallback (Linux only)
 
-The escape hatch is independent of the voice implementation and never resets, stashes, or
+`run-emergency.sh` depends on the Linux `.venv-linux`, `flock`, `/proc`, and `run.sh`; it is not
+a macOS or Windows fallback. On Linux, the escape hatch is independent of the voice implementation and never resets, stashes, or
 overwrites the working tree. It extracts the pinned last pre-voice commit into a disposable
 directory, reuses the installed environment, disables the optional paid second passes, and
 runs with no voice code at all.
@@ -297,6 +396,8 @@ other people, and plain self-narration — through the real gate:
 python scripts/eval_gate.py --mode balanced
 ```
 
+On macOS, run `.venv-macos/bin/python scripts/eval_gate.py --mode balanced` instead.
+
 It reports accuracy, false positives, false negatives, and latency, and exits non-zero if any
 false positive appears. **Run it after changing any heuristic or Stage B prompt.** Current results:
 
@@ -333,7 +434,7 @@ all the monitors exactly as it watches all the loopback endpoints on Windows.
 
 On macOS, CoreAudio has no built-in recordable view of speaker output. Ambient automatically
 classifies BlackHole, Soundflower, Loopback Audio, Background Music, and VB-Audio virtual inputs
-as `sys` endpoints. BlackHole 2ch plus a Multi-Output Device is the tested path. Less-common
+as `sys` endpoints. BlackHole 2ch plus a Multi-Output Device is the documented, recommended path. Less-common
 drivers can still be selected by explicitly pinning their input name in `audio.output_device`.
 
 Naming an endpoint pins it, and that is how a whole conversation gets lost. A loopback opened on an
@@ -358,8 +459,8 @@ and always feed the context window; this only decides what may become an answer.
 
 | Policy | Behaviour |
 |---|---|
-| `full` | Heuristics **plus** the semantic gate, which may rewrite an indirect request into a question. Default for `sys`. |
-| `explicit` | Only speech actually shaped like a question. Default for `mic`. |
+| `full` | Heuristics **plus** the semantic gate, which may rewrite an indirect request into a question. Command-form candidates also require semantic approval and fail closed if Ollama is unavailable. Default for `sys`. |
+| `explicit` | Only speech actually shaped like a question. Explicit interrogatives and clear command-form asks use zero-call Stage A acceptance. Default for `mic`. |
 | `off` | Context only, never answered. |
 
 Default: `channel_policy = { mic = "explicit", sys = "full" }`.
@@ -386,6 +487,12 @@ the last ~90 s is accepted as a deliberate re-ask: the first answer missed, and 
 (*"no, prompt engineering..."*) rarely carry fresh question intonation. Everything else
 declarative is rejected before the semantic gate ever sees it, so it cannot be rewritten into a
 question.
+
+That zero-call command path is specific to `explicit` policy. On a `full` channel such as the
+default other-speaker `sys` input, Stage A still recognizes the command shape but sends it to
+Ollama for semantic judgment; incoherent request-shaped STT is rejected, and an unavailable
+Ollama fails closed as `ollama_unavailable`. Explicit interrogatives remain zero-call fast accepts
+under either policy.
 
 Replayed over all 690 recorded mic utterances: **221 were answered under the old gate, 66 under
 `explicit`** — 38 of them instantly via Stage A, 28 through the semantic gate. 662 utterances never
@@ -418,7 +525,8 @@ Answers may therefore complete out of order. Each is bound to its question's id,
 independently and never cross-contaminate.
 
 Raising `answer.max_concurrent` costs one Node process per slot. The floor is unchanged: a single
-`claude -p` invocation still takes 6–9 s, so concurrency removes queueing, not per-answer latency.
+The controlled-host `claude -p` test took 6–9 s, while a later live session ranged 3.8–21.8 s end
+to end. Concurrency removes queueing; it does not guarantee per-answer latency.
 
 ## When it looks things up
 
@@ -544,10 +652,13 @@ Platform audio lives behind a small backend layer (`ambientqa/backends/`):
 PipeWire (one `parec` subprocess per stream) on Linux, and CoreAudio (`sounddevice`) on macOS — behind one device/stream contract, so
 everything above capture is platform-blind. Non-blocking capture threads — one per open stream —
 feed per-channel Silero VAD segmenters. One faster-whisper worker transcribes utterances
-serially. Free heuristics reject obvious non-questions and fast-accept explicit interrogatives
-and command-form requests; remaining speech goes to the local Ollama gate model
+serially. Free heuristics reject obvious non-questions and fast-accept explicit interrogatives;
+they also fast-accept clear command-form requests on an `explicit`-policy channel. A command-form
+candidate on a `full` channel, and other remaining speech, goes to the local Ollama gate model
 (`[gate] model`). Confirmed questions each launch their own bounded, one-shot
-`claude -p` process and stream output into that question's card as it is generated. There is
+`claude -p` process and stream output into that question's card as it is generated. Those prompts
+carry transcript-derived context, history, profile context, and optional grounding as documented
+under [Data handling, privacy, and consent](#data-handling-privacy-and-consent). There is
 intentionally no persistent Claude stream session.
 
 Two independent second passes can run behind the live path, one per direction of error. The
@@ -562,9 +673,14 @@ never grounds. With `answer.sweep = "always"`, the **missed** side is covered: e
 model (`sweep_model`, `claude-haiku-4-5` by default) re-judges the gate's judgment-stage
 rejections against the same wide context and the list of questions already answered or in
 flight; genuine asks come back as late cards through the normal answer path, logged as
-`second_pass_recovery`. A missed question therefore has a ladder of recovery: re-ask it (past
-the 8 s dedupe cooldown a repeat gets a fresh answer, and a statement retry of a recent
-question is accepted outright), wait for the sweep, or press `a`.
+`second_pass_recovery`. Its hard end-to-end deadline starts at the captured transcript timestamp:
+old candidates are pruned before classification, rechecked after classification, and any queued or
+generating recovery is cancelled instead of being delivered after `sweep_max_age_s` (60 s by
+default). The 25 s interval is scheduling cadence, not a promise that a recovery will arrive;
+failures and remaining misses are still possible. A missed question
+therefore has a ladder of recovery: re-ask it (past the 8 s dedupe cooldown a repeat gets a fresh
+answer, and a statement retry of a recent question is accepted outright), wait for the sweep, or
+press `a`.
 
 Keys:
 
@@ -590,6 +706,10 @@ workflow outside the TUI:
 .\.venv\Scripts\python.exe scripts\pick_mic.py --seconds 6 --list
 ```
 
+On macOS, use `.venv-macos/bin/python scripts/pick_mic.py` (with the same optional arguments).
+It automatically reads and updates `config.macos.toml`; `--config PATH` can select a different
+overlay explicitly.
+
 Every completed utterance is appended to `logs/session-<timestamp>.jsonl` with its channel,
 transcript, gate decision, reason, answer, and measured stage latencies. Records are written
 live, one line per utterance as it completes — nothing is buffered until session end, so the
@@ -604,6 +724,8 @@ answers, web lookups, and errors:
 ```powershell
 python scripts\render_session.py
 ```
+
+On macOS, use `.venv-macos/bin/python scripts/render_session.py`.
 
 With no argument it renders the newest session; pass a `logs\session-*.jsonl` path for a
 specific one, and `-o` to choose the output location (default: the `.html` next to the
@@ -635,11 +757,16 @@ platform-specific devices/STT while inheriting the shared tuning.
 | | `min_utterance_ms`, `max_utterance_s` | Segment discard and force-flush limits |
 | | `silent_source_warn_s` | Flag an open-but-inaudible capture source in the status bar |
 | `stt` | `model` | faster-whisper model name |
-| | `device`, `compute_type`, `cpu_compute_type` | CUDA primary and CPU fallback; a shared `cuda` setting maps directly to CPU on macOS |
+| | `device`, `compute_type`, `cpu_compute_type` | Windows/Linux prefer CUDA with CPU fallback; the Mac overlay deliberately sets CPU/int8 |
 | | `queue_size`, `language` | Bounded utterance queue and optional language |
+| | `vad_filter` | Retain faster-whisper's secondary residual-silence filter after streaming VAD; `true` by default |
+| | `profile_hints` | Opt in to active-profile vocabulary/topic hints for Whisper; `false` by default because hints can bias unrelated speech |
 | | `hallucination_blocklist` | Normalized exact phrases discarded after STT |
-| `context` | `profile` | Markdown profile path; empty disables profile context |
+| `context` | `profile` | Markdown profile path; empty means no active profile or profile-specific knowledge pack. The Mac overlay starts empty; press `x` to choose one |
 | | `enabled` | Master switch for profile influence |
+| `knowledge` | `enabled`, `path` | Enable the local pre-answered knowledge pack and set its fallback directory. The shared default remains enabled even while the Mac profile starts empty |
+| | `hit_threshold`, `min_query_words` | Minimum score and length after cache specificity checks: every verbatim hit requires an exact normalized content-token-set match to one canonical question or alias, and ambiguous matches go live |
+| | `ground_on_miss`, `retrieve_k`, `grounding_threshold` | On a cache miss, inject at most this many entries only when one canonical question or alias has the same normalized content-token set and clears the score floor (default 0.30) |
 | `gate` | `model`, `ollama_url`, `request_timeout_s` | Local classifier connection |
 | | `channel_policy` | Per-channel `full` / `explicit` / `off` gating freedom |
 | | `max_concurrent` | Utterances judged at once, off the ordered consumer path |
@@ -661,8 +788,8 @@ platform-specific devices/STT while inheriting the shared tuning.
 | | `context_turns`, `queue_size` | Background context and configured capacity |
 | | `history_turns` | Completed Q&A pairs carried into each new answer so follow-ups ("elaborate on the second method") resolve against what was actually answered; 0 disables |
 | | `verify`, `verify_context_turns` | Opt-in second-pass audit of each delivered answer with a wider transcript window: replaces the card (marked "revised") only when the answer was materially wrong. `"off"` by default; `"always"` adds one Claude call per answer |
-| | `sweep`, `sweep_interval_s`, `sweep_model` | Opt-in detection second pass: periodically re-judges judgment-stage rejections and answers genuine asks it wrongly dropped as late cards. `"off"` by default; small model when enabled |
-| `tts` | `engine` | `kokoro` (neural, local model) or `espeak` (instant fallback); Kokoro degrades to espeak by itself if it cannot load. Only tunes HOW answers are spoken — an instance speaks only when launched with `--voice` |
+| | `sweep`, `sweep_interval_s`, `sweep_max_age_s`, `sweep_model` | Default-on (`"always"`) detection second pass: every 25 s it re-judges recent judgment-stage rejections with a small model. Candidates older than 60 s are discarded; `"off"` disables it |
+| `tts` | `engine` | `kokoro` (neural, local model) or `espeak` (fallback selection); if Kokoro cannot load, Ambient selects espeak. macOS setup installs and probes the external `espeak-ng` executable before declaring the environment ready. An instance speaks only when launched with `--voice` |
 | | `voice`, `speed` | Kokoro voice name and rate multiplier |
 | | `speak` | Normal-mode baseline: `first_line` speaks a cue answer's opening line; `full` speaks the whole code-stripped answer. Voice key `r` temporarily overrides this to `full` together with spoken-prose answer style |
 | | `speak_channels` | Channels whose accepted questions are spoken (default `["mic"]` — see "Voice mode") |
@@ -682,7 +809,8 @@ Context profiles live in `profiles/*.md` and may contain optional `## Topic`,
 `## Background`, and `## Vocabulary` sections. Agent sessions may additionally use
 `## Customer Channel` (`mic` or `sys`) and `## Greeting`; the Agent/Q&A role itself is selected
 at runtime and is not controlled by profile metadata.
-Vocabulary biases Whisper spelling, Topic helps
+When the deliberately opt-in `stt.profile_hints = true`, Vocabulary biases Whisper spelling and a
+short Topic hint reaches STT. With the safe default `false`, neither is sent to Whisper. Topic helps
 the gate resolve words already present in an utterance, and Topic plus Background tune answer
 depth. Profile context never filters topics or turns contextless speech into a question. Press
 `x` to switch profiles live; the selection is saved to `context.profile`.
@@ -696,9 +824,11 @@ through *any* output endpoint: check that the call is not muted and that the OS 
 somewhere. Press `d` for live meters; the right endpoint is the one that moves when the other
 person speaks. Tune the delay with `audio.silent_source_warn_s` (default 45 s).
 
-**No loopback device:** run `python scripts/list_devices.py` to see the endpoints. A pinned name
-that matches nothing no longer drops you to microphone-only — it falls back to the default output
-and warns, since mic-only silently loses the side of the conversation worth answering. If no
+**No loopback device:** run the platform interpreter's device list command (on macOS,
+`.venv-macos/bin/python scripts/list_devices.py`) to see the endpoints. A pinned name
+that matches nothing no longer drops you to microphone-only — it falls back to the platform's
+automatic loopback candidates and warns. On macOS that means watching every recognized virtual
+input, because CoreAudio has no default recordable output mapping. If no
 endpoint can be opened at all, the status bar warns and the app continues microphone-only.
 On macOS, install BlackHole 2ch and configure the Multi-Output Device described in Quickstart;
 physical CoreAudio outputs are not recordable inputs by themselves.
@@ -735,8 +865,9 @@ Verify with `python -c "import sys; print(sys.base_prefix)"` — it must not con
 
 **It hears system audio but not me:** check *which* microphone it picked. The status bar names the
 active device, and the app follows the platform default, which is often not the one you speak into.
-Set `audio.mic_device` in `config.toml` to any case-insensitive substring of the device you want
-(for example `"Logitech"`), using the names from `python scripts/list_devices.py`.
+Set `audio.mic_device` in the launcher's config to any case-insensitive substring of the device
+you want (for example `"Logitech"`), using the names from the platform device-list command above.
+On macOS, prefer the `d` picker so it writes `config.macos.toml` rather than the shared config.
 
 **Mic transcription is garbled (Linux):** the microphone is almost certainly clipping. The raw
 USB mic at full PipeWire volume runs ~34 dB above its hardware-neutral level; loud speech clipped
@@ -746,23 +877,26 @@ automatic gain control, the class of processing Windows applies in its own audio
 `audio.mic_device` to it. If the app reports the mic unavailable, the module did not load: rerun
 `./run.sh`, or press `d` and pick the raw device (then turn its volume down).
 
-**Whisper says `cpu`:** this is expected on macOS, where the shared CUDA config is translated to
-CPU `int8` before model loading. On Windows or Linux it means CUDA/model initialization failed and
-faster-whisper fell back to CPU. Read the warning text first. If it says GPU memory is exhausted, close GPU-heavy games,
-another Whisper/dictation service, or unused Ollama models and relaunch; CPU fallback works but is
-far too slow for a conversational demo. Otherwise check the NVIDIA driver and the installed
+**Whisper says `cpu`:** this is expected on macOS, where `config.macos.toml` deliberately pins CPU
+`int8` before model loading. On Windows or Linux it means CUDA/model initialization failed and
+faster-whisper fell back to CPU. Read the warning text first. If it says GPU memory is exhausted,
+close GPU-heavy games, another Whisper/dictation service, or unused Ollama models and relaunch. On
+the measured Windows/Linux GPU-class hosts, CPU fallback was not accepted for demo latency; Mac CPU
+latency remains a real-hardware acceptance item. Otherwise check the NVIDIA driver and the installed
 `nvidia-cublas-cu12`/`nvidia-cudnn-cu12` packages. The status bar deliberately makes this fallback
 prominent because it is slower.
 
 **Ollama is not running:** start Ollama, confirm `ollama list` includes the model named in
 `[gate] model` (a model that is configured but not pulled fails the same way), then restart
-the app. Until the local gate is available, fast heuristic accepts still work and uncertain
-utterances are rejected safely.
+the app. On macOS, ensure the `ollama` CLI is on `PATH`; the launcher starts its own private
+server even if the desktop Ollama service is already running. Until the local gate is available, explicit interrogatives and clear commands on an
+`explicit` channel still use their zero-call paths. Uncertain utterances and command-form
+candidates on a `full` channel fail closed.
 
 **Gate responses are empty:** `gemma4:e2b` (the default gate model) is a reasoning model. Every Ollama request must contain
 top-level `"think": false`; otherwise `message.content` can be empty. Both application requests
-and the PowerShell warmup include it. If you put Ollama behind a proxy, ensure that field is not
-removed.
+and the warmup include it. Remote/proxied gate endpoints are deliberately rejected: `ollama_url`
+must be a literal HTTP loopback `/api/chat` URL, and the client ignores proxy environment variables.
 
 **Claude answers time out or fail:** run `claude -p "hello"` to confirm the CLI is installed and
 authenticated. Each question intentionally uses a separate one-shot process and is killed after

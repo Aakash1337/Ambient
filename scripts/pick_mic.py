@@ -19,7 +19,13 @@ from ambientqa.config import load_config  # noqa: E402
 from ambientqa.config_write import set_audio_device  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = PROJECT_ROOT / "config.toml"
+
+
+def _default_config_path(platform: str | None = None) -> Path:
+    """Use the same platform overlay as the normal launcher."""
+    selected = sys.platform if platform is None else platform
+    name = "config.macos.toml" if selected == "darwin" else "config.toml"
+    return PROJECT_ROOT / name
 
 
 def _meter_text(reading: MeterReading) -> str:
@@ -77,7 +83,7 @@ def _meter_for(
     return maxima
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare live capture levels and choose an Ambient device."
     )
@@ -92,16 +98,30 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="print devices and measured levels without prompting",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help=(
+            "config file to read and update (default: config.macos.toml on "
+            "macOS, config.toml elsewhere)"
+        ),
+    )
+    return parser.parse_args(argv)
 
 
 def main() -> int:
     args = _parse_args()
+    config_path = (
+        args.config.expanduser().resolve()
+        if args.config is not None
+        else _default_config_path()
+    )
     if args.seconds < 0:
         print("--seconds must be non-negative", file=sys.stderr)
         return 2
     try:
-        config = load_config(CONFIG_PATH)
+        config = load_config(config_path)
         session = AudioDeviceSession.open(
             get_backend(config.audio),
             active_mic=config.audio.mic_device,
@@ -138,10 +158,10 @@ def main() -> int:
             return 2
         selected = session.devices[choice - 1]
         key = "mic_device" if selected.kind == "mic" else "output_device"
-        set_audio_device(CONFIG_PATH, key, selected.name)
+        set_audio_device(config_path, key, selected.name)
         target = "microphone" if selected.kind == "mic" else "system audio"
         print(f"Selected {target}: {selected.name}")
-        print(f"Updated {CONFIG_PATH}")
+        print(f"Updated {config_path}")
         return 0
     finally:
         session.close()

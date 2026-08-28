@@ -5,7 +5,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ambientqa.__main__ import AmbientController, _AnswerJob
+from ambientqa.__main__ import AmbientController
 from ambientqa.bus import AnswerResult, DropOldestQueue, Transcript
 from ambientqa.config import default_config
 from ambientqa.context import TranscriptContext
@@ -174,11 +174,11 @@ def test_strong_cache_hit_is_served_verbatim_without_a_model_call() -> None:
     assert controller._last_completed_answer is not None
 
 
-def test_cache_miss_enqueues_a_live_job_with_grounding() -> None:
+def test_fuzzy_cache_miss_enqueues_live_without_unsafe_grounding() -> None:
     controller = build_controller(
-        _index(), accepted_query="How should I think about IAM policy evaluation?"
+        _index(), accepted_query="How should I think about IAM role policy evaluation?"
     )
-    transcript = _transcript("How should I think about IAM policy evaluation?")
+    transcript = _transcript("How should I think about IAM role policy evaluation?")
 
     asyncio.run(controller._gate_and_enqueue(transcript, [], [], "full", {}))
 
@@ -186,9 +186,9 @@ def test_cache_miss_enqueues_a_live_job_with_grounding() -> None:
     assert controller.app.resolved == []
     job = controller.answers.get_nowait()
     controller.answers.task_done()
-    # ...but the closest entry rides along as authoritative reference.
-    assert job.grounding
-    assert any("short-lived credentials via STS" in block for block in job.grounding)
+    # A nearby entry is not automatically authoritative: without an exact
+    # canonical/alias subject match, the live model receives no pack excerpt.
+    assert job.grounding == []
 
 
 def test_unrelated_question_enqueues_with_no_grounding() -> None:

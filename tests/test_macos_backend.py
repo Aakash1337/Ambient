@@ -60,8 +60,15 @@ DEVICES = [
 ]
 
 
+class _InputOutputPair:
+    """Match sounddevice's indexable, non-list default.device object."""
+
+    def __getitem__(self, index: int) -> int:
+        return (3, 0)[index]
+
+
 class _Default:
-    device = (3, 0)
+    device = _InputOutputPair()
 
 
 class _RawInput:
@@ -147,6 +154,23 @@ def test_missing_pinned_mic_raises_and_stale_loopback_warns() -> None:
     assert len(warnings) == 1 and "Old Soundflower" in warnings[0]
 
 
+def test_stale_loopback_pin_keeps_every_recognized_fallback() -> None:
+    second_loopback = {
+        "name": "Loopback Audio",
+        "hostapi": 0,
+        "max_input_channels": 2,
+        "default_samplerate": 48000,
+    }
+    session = _backend([*DEVICES, second_loopback]).open_session()
+    warnings: list[str] = []
+
+    fallback = session.loopback_candidates("Removed virtual cable", warnings.append)
+
+    assert [device.id for device in fallback] == ["1", "6"]
+    assert len(warnings) == 1
+    assert "Removed virtual cable" in warnings[0]
+
+
 def test_missing_loopback_explains_blackhole_and_mic_only_fallback() -> None:
     physical_only = [DEVICES[2], DEVICES[3]]
     session = _backend(physical_only).open_session()
@@ -211,6 +235,37 @@ class _BlockingRawInput:
         pass
 
 
+class _AbortFailingRawInput(_BlockingRawInput):
+    def __init__(self) -> None:
+        super().__init__()
+        self.abort_called = False
+        self.stop_called = False
+
+    def abort(self) -> None:
+        self.abort_called = True
+        raise RuntimeError("abort failed")
+
+    def stop(self) -> None:
+        self.stop_called = True
+        self.released.set()
+
+
+class _StrictControlRawInput(_BlockingRawInput):
+    def __init__(self) -> None:
+        super().__init__()
+        self.abort_ignore_errors: list[bool] = []
+        self.stop_ignore_errors: list[bool] = []
+
+    def abort(self, ignore_errors: bool = True) -> None:
+        self.abort_ignore_errors.append(ignore_errors)
+        if not ignore_errors:
+            raise RuntimeError("PortAudio abort failed")
+
+    def stop(self, ignore_errors: bool = True) -> None:
+        self.stop_ignore_errors.append(ignore_errors)
+        self.released.set()
+
+
 def test_stop_unblocks_a_coreaudio_reader() -> None:
     stream = CoreAudioStream(_BlockingRawInput(), rate=48000, channels=1)
     errors: list[BaseException] = []
@@ -230,6 +285,41 @@ def test_stop_unblocks_a_coreaudio_reader() -> None:
     assert not thread.is_alive()
     assert len(errors) == 1
     assert "stopped" in str(errors[0]).casefold()
+
+
+def test_failed_abort_falls_back_to_stop_and_unblocks_reader() -> None:
+    raw = _AbortFailingRawInput()
+    stream = CoreAudioStream(raw, rate=48000, channels=1)
+    errors: list[BaseException] = []
+
+    def read() -> None:
+        try:
+            stream.read(400)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    assert thread.is_alive()
+
+    stream.stop()
+    thread.join(timeout=2)
+
+    assert raw.abort_called and raw.stop_called
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert "stopped" in str(errors[0]).casefold()
+
+
+def test_coreaudio_control_disables_sounddevice_silent_error_mode() -> None:
+    raw = _StrictControlRawInput()
+    stream = CoreAudioStream(raw, rate=48000, channels=1)
+
+    stream.stop()
+
+    assert raw.abort_ignore_errors == [False]
+    assert raw.stop_ignore_errors == [False]
 
 
 def test_backend_selection_covers_all_three_platforms(monkeypatch) -> None:

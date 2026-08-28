@@ -15,6 +15,7 @@ from ambientqa.bus import AudioFrame, DropOldestQueue, Utterance
 from ambientqa.config import AudioConfig, TtsConfig, default_config, validate_config
 from ambientqa.segmenter import UtteranceSegmenter, segment_worker
 from ambientqa.tts import (
+    EspeakEngine,
     SpeakWindows,
     SpeechOutput,
     _CoreAudioPlayer,
@@ -73,6 +74,29 @@ def test_speakable_flattens_markdown() -> None:
 
 def test_speakable_code_only_answer_is_empty() -> None:
     assert speakable("```python\nx = 1\n```", "full") == ""
+
+
+def test_espeak_receives_private_answer_over_stdin(monkeypatch) -> None:
+    secret = "PRIVATE spoken answer sentinel"
+    captured: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=b"RIFFplaceholderdata\x00\x00\x00\x00pcm",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert EspeakEngine().synthesize(secret) == b"pcm"
+    command = captured["command"]
+    kwargs = captured["kwargs"]
+    assert command[-1] == "--stdin"
+    assert secret not in "\n".join(str(item) for item in command)
+    assert kwargs["input"] == secret.encode("utf-8")
 
 
 @pytest.mark.parametrize(
@@ -447,6 +471,84 @@ def test_coreaudio_player_abort_matches_subprocess_termination() -> None:
     assert sounddevice.streams[0].aborted
     assert sounddevice.streams[0].closed
     assert player.wait(timeout=0.1) == -15
+
+
+def test_coreaudio_player_failed_abort_falls_back_to_stop() -> None:
+    class AbortFailingOutput(_RawOutput):
+        def abort(self) -> None:
+            self.aborted = True
+            raise RuntimeError("abort unavailable")
+
+    class AbortFailingSoundDevice(_OutputSoundDevice):
+        def RawOutputStream(self, **kwargs) -> _RawOutput:
+            stream = AbortFailingOutput(**kwargs)
+            self.streams.append(stream)
+            return stream
+
+    sounddevice = AbortFailingSoundDevice()
+    player = _CoreAudioPlayer(24000, sounddevice)
+
+    player.terminate()
+
+    raw = sounddevice.streams[0]
+    assert raw.aborted and raw.stopped and raw.closed
+    assert player.wait(timeout=0.1) == -15
+
+
+def test_coreaudio_player_disables_sounddevice_silent_error_mode() -> None:
+    class StrictOutput(_RawOutput):
+        abort_ignore_errors: list[bool]
+        stop_ignore_errors: list[bool]
+
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.abort_ignore_errors = []
+            self.stop_ignore_errors = []
+
+        def abort(self, ignore_errors: bool = True) -> None:
+            self.abort_ignore_errors.append(ignore_errors)
+            if not ignore_errors:
+                raise RuntimeError("PortAudio abort failed")
+
+        def stop(self, ignore_errors: bool = True) -> None:
+            self.stop_ignore_errors.append(ignore_errors)
+            self.stopped = True
+
+    class StrictSoundDevice(_OutputSoundDevice):
+        def RawOutputStream(self, **kwargs) -> _RawOutput:
+            stream = StrictOutput(**kwargs)
+            self.streams.append(stream)
+            return stream
+
+    sounddevice = StrictSoundDevice()
+    player = _CoreAudioPlayer(24000, sounddevice)
+
+    player.terminate()
+
+    raw = sounddevice.streams[0]
+    assert isinstance(raw, StrictOutput)
+    assert raw.abort_ignore_errors == [False]
+    assert raw.stop_ignore_errors == [False]
+    assert raw.closed
+
+
+def test_failed_coreaudio_player_start_closes_native_stream() -> None:
+    class BrokenOutput(_RawOutput):
+        def start(self) -> None:
+            raise RuntimeError("output permission denied")
+
+    class BrokenSoundDevice(_OutputSoundDevice):
+        def RawOutputStream(self, **kwargs) -> _RawOutput:
+            stream = BrokenOutput(**kwargs)
+            self.streams.append(stream)
+            return stream
+
+    sounddevice = BrokenSoundDevice()
+
+    with pytest.raises(RuntimeError, match="output permission denied"):
+        _CoreAudioPlayer(24000, sounddevice)
+
+    assert sounddevice.streams[0].closed
 
 
 def test_speech_output_defaults_to_coreaudio_player_on_macos(

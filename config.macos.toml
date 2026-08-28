@@ -9,4 +9,13 @@ output_device = ""
 
 [stt]
 # CTranslate2's macOS wheels support Intel/Apple-Silicon CPUs, not Metal/MPS.
+# setup-macos.sh downloads and verifies this exact immutable model snapshot;
+# runtime never resolves a mutable Hugging Face branch or downloads lazily.
+model = "models/faster-whisper-large-v3-turbo-0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf"
 device = "cpu"
+
+# A fresh Mac starts in general-purpose mode. Pick a domain profile explicitly
+# with `x`; inheriting the developer's AWS interview profile poisoned unrelated
+# sessions with IAM vocabulary and first-person interview context.
+[context]
+profile = ""

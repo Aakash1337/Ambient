@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import stat
 from collections import deque
+from pathlib import Path
 
 import pytest
 
@@ -56,6 +58,24 @@ class FakeStream:
         return self.data
 
 
+class FakeStdin:
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.data.extend(data)
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
 class FakeProcess:
     def __init__(
         self,
@@ -67,6 +87,7 @@ class FakeProcess:
         hang: bool = False,
     ) -> None:
         self.returncode = None
+        self.stdin = FakeStdin()
         self.stdout = FakeStream(lines, delay=delay, hang=hang)
         self.stderr = FakeStream(data=stderr)
         self.communicate_stdout = stdout
@@ -74,9 +95,11 @@ class FakeProcess:
         self.hang = hang
         self.killed = False
         self.communicate_called = False
+        self.communicate_input: bytes | None = None
 
-    async def communicate(self) -> tuple[bytes, bytes]:
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
         self.communicate_called = True
+        self.communicate_input = input
         if self.hang:
             await asyncio.Event().wait()
         self.returncode = 0
@@ -99,7 +122,16 @@ def test_uses_one_shot_cli_with_required_isolation(monkeypatch) -> None:
     process = FakeProcess([_delta("Direct "), _delta("answer.")])
 
     async def fake_create(*args, **kwargs):
-        seen.append((args, kwargs))
+        system_path = Path(args[args.index("--system-prompt-file") + 1])
+        seen.append(
+            (
+                args,
+                kwargs,
+                system_path,
+                system_path.read_text(),
+                stat.S_IMODE(system_path.stat().st_mode),
+            )
+        )
         return process
 
     deltas: list[tuple[str, str]] = []
@@ -129,10 +161,138 @@ def test_uses_one_shot_cli_with_required_isolation(monkeypatch) -> None:
     assert args[args.index("--output-format") + 1] == "stream-json"
     assert "--include-partial-messages" in args
     assert "--verbose" in args
+    assert args[args.index("--tools") + 1] == ""
     assert args[args.index("--allowed-tools") + 1] == ""
+    assert args[args.index("--permission-mode") + 1] == "dontAsk"
+    assert args[args.index("--setting-sources") + 1] == ""
+    assert "--no-session-persistence" in args
+    assert "--safe-mode" in args
+    assert "--restricted" in args
     assert args[args.index("--strict-mcp-config") + 1] == "--mcp-config"
     assert json.loads(args[args.index("--mcp-config") + 1]) == {"mcpServers": {}}
-    assert "BACKGROUND TRANSCRIPT" in args[2]
+    serialized = "\n".join(str(item) for item in args)
+    assert "What is WASAPI?" not in serialized
+    assert "We were discussing Windows audio" not in serialized
+    assert "--system-prompt" not in args
+    assert "--system-prompt-file" in args
+    prompt = bytes(process.stdin.data).decode()
+    assert "BACKGROUND TRANSCRIPT" in prompt
+    assert "What is WASAPI?" in prompt
+    assert seen[0][3].startswith("You are feeding a cue card")
+    assert seen[0][4] == 0o600
+    assert not seen[0][2].exists()
+    assert seen[0][1]["stdin"] == asyncio.subprocess.PIPE
+    assert seen[0][1]["limit"] == 4 * 1024 * 1024
+    assert "ambientqa-claude-" in seen[0][1]["cwd"]
+
+
+def test_web_lookup_never_exposes_prior_conversation_or_profile_to_tools(
+    monkeypatch,
+) -> None:
+    from ambientqa.profile import Profile
+
+    seen: list[tuple[tuple[object, ...], dict[str, object], str]] = []
+    process = FakeProcess(stdout=b"Current answer.")
+
+    async def fake_create(*args, **kwargs):
+        system_path = Path(args[args.index("--system-prompt-file") + 1])
+        seen.append((args, kwargs, system_path.read_text()))
+        return process
+
+    answerer = ClaudeAnswerer(
+        AnswerConfig(web_lookup="always", stream=False),
+        profile=Profile(
+            name="private",
+            topic="SECRET PROFILE TOPIC",
+            background="SECRET PROFILE BACKGROUND",
+            vocabulary=[],
+            raw="",
+        ),
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    result = asyncio.run(
+        answerer.answer(
+            "q1",
+            "What is the latest version of Library X used by SECRET PROJECT ZEPHYR?",
+            ["[sys] SECRET TRANSCRIPT"],
+            history=[("SECRET EARLIER QUESTION", "SECRET EARLIER ANSWER")],
+            grounding=["SECRET LOCAL GROUNDING"],
+            lookup_query="What is its latest version?",
+        )
+    )
+
+    assert result.status == "ok"
+    args = seen[0][0]
+    assert args[args.index("--tools") + 1] == "WebSearch"
+    assert args[args.index("--allowed-tools") + 1] == "WebSearch"
+    serialized = "\n".join(str(item) for item in args)
+    assert process.communicate_input is not None
+    stdin_prompt = process.communicate_input.decode()
+    assert "CURRENT QUESTION" in stdin_prompt
+    assert "What is its latest version?" in stdin_prompt
+    assert "What is its latest version?" not in serialized
+    for secret in (
+        "SECRET TRANSCRIPT",
+        "SECRET EARLIER QUESTION",
+        "SECRET EARLIER ANSWER",
+        "SECRET PROFILE TOPIC",
+        "SECRET PROFILE BACKGROUND",
+        "SECRET LOCAL GROUNDING",
+        "SECRET PROJECT ZEPHYR",
+    ):
+        assert secret not in serialized
+        assert secret not in stdin_prompt
+        assert secret not in seen[0][2]
+
+
+def test_web_lookup_detection_uses_literal_utterance_not_context_rewrite(
+    monkeypatch,
+) -> None:
+    process = FakeProcess(stdout=b"Answer from memory.")
+    seen: list[tuple[object, ...]] = []
+
+    async def fake_create(*args, **_kwargs):
+        seen.append(args)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    result = asyncio.run(
+        ClaudeAnswerer(AnswerConfig(web_lookup="auto", stream=False)).answer(
+            "q1",
+            "What is the latest version of SECRET CONTEXT LIBRARY?",
+            ["[sys] SECRET CONTEXT LIBRARY"],
+            lookup_query="What about it?",
+        )
+    )
+
+    assert result.searched is False
+    assert seen[0][seen[0].index("--tools") + 1] == ""
+    assert process.communicate_input is not None
+    # The normal no-tool answer may use the rewrite and bounded context; only
+    # the tool-enabled boundary is restricted to the literal utterance.
+    assert "SECRET CONTEXT LIBRARY" in process.communicate_input.decode()
+
+
+def test_answer_reaps_child_when_stream_reader_raises(monkeypatch) -> None:
+    process = FakeProcess(hang=True)
+
+    class BrokenStream(FakeStream):
+        async def readline(self) -> bytes:
+            raise ValueError("event exceeded stream limit")
+
+    process.stdout = BrokenStream()
+
+    async def fake_create(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    result = asyncio.run(
+        ClaudeAnswerer(AnswerConfig()).answer("q1", "Question?", [])
+    )
+
+    assert result.status == "error"
+    assert process.killed is True
+    assert process.returncode == -1
 
 
 def test_streamed_deltas_match_non_streaming_answer(monkeypatch) -> None:
@@ -323,6 +483,35 @@ def test_timeout_kills_process(monkeypatch) -> None:
     assert process.returncode == -1
 
 
+def test_timeout_does_not_wait_for_a_child_that_never_reads_stdin(monkeypatch) -> None:
+    class BlockingInput(FakeStdin):
+        async def drain(self) -> None:
+            await asyncio.Event().wait()
+
+        async def wait_closed(self) -> None:
+            # A real pipe can remain unclosed until a non-reading child exits.
+            # The answer timeout must not await this before killing the child.
+            await asyncio.Event().wait()
+
+    process = FakeProcess(hang=True)
+    process.stdin = BlockingInput()
+
+    async def fake_create(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    result = asyncio.run(
+        ClaudeAnswerer(AnswerConfig(answer_timeout_s=0.001)).answer(
+            "q1", "private prompt " * 100_000, []
+        )
+    )
+
+    assert result.status == "timed_out"
+    assert process.stdin.closed
+    assert process.killed
+    assert process.returncode == -1
+
+
 def test_timed_out_lookup_still_records_searched(monkeypatch) -> None:
     # Web lookups are the documented outlier-latency case, so a timed-out
     # lookup is exactly the record whose searched flag must be truthful.
@@ -378,17 +567,15 @@ def test_cancellation_kills_process_and_reraises(monkeypatch) -> None:
 
 
 def test_two_concurrent_streams_do_not_mix_deltas(monkeypatch) -> None:
-    async def fake_create(*args, **_kwargs):
-        prompt = args[2]
-        if "First question?" in prompt:
-            return FakeProcess(
-                [_delta("First "), _delta("answer.")],
-                delay=0.002,
-            )
-        return FakeProcess(
-            [_delta("Second "), _delta("answer.")],
-            delay=0.001,
-        )
+    processes = deque(
+        [
+            FakeProcess([_delta("First "), _delta("answer.")], delay=0.002),
+            FakeProcess([_delta("Second "), _delta("answer.")], delay=0.001),
+        ]
+    )
+
+    async def fake_create(*_args, **_kwargs):
+        return processes.popleft()
 
     received: dict[str, list[str]] = {"q1": [], "q2": []}
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
@@ -435,6 +622,9 @@ def test_stream_false_restores_buffered_communicate_path(monkeypatch) -> None:
     assert "--verbose" not in args
     assert "--input-format" not in args
     assert process.communicate_called
+    assert process.communicate_input is not None
+    assert "Question?" in process.communicate_input.decode()
+    assert "Question?" not in "\n".join(str(item) for item in args)
     assert not deltas
     assert result.answer == "Buffered answer."
     assert result.status == "ok"
@@ -502,7 +692,8 @@ def _fake_exec(stdout: bytes, returncode: int = 0):
         def __init__(self) -> None:
             self.returncode = returncode
 
-        async def communicate(self):
+        async def communicate(self, input: bytes | None = None):
+            captured["stdin"] = input
             return stdout, b""
 
         def kill(self) -> None:
@@ -511,8 +702,13 @@ def _fake_exec(stdout: bytes, returncode: int = 0):
         async def wait(self) -> int:
             return self.returncode
 
-    async def runner(*command, **_kwargs):
+    async def runner(*command, **kwargs):
         captured["command"] = command
+        captured["kwargs"] = kwargs
+        system_path = Path(command[command.index("--system-prompt-file") + 1])
+        captured["system"] = system_path.read_text()
+        captured["system_mode"] = stat.S_IMODE(system_path.stat().st_mode)
+        captured["system_path"] = system_path
         return FakeProc()
 
     return runner, captured
@@ -545,12 +741,18 @@ def test_verify_returns_none_on_ok_and_the_revision_otherwise(
     assert revised == "RAG, because the content keeps changing."
     # The audit prompt must carry the raw speech, the query, and the delivered
     # answer -- the evidence the verdict is supposed to weigh.
-    prompt = captured2["command"][2]
+    prompt = captured2["stdin"].decode()
     assert "raw words" in prompt and "Which method?" in prompt and "All three." in prompt
-    system = captured2["command"][6]
+    system = captured2["system"]
     assert "AUDITING" in system and "Reply with exactly OK" in system
     assert "two to four sentences" in system.lower()
     assert "cue card" not in system.lower()
+    serialized = "\n".join(str(item) for item in captured2["command"])
+    assert "raw words" not in serialized
+    assert "Which method?" not in serialized
+    assert "All three." not in serialized
+    assert captured2["system_mode"] == 0o600
+    assert not captured2["system_path"].exists()
 
 
 def test_verify_failure_never_disturbs_the_answer(
@@ -575,7 +777,7 @@ def test_all_claude_calls_share_the_concurrency_limit(
             self.stdout = stdout
             self.returncode = 0
 
-        async def communicate(self):
+        async def communicate(self, input: bytes | None = None):
             nonlocal active, peak_active
             active += 1
             peak_active = max(peak_active, active)
@@ -590,7 +792,8 @@ def test_all_claude_calls_share_the_concurrency_limit(
             return self.returncode
 
     async def fake_create(*command, **_kwargs):
-        system_prompt = command[command.index("--system-prompt") + 1]
+        system_path = Path(command[command.index("--system-prompt-file") + 1])
+        system_prompt = system_path.read_text()
         if system_prompt.startswith(ClaudeAnswerer.VERIFY):
             return SlowProcess(b"OK")
         if system_prompt == ClaudeAnswerer.SWEEP:
@@ -660,7 +863,7 @@ def test_detect_missed_parses_indices_and_filters_junk(
     )
     # Only the in-range, non-blank entry survives; prefix prose is tolerated.
     assert result == [(1, "How does diarization work?")]
-    prompt = captured["command"][2]
+    prompt = captured["stdin"].decode()
     assert "[1] [mic] diarization how it works" in prompt
     assert "What is RAG?" in prompt
 
@@ -687,7 +890,7 @@ def test_detect_missed_prompt_preserves_challenging_followups(
     )
 
     assert result == [(0, "Should full-screen sharing include system audio?")]
-    prompt = captured["command"][2]
+    prompt = captured["stdin"].decode()
     assert candidate in prompt
     assert "topic overlap alone does not make a follow-up answered" in prompt
     assert "challenges an earlier answer" in ClaudeAnswerer.SWEEP

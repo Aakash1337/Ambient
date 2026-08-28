@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ipaddress
+import os
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import urlsplit
 
 try:
     import tomllib
@@ -43,6 +46,13 @@ class STTConfig:
     cpu_compute_type: str = "int8"
     queue_size: int = 12
     language: str = ""
+    # Faster-Whisper's own VAD is a second line of defence after the streaming
+    # segmenter. It trims residual silence/hold music before decoding, where
+    # Whisper is otherwise most likely to hallucinate fluent text.
+    vad_filter: bool = True
+    # Domain hotwords can improve proper nouns, but a mismatched profile can
+    # also bias ordinary speech into those terms. Keep them explicitly opt-in.
+    profile_hints: bool = False
     hallucination_blocklist: list[str] | None = None
 
     def __post_init__(self) -> None:
@@ -74,8 +84,9 @@ class KnowledgeConfig:
 
     Opt-in and off by default so existing sessions are untouched. When enabled,
     a gated question is first matched against the pack: a strong match is
-    answered verbatim in milliseconds with no model call, and a weak match falls
-    through to the live model with the closest entries injected as reference.
+    answered verbatim in milliseconds with no model call. A miss goes live; an
+    entry is grounded only when an authored phrasing has the same normalized
+    subject and compatible intent, never from merely nearby lexical overlap.
     """
 
     enabled: bool = False
@@ -91,11 +102,13 @@ class KnowledgeConfig:
     # fragment matches too much by accident to trust. Counts raw words, so a
     # three-word "What is GuardDuty?" still qualifies.
     min_query_words: int = 3
-    # On a miss, inject up to this many of the closest entries into the live
-    # prompt as authoritative reference. 0, or ground_on_miss = false, disables
-    # grounding and leaves the live answer exactly as it is today.
+    # On a miss, inject up to this many intent-compatible exact-subject entries
+    # into the live prompt as authoritative reference. 0, or
+    # ground_on_miss = false, disables grounding.
     ground_on_miss: bool = True
     retrieve_k: int = 3
+    # Secondary score floor after exact-subject and intent checks.
+    grounding_threshold: float = 0.30
 
 
 @dataclass(slots=True)
@@ -224,6 +237,9 @@ class AnswerConfig:
     # this to "off" for its minimum-dependency baseline.
     sweep: str = "always"
     sweep_interval_s: float = 25.0
+    # A recovered question that is this old is no longer conversationally
+    # useful and can interrupt a completely different part of the discussion.
+    sweep_max_age_s: float = 60.0
     # The sweep is a small classification, so a fast cheap model is the right
     # default; empty falls back to answer_model.
     sweep_model: str = "claude-haiku-4-5"
@@ -308,6 +324,32 @@ def _section(cls: type[T], values: dict[str, Any], name: str) -> T:
     return cls(**values)
 
 
+def validate_ollama_url(url: str) -> None:
+    """Require the semantic gate's documented direct loopback HTTP endpoint."""
+    try:
+        parsed = urlsplit(url)
+        host = ipaddress.ip_address(parsed.hostname or "")
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(
+            "gate.ollama_url must be an HTTP URL on a literal loopback address"
+        ) from exc
+    if (
+        parsed.scheme != "http"
+        or not host.is_loopback
+        or port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != "/api/chat"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "gate.ollama_url must be an HTTP /api/chat URL on a literal "
+            "loopback address"
+        )
+
+
 def validate_config(config: Config) -> Config:
     if config.audio.backend not in {"auto", "wasapi", "pipewire", "coreaudio"}:
         raise ValueError(
@@ -319,6 +361,7 @@ def validate_config(config: Config) -> Config:
         raise ValueError("audio.frame_ms must be between 20 and 30")
     if config.gate.mode not in {"strict", "balanced", "eager"}:
         raise ValueError("gate.mode must be strict, balanced, or eager")
+    validate_ollama_url(config.gate.ollama_url)
     unknown_channels = sorted(set(config.gate.channel_policy) - {"mic", "sys"})
     if unknown_channels:
         raise ValueError(
@@ -358,6 +401,8 @@ def validate_config(config: Config) -> Config:
         raise ValueError('answer.sweep must be "off" or "always"')
     if config.answer.sweep_interval_s <= 0:
         raise ValueError("answer.sweep_interval_s must be greater than 0")
+    if config.answer.sweep_max_age_s <= 0:
+        raise ValueError("answer.sweep_max_age_s must be greater than 0")
     if config.gate.reask_cooldown_s < 0:
         raise ValueError("gate.reask_cooldown_s must be at least 0")
     if not 0 <= config.gate.dedupe_ratio <= 1:
@@ -376,6 +421,8 @@ def validate_config(config: Config) -> Config:
         raise ValueError('answer.web_lookup must be "off", "auto", or "always"')
     if config.audio.silent_source_warn_s <= 0:
         raise ValueError("audio.silent_source_warn_s must be greater than 0")
+    if config.ui.status_interval_s <= 0:
+        raise ValueError("ui.status_interval_s must be greater than 0")
     if config.ui.feed_direction not in {"top", "bottom"}:
         raise ValueError('ui.feed_direction must be "top" or "bottom"')
     if config.tts.engine not in {"kokoro", "espeak"}:
@@ -402,6 +449,8 @@ def validate_config(config: Config) -> Config:
         raise ValueError("tts.speed must be between 0.25 and 3")
     if not 0 <= config.knowledge.hit_threshold <= 1:
         raise ValueError("knowledge.hit_threshold must be between 0 and 1")
+    if not 0 <= config.knowledge.grounding_threshold <= 1:
+        raise ValueError("knowledge.grounding_threshold must be between 0 and 1")
     if config.knowledge.min_query_words < 1:
         raise ValueError("knowledge.min_query_words must be at least 1")
     if config.knowledge.retrieve_k < 0:
@@ -471,11 +520,15 @@ def load_config(path: str | Path = "config.toml") -> Config:
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise ValueError(f"Unknown config section(s): {', '.join(unknown)}")
+    gate_values = dict(raw.get("gate", {}))
+    managed_ollama_url = os.environ.get("AMBIENTQA_OLLAMA_URL")
+    if managed_ollama_url:
+        gate_values["ollama_url"] = managed_ollama_url
     config = Config(
         audio=_section(AudioConfig, raw.get("audio", {}), "audio"),
         stt=_section(STTConfig, raw.get("stt", {}), "stt"),
         context=_section(ContextConfig, raw.get("context", {}), "context"),
-        gate=_section(GateConfig, raw.get("gate", {}), "gate"),
+        gate=_section(GateConfig, gate_values, "gate"),
         merge=_section(MergeConfig, raw.get("merge", {}), "merge"),
         answer=_section(AnswerConfig, raw.get("answer", {}), "answer"),
         ui=_section(UIConfig, raw.get("ui", {}), "ui"),

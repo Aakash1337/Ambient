@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from ambientqa.config import default_config, load_config
+from ambientqa.config import default_config, load_config, validate_config
 
 
 def test_defaults_match_spec() -> None:
@@ -15,6 +15,8 @@ def test_defaults_match_spec() -> None:
     assert config.audio.max_utterance_s == 20.0
     assert config.stt.model == "large-v3-turbo"
     assert config.stt.device == "cuda"
+    assert config.stt.vad_filter is True
+    assert config.stt.profile_hints is False
     assert config.context.profile == ""
     assert config.context.enabled is True
     assert config.gate.model == "gemma4:e2b"
@@ -30,6 +32,7 @@ def test_defaults_match_spec() -> None:
     assert config.answer.max_concurrent == 4
     assert config.answer.verify == "off"
     assert config.answer.sweep == "always"
+    assert config.answer.sweep_max_age_s == 60.0
     assert config.gate.max_concurrent == 3
     assert config.answer.answer_timeout_s == 45.0
     # Your own channel answers direct questions but never has its narration
@@ -37,6 +40,39 @@ def test_defaults_match_spec() -> None:
     assert config.gate.channel_policy == {"mic": "explicit", "sys": "full"}
     assert config.answer.style == "cue"
     assert config.audio.silent_source_warn_s == 45.0
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:11434/api/chat",
+        "http://192.168.1.20:11434/api/chat",
+        "https://127.0.0.1:11434/api/chat",
+        "http://127.0.0.1:11434/other",
+        "http://user:pass@127.0.0.1:11434/api/chat",
+    ],
+)
+def test_ollama_url_must_be_literal_loopback_http(url: str) -> None:
+    config = default_config()
+    config.gate.ollama_url = url
+    with pytest.raises(ValueError, match="gate.ollama_url"):
+        validate_config(config)
+
+
+def test_managed_ollama_environment_overrides_file_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "ambient.toml"
+    config_path.write_text(
+        '[gate]\nollama_url = "http://127.0.0.1:11434/api/chat"\n'
+    )
+    monkeypatch.setenv(
+        "AMBIENTQA_OLLAMA_URL", "http://127.0.0.1:49199/api/chat"
+    )
+
+    assert load_config(config_path).gate.ollama_url == (
+        "http://127.0.0.1:49199/api/chat"
+    )
 
 
 def test_knowledge_defaults_are_opt_in_and_safe() -> None:
@@ -47,6 +83,7 @@ def test_knowledge_defaults_are_opt_in_and_safe() -> None:
     assert knowledge.min_query_words == 3
     assert knowledge.ground_on_miss is True
     assert knowledge.retrieve_k == 3
+    assert knowledge.grounding_threshold == 0.30
 
 
 def test_knowledge_section_loads_over_defaults(tmp_path: Path) -> None:
@@ -58,7 +95,8 @@ def test_knowledge_section_loads_over_defaults(tmp_path: Path) -> None:
         "hit_threshold = 0.7\n"
         "min_query_words = 5\n"
         "ground_on_miss = false\n"
-        "retrieve_k = 2\n",
+        "retrieve_k = 2\n"
+        "grounding_threshold = 0.3\n",
         encoding="utf-8",
     )
     knowledge = load_config(path).knowledge
@@ -68,6 +106,7 @@ def test_knowledge_section_loads_over_defaults(tmp_path: Path) -> None:
     assert knowledge.min_query_words == 5
     assert knowledge.ground_on_miss is False
     assert knowledge.retrieve_k == 2
+    assert knowledge.grounding_threshold == 0.3
 
 
 @pytest.mark.parametrize("threshold", [-0.1, 1.5])
@@ -84,6 +123,24 @@ def test_knowledge_rejects_zero_min_query_words(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text("[knowledge]\nmin_query_words = 0\n", encoding="utf-8")
     with pytest.raises(ValueError, match="min_query_words"):
+        load_config(path)
+
+
+def test_knowledge_rejects_out_of_range_grounding_threshold(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[knowledge]\ngrounding_threshold = 1.1\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="grounding_threshold"):
+        load_config(path)
+
+
+def test_answer_rejects_nonpositive_sweep_age(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("[answer]\nsweep_max_age_s = 0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="sweep_max_age_s"):
         load_config(path)
 
 
@@ -216,6 +273,13 @@ def test_rejects_invalid_feed_direction(tmp_path: Path) -> None:
         load_config(path)
 
 
+def test_rejects_nonpositive_status_interval(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("[ui]\nstatus_interval_s = 0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="status_interval_s"):
+        load_config(path)
+
+
 def test_audio_backend_defaults_to_auto_and_loads_explicit_values(
     tmp_path: Path,
 ) -> None:
@@ -258,6 +322,19 @@ def test_platform_overlay_inherits_and_overrides_shared_config(tmp_path: Path) -
     assert config.audio.frame_ms == 30
     assert config.stt.model == "small"
     assert config.stt.device == "cpu"
+
+
+def test_shipped_macos_overlay_starts_general_and_cpu_only() -> None:
+    config = load_config(Path(__file__).parents[1] / "config.macos.toml")
+
+    assert config.audio.mic_device == ""
+    assert config.audio.output_device == ""
+    assert config.stt.device == "cpu"
+    assert config.stt.profile_hints is False
+    assert config.context.profile == ""
+    # With no active profile and an empty fallback path no pack loads, but the
+    # feature stays enabled so selecting a profile can activate its own pack.
+    assert config.knowledge.enabled is True
 
 
 def test_config_overlay_rejects_missing_base_and_cycles(tmp_path: Path) -> None:

@@ -52,6 +52,12 @@ queue_size = 12
 # matches against the transcript. Pin English for English-only sessions; clear
 # it only if a session genuinely mixes languages.
 language = "en"
+# Retain Faster-Whisper's VAD after streaming segmentation so residual silence
+# and hold music do not become hallucinated text.
+vad_filter = true
+# Domain hints can bias unrelated speech into profile terms. Enable only for a
+# tightly scoped session whose audio is known to match the selected profile.
+profile_hints = false
 # Discarded when the normalized transcript EXACTLY equals an entry (never a
 # prefix -- prefix matching ate real openers like "Thank you. So, tell me...").
 # List the full utterances Whisper hallucinates on silence.
@@ -77,10 +83,11 @@ profile = "profiles/aws-security-architect.md"
 # whose ## entries are anticipated questions with ready-to-read cue-card answers.
 # When enabled, a gated question is matched against the pack first: a strong
 # match is answered VERBATIM in milliseconds with no `claude -p` call at all
-# (total latency is then just the ~0.9s gate), and a weak match falls through to
-# the live model with the closest entries injected as authoritative reference so
-# even the miss is faster and better grounded. Off by default; the pack must
-# match the active profile to be useful. Loaded once at startup.
+# (total latency is then just the ~0.9s gate). A miss goes live; grounding is
+# added only for an authored phrasing with the same normalized subject and a
+# compatible question intent, never from merely nearby lexical overlap.
+# Enabled for shipped profile packs;
+# the pack must match the active profile to be useful and reloads on a switch.
 enabled = true
 # Fallback pack directory, resolved relative to this config file. A profile's
 # own "## Knowledge" path overrides this, so each profile carries its own pack
@@ -88,19 +95,21 @@ enabled = true
 # to give profiles that declare no pack no cache at all. The AWS Security
 # Architect profile points at knowledge/aws-security-architect itself.
 path = ""
-# Minimum match score (0..1) to answer verbatim from the pack. Higher = fewer,
-# safer cache hits; a miss is always answered live, so err high. 0.66 was chosen
-# after a dense pack produced a borderline 0.62 false-positive (an MFA question
-# matched an IAM Roles Anywhere entry); 0.66 trims that band while losing no
-# genuine paraphrase hits measured against the drill set.
+# Minimum lexical score (0..1) after cache-specific safety checks. Every verbatim
+# hit requires the query's normalized content-token set to exactly match one
+# human-authored canonical question or alias; ambiguous answers fall through live.
+# The score is a secondary ranking guard, not permission for a broad query to
+# subset-match a narrow entry.
 hit_threshold = 0.66
 # Never answer a shorter question from cache: a tiny fragment overlaps too many
 # entries by accident. Counts raw words, so "What is GuardDuty?" (3) still hits.
 min_query_words = 3
-# On a miss, inject up to retrieve_k closest entries into the live prompt as
-# reference. Set ground_on_miss = false to leave live answers exactly as before.
+# On a miss, inject up to retrieve_k intent-compatible exact-subject entries.
+# Set ground_on_miss = false to leave live answers exactly as before.
 ground_on_miss = true
 retrieve_k = 3
+# Secondary score floor after exact-subject and intent checks.
+grounding_threshold = 0.30
 
 [gate]
 # The gate prompt was engineered against gemma4:e2b; qwen2.5:3b (the earlier
@@ -183,6 +192,7 @@ context_turns = 6
 # model, so a genuine first-pass miss still has the promised second chance.
 verify = "off"
 sweep = "always"
+sweep_max_age_s = 60.0
 queue_size = 16
 
 [tts]

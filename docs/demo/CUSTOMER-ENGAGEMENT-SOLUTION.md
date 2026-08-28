@@ -33,7 +33,8 @@ work required for the MVP and long-term platform.
 > **Scope boundary:** The current repository is a single-seat desktop agent-assist prototype. It
 > captures microphone and system audio, transcribes locally, detects information-seeking
 > utterances, generates contextual answer cards, writes local session logs, and can play TTS on
-> Linux. It does not currently provide telephony, web chat, SMS/email/social messaging, customer
+> Linux or the Apple-Silicon Mac release candidate. It does not currently provide telephony, web
+> chat, SMS/email/social messaging, customer
 > identity resolution, durable cross-channel history, lead qualification, scheduling, CRM
 > actions, live transfer, an admin/reporting portal, multitenancy, or production APIs. Those are
 > target-platform requirements and roadmap items, not claims about the demo.
@@ -149,9 +150,11 @@ The current demo can show:
 - Local speech transcription with automatic device handling and health warnings
 - Detection of explicit questions, indirect information requests, and command-style asks
 - Short current-session follow-up handling using recent transcript and answer context
-- Switchable local Markdown profiles for topic, background, and transcription vocabulary
-- Concise answer cards and optional local Linux speech output
-- Answer audit, missed-question recovery, and labelled gate evaluation
+- Switchable local Markdown profiles for topic/background and optional transcription vocabulary
+  hints (the STT hints are off by default)
+- Concise answer cards and optional local speech output on Linux or the supported Apple-Silicon
+  Mac release candidate
+- Optional answer audit, missed-question recovery, and labelled gate evaluation
 - Local JSONL transcripts, decision reasons, answer status, latency, and replay
 
 It cannot currently answer or originate telephone calls, route generated speech into a call,
@@ -174,8 +177,10 @@ The live presentation should stay focused on capabilities that actually exist:
   demonstrates context assembly inside one live conversation—not persistent customer memory.
 - **Guided response generation:** a concise answer uses the active local context profile. This is
   prompt/context engineering—not a managed enterprise knowledge base.
-- **Optional voice response:** the Linux prototype can speak configured answers locally. This
-  demonstrates TTS and self-hearing controls—not production telephony or full-duplex Voice AI.
+- **Optional voice response:** Linux can play configured answers through `paplay`; the supported
+  Apple-Silicon Mac release candidate uses CoreAudio and its setup validates an `espeak-ng`
+  fallback. The Mac voice path still needs real-hardware acceptance. This demonstrates TTS and
+  self-hearing controls—not production telephony or full-duplex Voice AI.
 - **Audit and recovery:** answers can be reviewed, missed questions recovered, and sessions
   replayed. This demonstrates evaluation, observability, and correction—not business analytics.
 
@@ -209,10 +214,11 @@ demo proves end-to-end automation.” Prefer precise language: “we have implem
 
 ## Current Demo, Recommended MVP, and Target Platform
 
-- **Channels** — Current: desktop call audio, answer cards, and optional local Linux TTS, without
-  call control. MVP: inbound AI voice, website chat, transactional SMS, and optional consented
-  callbacks/reminders. Target: voice, web, SMS, email, supported messaging, mobile apps, and future
-  API-connected channels.
+- **Channels** — Current: desktop call audio, answer cards, and optional local Linux or
+  Apple-Silicon macOS TTS, without call control; the Mac path remains a real-hardware-unvalidated
+  release candidate. MVP: inbound AI voice, website chat, transactional SMS, and optional
+  consented callbacks/reminders. Target: voice, web, SMS, email, supported messaging, mobile apps,
+  and future API-connected channels.
 - **Identity and continuity** — Current: short in-process context and unidentified local logs.
   MVP: a persistent customer profile and timeline linked by verified phone, email, CRM ID, or
   session. Target: governed continuity across channels, devices, and employees.
@@ -415,9 +421,13 @@ The proposal requires enterprise controls from the start:
   regression, security patching, cost and latency tuning, capacity planning, disaster-recovery
   tests, and customer support.
 
-Current privacy should be stated precisely: raw audio, transcription, and the first question gate
-run locally, but accepted question text and a bounded context window reach the configured external
-answer model. Local session logs are plaintext and have no enterprise access or retention layer.
+Current privacy should be stated precisely: raw audio, transcription, and the primary question gate
+run locally, but primary answers send the accepted turn, recent transcript, Q&A/dialogue history,
+active profile context, and grounding to Claude. The default missed-question sweep also sends
+rejected candidates with wider context; optional verification sends the raw transcription,
+delivered answer, history/profile/grounding, and WebSearch can create outbound queries. Local
+session logs are plaintext and have no enterprise access or retention layer. Every participant must
+consent to capture, transcription, local logging, and external text processing before use.
 
 ## AI Model Strategy
 

@@ -38,7 +38,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 import numpy as np
 
@@ -381,7 +381,8 @@ class EspeakEngine:
 
     def synthesize(self, text: str) -> bytes:
         result = subprocess.run(
-            ["espeak-ng", "--stdout", "-s", str(self._wpm), "--", text],
+            ["espeak-ng", "--stdout", "-s", str(self._wpm), "--stdin"],
+            input=text.encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             check=True,
@@ -482,15 +483,20 @@ class _CoreAudioPlayer:
             from .backends.macos import _sounddevice_module
 
             sounddevice_module = _sounddevice_module()
+        stream: Any | None = None
         try:
-            self._stream = sounddevice_module.RawOutputStream(
+            stream = sounddevice_module.RawOutputStream(
                 samplerate=sample_rate,
                 channels=1,
                 dtype="int16",
             )
-            self._stream.start()
+            stream.start()
         except Exception as exc:
+            if stream is not None:
+                with suppress(Exception):
+                    stream.close()
             raise RuntimeError(f"Unable to open the CoreAudio output: {exc}") from exc
+        self._stream = stream
         self.stdin: PlayerInput | None = self
         self._state_lock = threading.Lock()
         self._done = threading.Event()
@@ -536,13 +542,25 @@ class _CoreAudioPlayer:
                 return
             self._closing = True
         try:
-            action = (
-                getattr(self._stream, "abort", None)
-                if abort
-                else getattr(self._stream, "stop", None)
-            )
+            stop = getattr(self._stream, "stop", None)
+            action = getattr(self._stream, "abort", None) if abort else stop
             if callable(action):
-                action()
+                try:
+                    try:
+                        action(ignore_errors=False)
+                    except TypeError:
+                        action()
+                except Exception:
+                    # PortAudio abort is the preferred immediate unblock, but
+                    # an output driver may reject it while still accepting a
+                    # normal stop. Cleanup must remain best-effort and must not
+                    # strand the feeder thread.
+                    if not abort or not callable(stop):
+                        raise
+                    try:
+                        stop(ignore_errors=False)
+                    except TypeError:
+                        stop()
         finally:
             with suppress(Exception):
                 self._stream.close()

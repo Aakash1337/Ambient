@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from ambientqa.knowledge import (
     KnowledgeIndex,
+    _TOKEN_RE,
     _content_tokens,
     _parse_entries,
     load_pack,
@@ -88,6 +91,22 @@ def test_alias_drives_a_match_the_canonical_would_miss() -> None:
     assert hit.entry.question.startswith("What is the difference")
 
 
+def test_unclassified_exact_authored_phrasings_remain_cacheable() -> None:
+    raw = """# Scenarios
+
+## Design a keyless deployment pipeline.
+Aliases: keyless deployment design
+Use OIDC federation and short-lived credentials.
+"""
+    index = _index(raw)
+    canonical = index.lookup(
+        "Design a keyless deployment pipeline!", threshold=0.5, min_words=3
+    )
+    alias = index.lookup("keyless deployment design", threshold=0.5, min_words=3)
+    assert canonical is not None
+    assert alias is not None
+
+
 def test_ambiguous_near_tie_between_different_answers_is_rejected() -> None:
     raw = """# Duplicated topic
 
@@ -131,11 +150,209 @@ Note: it is region-scoped.
     assert "Note: it is region-scoped." in entries[0].answer
 
 
-def test_grounding_returns_top_k_reference_blocks() -> None:
+def test_grounding_returns_exact_reference_blocks() -> None:
     index = _index(IAM_DOC)
-    grounded = index.grounding("iam role permission boundary", k=2)
-    assert len(grounded) == 2
+    grounded = index.grounding("IAM users versus roles", k=2)
+    assert len(grounded) == 1
     assert all(block.startswith("Q: ") and "\nA: " in block for block in grounded)
+
+
+def test_grounding_excludes_matches_below_the_minimum_score() -> None:
+    index = _index(IAM_DOC)
+    assert index.grounding("cafeteria role", k=3, min_score=0.5) == []
+    assert index.grounding("iam role permission boundary", k=1, min_score=0.2) == []
+    assert index.grounding("IAM users versus roles", k=1, min_score=0.2)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What is the role of a product manager?",
+        "What is identity in philosophy?",
+        "Can you explain retrieval evaluation?",
+        "What is an AWS role?",
+        "What is a security role?",
+        "What is the difference between these two?",
+    ],
+)
+def test_grounding_rejects_single_generic_word_overlap(query: str) -> None:
+    index = _index(IAM_DOC)
+    assert index.grounding(query, k=3, min_score=0.2) == []
+
+
+def test_grounding_preserves_one_token_exact_domain_term() -> None:
+    index = _index("# IAM\n\n## What is IAM?\nIAM manages identities.\n")
+    grounded = index.grounding("What is IAM?", k=1, min_score=0.3)
+    assert grounded and "manages identities" in grounded[0]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What is the first one?",
+        "What is different about the first one?",
+        "How does the first one work?",
+        "Which one should I use?",
+    ],
+)
+def test_shipped_pack_does_not_ground_unresolved_referents(query: str) -> None:
+    pack = load_pack(
+        Path(__file__).parents[1] / "knowledge" / "aws-security-architect"
+    )
+    assert pack.grounding(query, k=3, min_score=0.3) == []
+
+
+def test_shipped_pack_single_term_grounding_does_not_add_tangents() -> None:
+    pack = load_pack(
+        Path(__file__).parents[1] / "knowledge" / "aws-security-architect"
+    )
+    grounded = pack.grounding("What is IAM?", k=3, min_score=0.3)
+    assert [block.splitlines()[0] for block in grounded] == ["Q: What is IAM?"]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What is an IAM role?",
+        "What is a security group?",
+        "What is OIDC?",
+        "How do IAM permissions work?",
+        "How do IAM policies work?",
+        "Explain access control.",
+        "Tell me about role based access control.",
+    ],
+)
+def test_shipped_pack_generic_or_conflicting_queries_are_never_cached(
+    query: str,
+) -> None:
+    pack = load_pack(
+        Path(__file__).parents[1] / "knowledge" / "aws-security-architect"
+    )
+    assert pack.lookup(query, threshold=0.66, min_words=3) is None
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "How do you block public access?",
+        "How do I delete a KMS key?",
+    ],
+)
+def test_shipped_pack_broad_queries_cannot_subset_match_cache(query: str) -> None:
+    pack = load_pack(
+        Path(__file__).parents[1] / "knowledge" / "aws-security-architect"
+    )
+    assert pack.lookup(query, threshold=0.66, min_words=3) is None
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What is consulting?",
+        "What is an incident?",
+        "What is HIPAA?",
+        "What is background?",
+        "What is the best?",
+        "Could you tell me what HIPAA is?",
+        "Can you tell me what HIPAA is?",
+        "Please tell me what HIPAA is.",
+        "Would you tell me about HIPAA?",
+        "Does HIPAA work?",
+        "Could consulting work?",
+        "Can you tell me about consulting?",
+        "May HIPAA work?",
+        "Might HIPAA work?",
+        "Shall HIPAA work?",
+        "Was HIPAA?",
+        "Were HIPAA?",
+        "May we use HIPAA?",
+        "Shall we use HIPAA?",
+        "HIPAA, can you explain?",
+        "HIPAA, what is it?",
+        "HIPAA? What does that mean?",
+        "Consulting: what does that mean?",
+        "Incident, what is that?",
+        "Just tell me HIPAA please.",
+        "How does an incident work?",
+        "How do incidents work?",
+        "Does best work?",
+        "Which KMS key should I use?",
+        "Which role should I use?",
+        "Which PrivateLink should I use?",
+    ],
+)
+def test_shipped_pack_rejects_intent_collisions_and_unresolved_choices(
+    query: str,
+) -> None:
+    pack = load_pack(
+        Path(__file__).parents[1] / "knowledge" / "aws-security-architect"
+    )
+    assert pack.lookup(query, threshold=0.66, min_words=3) is None
+    assert pack.grounding(query, k=3, min_score=0.3) == []
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What is role based access control?",
+        "What is Kubernetes RBAC?",
+        "What does public access mean?",
+        "What is key based access control?",
+    ],
+)
+def test_shipped_pack_conflicting_or_broad_queries_are_never_grounded(
+    query: str,
+) -> None:
+    pack = load_pack(
+        Path(__file__).parents[1] / "knowledge" / "aws-security-architect"
+    )
+    assert pack.grounding(query, k=3, min_score=0.3) == []
+
+
+def test_shipped_pack_abac_alias_grounds_the_correct_entry() -> None:
+    pack = load_pack(
+        Path(__file__).parents[1] / "knowledge" / "aws-security-architect"
+    )
+    grounded = pack.grounding(
+        "What is attribute based access control?", k=3, min_score=0.3
+    )
+    assert len(grounded) == 1
+    assert "Attribute-based access control" in grounded[0]
+
+
+def test_shipped_pack_still_caches_exact_subject_and_alias_phrasings() -> None:
+    pack = load_pack(
+        Path(__file__).parents[1] / "knowledge" / "aws-security-architect"
+    )
+    iam = pack.lookup("What is IAM?", threshold=0.66, min_words=3)
+    roles = pack.lookup(
+        "IAM users versus roles", threshold=0.66, min_words=3
+    )
+    assert iam is not None and iam.entry.question == "What is IAM?"
+    assert roles is not None and "IAM role instead of an IAM user" in roles.entry.question
+    incident = pack.lookup(
+        "Walk me through an incident", threshold=0.66, min_words=3
+    )
+    assert incident is not None
+    assert "security incident you led" in incident.entry.question
+
+
+def test_shipped_authored_phrasings_never_resolve_to_a_different_answer() -> None:
+    pack = load_pack(
+        Path(__file__).parents[1] / "knowledge" / "aws-security-architect"
+    )
+    hits = 0
+    for entry in pack.entries:
+        for phrasing in (entry.question, *entry.aliases):
+            if len(_TOKEN_RE.findall(phrasing)) < 3:
+                continue
+            hit = pack.lookup(phrasing, threshold=0.66, min_words=3)
+            if hit is None:
+                # Ambiguous or intentionally fail-closed phrasings go live.
+                continue
+            hits += 1
+            assert hit.entry.answer == entry.answer, phrasing
+    assert hits > 1000
 
 
 def test_malformed_entries_are_skipped_not_fatal() -> None:

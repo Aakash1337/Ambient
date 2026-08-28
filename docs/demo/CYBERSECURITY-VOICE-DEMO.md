@@ -6,14 +6,21 @@ use of vulnerability sources.
 
 ## Before the audience arrives
 
-1. Launch **Ambient** from the app menu.
+1. On the validated Linux demo host, launch **Ambient** from the app menu. On supported
+   Apple-Silicon macOS 14+, use
+   `./run-macos.sh --web --voice`; do not present the Mac build until its real-hardware checklist
+   and latency rehearsal pass.
 2. Choose **Web Console**, then **Web Voice**.
 3. Confirm the profile is **Cybersecurity analytics**.
 4. Under **Interaction**, select **Agent**. Wait for Ambient's opening greeting to finish.
 5. Select **Conversational** delivery and confirm the header says **VOICE ON**.
-6. Wait for **Whisper ready on cuda** before speaking. CPU fallback works, but it is
-   slower; for the smoothest demo, close competing GPU-heavy applications and
-   relaunch Ambient if startup reports a CPU fallback.
+6. Wait for Whisper's actual ready state before speaking. The NVIDIA Windows/Linux target should
+   report **cuda**; macOS should report **cpu/int8** because CTranslate2 has no Metal backend.
+   CPU on Mac is expected, not a fallback, and its live latency is not yet documented.
+
+Use only synthetic or explicitly authorized demo speech. Ambient keeps raw audio/STT/gating local,
+but sends transcript-derived context to Claude for Agent replies and may store plaintext local
+JSONL. Obtain every participant's consent for transcription, logging, and external processing.
 
 Ask every question through the microphone. Ambient speaks only answers to the mic
 channel by default. Wait until the complete spoken answer finishes, then leave about

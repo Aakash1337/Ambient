@@ -2,7 +2,7 @@
 .venv/
 .venv-linux/
 .venv-macos/
-# Voice model binaries (~340 MB); the platform launcher fetches them on first --voice launch.
+# Local model binaries: pinned Whisper (~1.6 GB) and optional voice (~340 MB).
 models/
 __pycache__/
 *.pyc
@@ -13,3 +13,5 @@ __pycache__/
 # you want history backed up to the private repo.
 logs/
 *.jsonl
+# Cross-process config transaction locks are local runtime state.
+.*.ambientqa.lock

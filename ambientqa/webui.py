@@ -25,9 +25,11 @@ import json
 import logging
 import queue
 import re
+import secrets
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import OrderedDict, deque
 from contextlib import suppress
@@ -56,6 +58,16 @@ _MAX_DECISIONS = 100
 # navigates away mid-pick would leave the app deaf, so the picker self-closes
 # unless the page keeps pinging.
 _DEVICE_PICKER_TTL_S = 30.0
+
+# Commands can stop capture, change profiles, and shut the application down.
+# Keep their body deliberately small and require a per-process browser token;
+# binding to loopback alone does not prevent cross-site POSTs or DNS rebinding.
+_MAX_COMMAND_BYTES = 64 * 1024
+_ACCESS_HEADER = "X-Ambient-Access-Token"
+_ACCESS_QUERY = "access"
+_ACCESS_PLACEHOLDER = b"__AMBIENT_ACCESS_TOKEN__"
+_CSRF_HEADER = "X-Ambient-CSRF-Token"
+_CSRF_PLACEHOLDER = b"__AMBIENT_CSRF_TOKEN__"
 
 
 def _json_bytes(payload: Any) -> bytes:
@@ -117,6 +129,12 @@ class WebUIApp:
         self.open_browser = open_browser
         self.hub = EventHub()
         self.is_running = False
+        # Loopback is shared by every local OS user. This separate capability
+        # protects transcripts and controls from unrelated local processes;
+        # CSRF remains a second, browser-session-specific command boundary.
+        self._access_token = secrets.token_urlsafe(32)
+        self._csrf_token = secrets.token_urlsafe(32)
+        self._loop_state_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread_id: int | None = None
         self._exit_event: asyncio.Event | None = None
@@ -190,10 +208,14 @@ class WebUIApp:
     def _wait_until_ready(self, timeout_s: float = 5.0) -> bool:
         """Confirm this exact service is answering before opening a browser."""
         health_url = f"http://{self.host}:{self.port}/api/health"
+        # A loopback identity probe must go straight to the socket we just
+        # bound. Environment HTTP_PROXY settings could otherwise route it to a
+        # different service and produce a false-positive browser launch.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             try:
-                with urllib.request.urlopen(health_url, timeout=0.25) as response:
+                with opener.open(health_url, timeout=0.25) as response:
                     payload = json.loads(response.read())
                 if (
                     response.status == 200
@@ -217,29 +239,50 @@ class WebUIApp:
     # ------------------------------------------------------------------ #
 
     def exit(self, *args: Any, **kwargs: Any) -> None:
-        loop, event = self._loop, self._exit_event
-        if loop is None or event is None:
+        with self._loop_state_lock:
+            loop, event = self._loop, self._exit_event
+            loop_thread_id = self._loop_thread_id
+        if loop is None or event is None or loop.is_closed():
             return
-        if threading.get_ident() == self._loop_thread_id:
+        if threading.get_ident() == loop_thread_id:
             event.set()
         else:
-            loop.call_soon_threadsafe(event.set)
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                # The loop may close between the snapshot and the call. Exit is
+                # idempotent, so a completed shutdown needs no further action.
+                if not loop.is_closed():
+                    raise
 
     def call_from_thread(self, fn: Callable[..., Any], *args: Any) -> None:
-        loop = self._loop
-        if loop is None:
+        with self._loop_state_lock:
+            loop = self._loop
+        if loop is None or loop.is_closed():
             fn(*args)
         else:
-            loop.call_soon_threadsafe(fn, *args)
+            try:
+                loop.call_soon_threadsafe(fn, *args)
+            except RuntimeError:
+                if not loop.is_closed():
+                    raise
+                fn(*args)
 
     def call_later(self, fn: Callable[..., Any], *args: Any) -> None:
-        loop = self._loop
-        if loop is None:
+        with self._loop_state_lock:
+            loop = self._loop
+            loop_thread_id = self._loop_thread_id
+        if loop is None or loop.is_closed():
             fn(*args)
-        elif threading.get_ident() == self._loop_thread_id:
+        elif threading.get_ident() == loop_thread_id:
             loop.call_soon(fn, *args)
         else:
-            loop.call_soon_threadsafe(fn, *args)
+            try:
+                loop.call_soon_threadsafe(fn, *args)
+            except RuntimeError:
+                if not loop.is_closed():
+                    raise
+                fn(*args)
 
     def notify(self, message: str, **_kwargs: Any) -> None:
         self.hub.publish({"type": "notify", "message": str(message), "ts": time.time()})
@@ -328,21 +371,33 @@ class WebUIApp:
         self.hub.publish({"type": "answer", **payload})
 
     async def run_async(self) -> None:
-        self._loop = asyncio.get_running_loop()
-        self._loop_thread_id = threading.get_ident()
-        self._exit_event = asyncio.Event()
-        self.is_running = True
+        loop = asyncio.get_running_loop()
+        exit_event = asyncio.Event()
+        with self._loop_state_lock:
+            self._loop = loop
+            self._loop_thread_id = threading.get_ident()
+            self._exit_event = exit_event
+            self.is_running = True
         self._server_thread = threading.Thread(
             target=self._server.serve_forever,
             name="ambientqa-web-server",
             daemon=True,
         )
         self._server_thread.start()
-        url = f"http://{self.host}:{self.port}"
+        base_url = f"http://{self.host}:{self.port}"
+        capability_url = (
+            f"{base_url}/?{_ACCESS_QUERY}="
+            f"{urllib.parse.quote(self._access_token, safe='')}"
+        )
         # In web mode the terminal is not owned by Textual, so this is
         # actually readable — it is the one line the user needs.
-        print(f"Ambient web console: {url}  (Ctrl+C or the console's Quit to stop)")
-        log.info("web console listening on %s", url)
+        print(
+            "Ambient web console: "
+            f"{capability_url}  (Ctrl+C or the console's Quit to stop)"
+        )
+        # Never put the capability in logs: log files can have a wider reader
+        # set than the launching terminal and browser profile.
+        log.info("web console listening on %s (capability URL issued)", base_url)
         if self.open_browser:
             # Launched from the mode picker / app menu there is no visible
             # terminal to copy the URL from. webbrowser shells out (xdg-open)
@@ -352,39 +407,58 @@ class WebUIApp:
                 import webbrowser
 
                 if not self._wait_until_ready():
-                    message = (
+                    log.error(
                         "Web console started but did not become ready; open "
-                        f"{url} after checking logs/ambientqa.log"
+                        "the capability URL printed in the terminal after checking logs"
                     )
-                    log.error(message)
-                    print(message)
+                    print(
+                        "Web console started but did not become ready; open "
+                        f"{capability_url} after checking logs/ambientqa.log"
+                    )
                     return
                 try:
-                    opened = webbrowser.open(url)
+                    opened = webbrowser.open(capability_url)
                     if opened is False:
-                        message = f"Could not open the browser automatically; open {url}"
-                        log.warning(message)
-                        print(message)
+                        log.warning("could not open the browser automatically")
+                        print(
+                            "Could not open the browser automatically; open "
+                            f"{capability_url}"
+                        )
                 except Exception as exc:
                     log.exception("could not open a browser for the web console")
-                    print(f"Could not open the browser automatically ({exc}); open {url}")
+                    print(
+                        f"Could not open the browser automatically ({exc}); open "
+                        f"{capability_url}"
+                    )
 
             threading.Thread(
                 target=_open, name="ambientqa-web-open-browser", daemon=True
             ).start()
-        self._status_task = asyncio.create_task(self._status_loop())
+        status_task = asyncio.create_task(self._status_loop())
+        self._status_task = status_task
         try:
-            await self._exit_event.wait()
+            await exit_event.wait()
         finally:
-            self.is_running = False
-            if self._status_task is not None:
-                self._status_task.cancel()
+            try:
+                status_task.cancel()
                 with suppress(asyncio.CancelledError):
-                    await self._status_task
-            await self._devices_close(None)
-            self.hub.publish({"type": "shutdown", "ts": time.time()})
-            await asyncio.to_thread(self._server.shutdown)
-            self._server.server_close()
+                    await status_task
+                await self._devices_close(None)
+                self.hub.publish({"type": "shutdown", "ts": time.time()})
+                await asyncio.to_thread(self._server.shutdown)
+                self._server.server_close()
+            finally:
+                # Clear every loop-owned handle before run_async returns. A
+                # second exit/callback after shutdown must never target the
+                # event loop that the caller is about to close.
+                with self._loop_state_lock:
+                    self.is_running = False
+                    self._loop = None
+                    self._loop_thread_id = None
+                    self._exit_event = None
+                    self._status_task = None
+                    self._meter_task = None
+                    self._server_thread = None
 
     # ------------------------------------------------------------------ #
     # Status heartbeat.
@@ -777,9 +851,23 @@ def _build_handler(app: WebUIApp) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
+        def _request_path(self) -> str:
+            # Query strings may carry the console capability for index/SSE.
+            # They must never reach request or exception logs.
+            return self.path.partition("?")[0]
+
         # Silence per-request stderr noise; failures go to the module log.
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-            log.debug("web: " + format, *args)
+            log.debug("web: %s %s", self.command, self._request_path())
+
+        def _send_security_headers(self) -> None:
+            # A hostile page must not embed the live console and place its own
+            # controls over Ambient's buttons to turn same-origin UI clicks
+            # into authenticated commands.
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
 
         def _send_json(self, payload: Any, status: int = 200) -> None:
             body = _json_bytes(payload)
@@ -787,6 +875,7 @@ def _build_handler(app: WebUIApp) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(body)
 
@@ -797,23 +886,86 @@ def _build_handler(app: WebUIApp) -> type[BaseHTTPRequestHandler]:
             except OSError:
                 self._send_json({"error": "not found"}, 404)
                 return
+            if name == "index.html":
+                body = body.replace(
+                    _ACCESS_PLACEHOLDER, app._access_token.encode("ascii")
+                ).replace(_CSRF_PLACEHOLDER, app._csrf_token.encode("ascii"))
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(body)
 
+        def _host_allowed(self) -> bool:
+            host = (self.headers.get("Host") or "").casefold()
+            authorities = {
+                f"127.0.0.1:{app.port}",
+                f"localhost:{app.port}",
+            }
+            if app.port == 80:
+                authorities.update({"127.0.0.1", "localhost"})
+            return host in authorities
+
+        def _origin_allowed(self) -> bool:
+            origin = self.headers.get("Origin")
+            if origin is None:
+                # Non-browser clients may omit Origin, but still need the
+                # unguessable token. Browsers send Origin for command POSTs.
+                return True
+            host = (self.headers.get("Host") or "").casefold()
+            return origin.casefold() == f"http://{host}"
+
+        def _reject_untrusted_host(self) -> bool:
+            if self._host_allowed():
+                return False
+            self._send_json({"error": "forbidden"}, 403)
+            return True
+
+        def _access_allowed(self, *, allow_query: bool = False) -> bool:
+            candidates = [self.headers.get(_ACCESS_HEADER) or ""]
+            if allow_query:
+                try:
+                    values = urllib.parse.parse_qs(
+                        self.path.partition("?")[2],
+                        keep_blank_values=True,
+                        max_num_fields=20,
+                    ).get(_ACCESS_QUERY, [])
+                except ValueError:
+                    values = []
+                # Reject duplicate capability parameters rather than letting
+                # proxies and clients disagree over which value is effective.
+                if len(values) == 1:
+                    candidates.append(values[0])
+            expected = app._access_token.encode("ascii")
+            return any(
+                secrets.compare_digest(candidate.encode("utf-8"), expected)
+                for candidate in candidates
+            )
+
+        def _reject_unauthorized(self, *, allow_query: bool = False) -> bool:
+            if self._access_allowed(allow_query=allow_query):
+                return False
+            self._send_json({"error": "forbidden"}, 403)
+            return True
+
         def do_GET(self) -> None:  # noqa: N802
             try:
-                path = self.path.split("?", 1)[0]
+                if self._reject_untrusted_host():
+                    return
+                path = self._request_path()
                 if path in ("/", "/index.html"):
+                    if self._reject_unauthorized(allow_query=True):
+                        return
                     self._send_static("index.html", "text/html; charset=utf-8")
                 elif path == "/static/app.css":
                     self._send_static("app.css", "text/css; charset=utf-8")
                 elif path == "/static/app.js":
                     self._send_static("app.js", "text/javascript; charset=utf-8")
                 elif path == "/events":
+                    if self._reject_unauthorized(allow_query=True):
+                        return
                     self._serve_events()
                 elif path == "/api/health":
                     self._send_json(
@@ -824,10 +976,16 @@ def _build_handler(app: WebUIApp) -> type[BaseHTTPRequestHandler]:
                         }
                     )
                 elif path == "/api/state":
+                    if self._reject_unauthorized():
+                        return
                     self._send_json(app.snapshot())
                 elif path == "/api/sessions":
+                    if self._reject_unauthorized():
+                        return
                     self._send_json({"sessions": app.list_sessions()})
                 elif path.startswith("/api/session/"):
+                    if self._reject_unauthorized():
+                        return
                     name = path.rsplit("/", 1)[-1]
                     records = app.load_session(name)
                     if records is None:
@@ -839,16 +997,47 @@ def _build_handler(app: WebUIApp) -> type[BaseHTTPRequestHandler]:
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception:
-                log.exception("web request failed: %s", self.path)
+                log.exception("web request failed: %s", self._request_path())
                 with suppress(Exception):
                     self._send_json({"error": "internal error"}, 500)
 
         def do_POST(self) -> None:  # noqa: N802
             try:
-                if self.path.split("?", 1)[0] != "/api/command":
+                if self._reject_untrusted_host():
+                    return
+                if self._request_path() != "/api/command":
                     self._send_json({"error": "not found"}, 404)
                     return
-                length = int(self.headers.get("Content-Length") or 0)
+                if self._reject_unauthorized():
+                    return
+                content_type = (
+                    (self.headers.get("Content-Type") or "")
+                    .split(";", 1)[0]
+                    .strip()
+                    .casefold()
+                )
+                if content_type != "application/json":
+                    self._send_json(
+                        {"ok": False, "error": "application/json required"}, 415
+                    )
+                    return
+                if not self._origin_allowed():
+                    self._send_json({"ok": False, "error": "forbidden"}, 403)
+                    return
+                supplied_token = self.headers.get(_CSRF_HEADER) or ""
+                if not secrets.compare_digest(
+                    supplied_token.encode("utf-8"), app._csrf_token.encode("ascii")
+                ):
+                    self._send_json({"ok": False, "error": "forbidden"}, 403)
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    self._send_json({"ok": False, "error": "bad length"}, 400)
+                    return
+                if length < 0 or length > _MAX_COMMAND_BYTES:
+                    self._send_json({"ok": False, "error": "payload too large"}, 413)
+                    return
                 raw = self.rfile.read(length) if length else b"{}"
                 try:
                     payload = json.loads(raw or b"{}")
@@ -878,6 +1067,7 @@ def _build_handler(app: WebUIApp) -> type[BaseHTTPRequestHandler]:
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Connection", "keep-alive")
+                self._send_security_headers()
                 self.end_headers()
                 hello = {"type": "hello", **app.snapshot()}
                 self.wfile.write(b"data: " + _json_bytes(hello) + b"\n\n")

@@ -110,7 +110,7 @@ def test_agent_answer_is_run_through_courtesy_guard(monkeypatch) -> None:
     class Process:
         returncode = 0
 
-        async def communicate(self):
+        async def communicate(self, input: bytes | None = None):
             return b"Obviously, that's your problem.", b""
 
         def kill(self) -> None:

@@ -3,12 +3,87 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import deque
 from dataclasses import dataclass
 
 from .bus import Transcript
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9']+")
+_DISFLUENCY_REPEAT_WORDS = {
+    "a",
+    "and",
+    "i",
+    "it",
+    "the",
+    "to",
+    "uh",
+    "um",
+    "we",
+    "you",
+}
+_URGENT_REPEAT_WORDS = {"fire", "help", "no", "stop", "wait"}
+_URGENT_SCAFFOLD_WORDS = {"me", "now", "please", "us"}
+
+
+def transcript_quality_reason(text: str) -> str | None:
+    """Return why a transcript is unsafe to use, or ``None`` when plausible.
+
+    This intentionally catches only high-confidence recognition failures.  A
+    transcript that is rejected here is still shown and logged by the
+    controller, but it must not enter conversational context or trigger an
+    answer.  Keeping the detector conservative avoids treating accents, names,
+    code, or legitimate non-English speech as corruption.
+    """
+    compact = text.strip()
+    if not compact:
+        return "empty"
+    if "\ufffd" in compact:
+        return "invalid_unicode"
+
+    tokens = [token.casefold() for token in TOKEN_RE.findall(compact)]
+    meaningful = {
+        token for token in tokens if token not in _DISFLUENCY_REPEAT_WORDS
+    }
+    urgent_content = meaningful - _URGENT_SCAFFOLD_WORDS
+    urgent_only = bool(urgent_content) and urgent_content.issubset(
+        _URGENT_REPEAT_WORDS
+    )
+    if len(tokens) >= 4:
+        run = 1
+        longest_run = 1
+        longest_token = tokens[0]
+        for previous, current in zip(tokens, tokens[1:]):
+            run = run + 1 if current == previous else 1
+            if run > longest_run:
+                longest_run = run
+                longest_token = current
+        if (
+            longest_run >= 4
+            and longest_token
+            not in (_DISFLUENCY_REPEAT_WORDS | _URGENT_REPEAT_WORDS)
+            and meaningful == {longest_token}
+        ):
+            return "repetition_loop"
+        if (
+            len(tokens) >= 12
+            and len(set(tokens)) / len(tokens) < 0.25
+            and not urgent_only
+        ):
+            return "repetition_loop"
+
+    visible = [char for char in compact if not char.isspace()]
+    if len(visible) >= 24 and not urgent_only:
+        ellipsis_runs = compact.count("…") + len(re.findall(r"\.{2,}", compact))
+        if ellipsis_runs >= 6:
+            return "punctuation_noise"
+        punctuation = sum(
+            unicodedata.category(char).startswith(("P", "S")) for char in visible
+        )
+        if punctuation / len(visible) >= 0.38:
+            return "punctuation_noise"
+
+    return None
 
 
 def normalised_tokens(text: str) -> set[str]:

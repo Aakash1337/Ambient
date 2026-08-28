@@ -1,0 +1,8 @@
+# PyAV 16+ wheels require a newer macOS deployment target than the other
+# runtime wheels. Keep the lock usable across supported Apple Silicon systems.
+av==15.1.0
+
+# torchaudio publishes in lockstep with torch and currently caps the supported
+# pair at 2.11 on Apple Silicon CPython 3.11.
+torch==2.11.0
+torchaudio==2.11.0

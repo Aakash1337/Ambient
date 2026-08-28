@@ -1,0 +1,3 @@
+# CI-only dependency-audit tool. Compile this to requirements-audit.txt with
+# hashes; it is not part of Ambient's runtime environment.
+pip-audit==2.10.1

@@ -1,0 +1,23 @@
+* text=auto eol=lf
+
+# Keep launchers and source/config files on portable LF line endings, including
+# when a checkout is copied through an exFAT drive from Windows.
+*.sh text eol=lf
+*.py text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.ps1 text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+*.bin binary
+*.docx binary
+*.onnx binary
+*.pdf binary
+*.pptx binary

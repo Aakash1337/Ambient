@@ -1,5 +1,12 @@
 # Code review — 2026-08-17
 
+> **Historical audit snapshot — not the current release status.** The findings below describe
+> the tree as reviewed on 2026-08-17. The 2026-08-28 Mac release audit subsequently remediated
+> many of them and added regression coverage; their original wording and severity are retained
+> here for provenance, not as claims that those defects remain in the ship tree. Section 0 is a
+> later release-ref correction. Use the current test/CI results and present source—not the stale
+> line numbers or “confirmed” labels below—to decide release readiness.
+
 Review of the full ambientqa codebase (source, tests, scripts, docs, git state), performed by a
 31-agent workflow: 8 parallel reviewers (audio path, gate/answer path, app shell, concurrency,
 security/privacy, design quality, test coverage, doc/code drift) plus a live test run, followed by
@@ -19,14 +26,26 @@ listed as confirmed. 58 raw findings → 55 after dedup → 18 confirmed, 3 refu
 
 ---
 
-## 0. URGENT — private transcripts are in git history; do not push
+## 0. Release refs verified clean of private transcripts
 
-The .gitignore comment claims session recordings 'stay local by default', but 18 logs/session-*.jsonl files (~1 MB of real interview/call transcripts with answers, e.g. logs/session-20260805-204057.jsonl contains verbatim mic speech) were committed in 6fb89ea8 and carried through merge 999c25b9. Commit 97c72257 ('Untrack files covered by .gitignore') only removed them from the index — the blobs remain in history. Verified: `git ls-tree -r 999c25b9` lists all 18 jsonl files, and `git merge-base --is-ancestor 6fb89ea8 main` succeeds, so both commits are ancestors of main. Remote `origin` is https://github.com/Aakash1337/ambientqa (origin/main currently at af6ea4ac, which contains 0 jsonl files). Concrete failure: the next `git push` of main uploads every recorded private conversation to GitHub in perpetuity; untracking does not prevent this. Fix requires history rewrite (git filter-repo / rebase dropping the transcript blobs) before any push.
+The urgent warning in the original review described an older local history; it is **not true of
+the current release branch history**. On 2026-08-28, `HEAD` (`42bb190`), `main` (`18f522e`), and
+`origin/main` (`18f522e`) were checked explicitly. None has a reachable `logs/*.jsonl` path,
+`git ls-files 'logs/*.jsonl'` is empty, and the formerly cited `6fb89ea8` / `999c25b9` commits are
+not ancestors of `HEAD`. A normal push of the audited release branch therefore does not upload
+those transcript blobs.
 
-**Action before any `git push`:** rewrite the three local commits to drop the
-`logs/*.jsonl` blobs (e.g. `git filter-repo --path logs --invert-paths --refs main`, or redo the
-snapshot/merge without `logs/`), and delete or equally rewrite the `local-snapshot` branch, which
-references the same blobs. Untracking alone (commit 97c72257) does **not** remove them from history.
+Keep this as a release gate rather than relying on `.gitignore`, which prevents new tracking but
+cannot sanitize history by itself. Immediately before any public push, run:
+
+```bash
+git ls-files 'logs/*.jsonl'
+git rev-list --objects HEAD main origin/main | rg '(^| )logs/.*\.jsonl$'
+```
+
+Both commands must produce no output. Audit every additional ref before a mirror-style push;
+unrelated local/checkpoint refs or object databases can retain old private blobs even when the
+public branch refs are clean. Do not copy the separate session-audit logs into this repository.
 
 ---
 

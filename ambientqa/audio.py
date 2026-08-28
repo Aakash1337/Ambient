@@ -246,14 +246,36 @@ class AudioCapture:
                 f"sys active: watching {len(loopback_sources)} output endpoints"
             )
         for channel, device, stream in sources:
-            thread = threading.Thread(
-                target=self._capture_source,
-                args=(channel, device, stream, loop, output, self._arbiter, generation),
-                name=f"ambientqa-{channel}-{device.id}",
-                daemon=True,
-            )
-            thread.start()
-            self._threads.append(thread)
+            try:
+                thread = threading.Thread(
+                    target=self._capture_source,
+                    args=(
+                        channel,
+                        device,
+                        stream,
+                        loop,
+                        output,
+                        self._arbiter,
+                        generation,
+                    ),
+                    name=f"ambientqa-{channel}-{device.id}",
+                    daemon=True,
+                )
+                thread.start()
+                self._threads.append(thread)
+            except Exception as exc:
+                message = (
+                    f"Audio capture unavailable: could not start the {channel} "
+                    f"reader for {device.name!r}: {exc}"
+                )
+                log.error(message)
+                # All streams are opened before readers start.  Unwind both the
+                # failed stream and any readers already running; otherwise an
+                # exception from Thread.start() leaves native capture alive with
+                # no owner available to stop it.
+                self._stop_locked()
+                self.status_callback(message)
+                return
 
     def stop(self) -> None:
         # _stop is set before taking the lifecycle lock so that a stop racing a

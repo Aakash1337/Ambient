@@ -50,6 +50,20 @@ _LOOPBACK_MARKERS = (
 )
 
 
+def _strict_stream_action(action: Callable[..., Any]) -> Any:
+    """Run a sounddevice stop/abort without its silent-error default.
+
+    sounddevice 0.5.x defaults ``ignore_errors=True`` for both methods, which
+    makes a failed PortAudio abort look successful and defeats our fallback.
+    Tiny injected fakes and older compatible wrappers may accept no keyword, so
+    retry the legacy call shape only for that signature mismatch.
+    """
+    try:
+        return action(ignore_errors=False)
+    except TypeError:
+        return action()
+
+
 def _sounddevice_module() -> Any:
     try:
         import sounddevice
@@ -138,8 +152,16 @@ def _coreaudio_input_records(sounddevice_module: Any) -> list[dict[str, Any]]:
 def _default_input_index(sounddevice_module: Any) -> int | None:
     default = getattr(sounddevice_module, "default", None)
     value = getattr(default, "device", None)
-    if isinstance(value, (tuple, list)):
-        value = value[0] if value else None
+    # sounddevice exposes this as its own indexable _InputOutputPair, not a
+    # tuple/list.  Accept ordinary scalar test doubles as well as the real pair.
+    try:
+        value = value[0]
+    except (TypeError, KeyError, IndexError):
+        pass
+    except Exception:
+        # Resolving sounddevice's lazy default can itself fail when CoreAudio has
+        # no default input.  Enumeration order remains a usable fallback.
+        return None
     try:
         index = int(value)
     except (TypeError, ValueError):
@@ -209,12 +231,17 @@ class CoreAudioStream:
             self._stopped = True
         # abort() is PortAudio's immediate cross-thread unblock.  Retain stop()
         # as a defensive seam for older sounddevice versions and test doubles.
-        action = getattr(self._stream, "abort", None)
-        if not callable(action):
-            action = getattr(self._stream, "stop", None)
-        if callable(action):
+        abort = getattr(self._stream, "abort", None)
+        stop = getattr(self._stream, "stop", None)
+        if callable(abort):
+            try:
+                _strict_stream_action(abort)
+                return
+            except Exception as exc:
+                log.debug("CoreAudio abort failed; trying stop(): %s", exc)
+        if callable(stop):
             with suppress(Exception):
-                action()
+                _strict_stream_action(stop)
 
     def close(self) -> None:
         self.stop()
@@ -267,13 +294,15 @@ class CoreAudioSession:
             if matches:
                 return [_as_kind(matches[0], "loopback")]
             if recognized:
-                fallback = recognized[0]
                 if on_warn is not None:
                     on_warn(
                         f"No loopback device matches {substring!r}; "
-                        f"falling back to {fallback.name!r}"
+                        "watching all detected loopback inputs instead"
                     )
-                return [fallback]
+                # CoreAudio has no physical-output-to-virtual-input mapping from
+                # which to identify one default.  Keep every viable virtual
+                # input so the existing level arbiter can follow the active one.
+                return recognized
         if not recognized:
             raise RuntimeError(_MISSING_LOOPBACK)
         return recognized

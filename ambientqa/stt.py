@@ -174,10 +174,10 @@ class WhisperTranscriber:
         started = time.perf_counter()
         kwargs = {
             "condition_on_previous_text": False,
-            "vad_filter": False,
+            "vad_filter": self.config.vad_filter,
         }
         profile = self.profile
-        if profile is not None:
+        if profile is not None and self.config.profile_hints:
             if profile.vocabulary:
                 kwargs["hotwords"] = ", ".join(profile.vocabulary)
             if profile.topic:
@@ -254,6 +254,9 @@ class WhisperTranscriber:
                 segments, _info = self.model.transcribe(
                     np.zeros(8000, dtype=np.float32),
                     condition_on_previous_text=False,
+                    # Silence is intentional here. Applying Silero VAD would
+                    # remove every frame and return before the encoder/decoder,
+                    # defeating the CUDA/cuDNN and first-inference warmup.
                     vad_filter=False,
                 )
                 for _segment in segments:

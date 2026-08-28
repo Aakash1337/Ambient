@@ -1,0 +1,118 @@
+name: macOS release checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - feature/macos-compatibility
+      - fix/macos-release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apple-silicon:
+    name: Apple Silicon / Python 3.11
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_INPUT: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-macos-arm64.txt
+      - name: Verify native architecture
+        run: test "$(uname -m)" = arm64
+      - name: Run release setup
+        env:
+          PYTHON_BIN: python3.11
+        run: ./setup-macos.sh
+      - name: Import smoke test without audio hardware
+        run: |
+          .venv-macos/bin/python - <<'PY'
+          import ambientqa
+          import faster_whisper
+          import kokoro_onnx
+          import numpy
+          import onnxruntime
+          import silero_vad
+          import sounddevice
+          import soxr
+          import textual
+          from ambientqa.backends import get_backend
+          from ambientqa.backends.macos import CoreAudioBackend
+          from ambientqa.config import AudioConfig
+          from ambientqa.tts import EspeakEngine
+
+          assert ambientqa.__version__
+          assert isinstance(get_backend(AudioConfig()), CoreAudioBackend)
+          assert EspeakEngine().synthesize("Ambient fallback check")
+          print("macOS imports OK")
+          PY
+      - name: Run unit tests
+        run: .venv-macos/bin/python -m pytest -q
+
+  intel-guard:
+    name: Intel fail-closed guard
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify Intel is rejected before dependency installation
+        run: |
+          test "$(uname -m)" = x86_64
+          set +e
+          output="$(./setup-macos.sh 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          test "$status" -eq 3
+          printf '%s\n' "$output" | grep -q "Intel macOS setup is disabled"
+
+  dependency-audit:
+    name: Locked dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Install audit tool
+        run: |
+          python -m pip install \
+            --require-hashes \
+            --only-binary=:all: \
+            --requirement requirements-audit.txt
+      - name: Audit the Apple Silicon lock
+        # PYSEC-2025-194 is a torch.jit.script advisory; Ambient only uses
+        # torch.from_numpy with the bundled Silero ONNX model. PYSEC-2026-3447
+        # affects building sdists; setup enforces wheel-only installation.
+        run: |
+          pip-audit \
+            --requirement requirements-macos-arm64.txt \
+            --no-deps \
+            --disable-pip \
+            --ignore-vuln PYSEC-2025-194 \
+            --ignore-vuln PYSEC-2026-3447

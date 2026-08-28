@@ -28,6 +28,9 @@ log = logging.getLogger(__name__)
 _HEADING_RE = re.compile(r"^##[ \t]+(.+?)[ \t]*$", re.MULTILINE)
 _TITLE_RE = re.compile(r"^#[ \t]+(.+?)[ \t]*$", re.MULTILINE)
 _TOKEN_RE = re.compile(r"[A-Za-z0-9']+")
+_APOSTROPHE_TRANSLATION = str.maketrans(
+    {"\u2018": "'", "\u2019": "'", "\u02bc": "'", "\uff07": "'"}
+)
 # Only these keys are honoured, and only as the first lines of an entry (before
 # any answer prose). That keeps an ordinary "Note: ..." or "Tip: ..." line
 # inside an answer from being silently eaten as metadata.
@@ -46,7 +49,41 @@ _STOPWORDS = frozenset(
         "why", "where", "who", "which", "can", "could", "would", "should",
         "will", "shall", "may", "might", "please", "so", "tell", "about",
         "give", "explain", "describe", "walk", "through", "us", "some", "any",
-        "with", "as", "if", "then", "just", "kind", "sort", "s",
+        "with", "as", "if", "then", "just", "kind", "sort", "s", "mean",
+        "means", "work", "works", "working",
+    }
+)
+
+# Comparison scaffolding helps rank canonical questions, but it is not evidence
+# that a knowledge entry matches the user's subject. Grounding removes it before
+# counting overlap so "What is the difference between these two?" cannot pull
+# arbitrary comparison entries into a prompt.
+_GROUNDING_SCAFFOLD = frozenset(
+    {
+        "another",
+        "between",
+        "choice",
+        "different",
+        "difference",
+        "first",
+        "former",
+        "fourth",
+        "from",
+        "latter",
+        "one",
+        "option",
+        "other",
+        "same",
+        "second",
+        "third",
+        "two",
+        "use",
+        "used",
+        "using",
+        "versus",
+        "vs",
+        "work",
+        "working",
     }
 )
 
@@ -56,6 +93,144 @@ _STOPWORDS = frozenset(
 # and risks merging distinct terms, so this only folds naive plurals and one
 # common synonym, and leaves short acronyms (kms, sts, aws) untouched.
 _SYNONYMS = {"versus": "vs"}
+
+# These words refer to alternatives supplied by prior conversation rather than
+# identifying a self-contained question.  A knowledge lookup has no reliable
+# way to resolve them, and a wrong verbatim cue card is worse than the live-model
+# fallback.  Keep this deliberately conservative; named comparisons still use
+# explicit ``vs``/``versus``/``difference`` phrasing and remain cacheable.
+_UNRESOLVED_REFERENCE_WORDS = frozenset(
+    {
+        "another",
+        "either",
+        "first",
+        "former",
+        "fourth",
+        "latter",
+        "one",
+        "ones",
+        "other",
+        "second",
+        "third",
+        "which",
+    }
+)
+
+
+def _intent(text: str) -> str | None:
+    """Return a conservative question-intent class for cache safety.
+
+    Content-token equality intentionally removes question scaffolding for
+    ranking, but that makes ``What is HIPAA?`` look identical to a personal
+    ``Tell me about your HIPAA work`` alias.  Intent is therefore checked as a
+    separate dimension before an answer or authoritative reference is used.
+    """
+    compact = re.sub(
+        r"\s+", " ", text.translate(_APOSTROPHE_TRANSLATION).strip().casefold()
+    )
+    words = [token.casefold() for token in _TOKEN_RE.findall(compact)]
+    word_set = set(words)
+
+    # Comparison markers are semantic, even when wrapped in "what is" or
+    # "explain". They must win over those generic lead-ins.
+    if word_set & {"compare", "comparison", "difference", "vs", "versus"}:
+        return "comparison"
+    if "between" in word_set and len(_content_tokens(text)) >= 2:
+        return "comparison"
+
+    if re.match(r"^(?:please )?(?:how|what|why|when) did you\b", compact):
+        return "personal"
+    if re.match(r"^(?:please )?(?:tell me about yourself|who are you)\b", compact):
+        return "personal"
+    if re.match(
+        r"^(?:please )?(?:tell me about|describe|walk me through)\b.*\byou\b",
+        compact,
+    ):
+        return "personal"
+    if "yourself" in word_set or "your" in word_set:
+        # A possessive technical ask can safely miss the cache and go live. The
+        # strict classification prevents a personal story from answering a
+        # generic definition merely because both share one subject word.
+        return "personal"
+
+    if re.match(
+        r"^(?:please )?(?:what(?:'s| is| are)\b|what (?:does|do)\b.*\bmean\b|"
+        r"define\b|(?:can|could|would) you (?:explain|tell me (?:about|what))\b|"
+        r"explain\b|tell me (?:about|what)\b)",
+        compact,
+    ):
+        return "definition"
+    if re.match(r"^(?:please )?why\b", compact):
+        return "reason"
+    if re.match(r"^(?:please )?who\b", compact):
+        return "actor"
+    if re.match(r"^(?:please )?where\b", compact):
+        return "location"
+    if re.match(r"^(?:please )?when\b", compact):
+        return "timing"
+    if re.match(r"^(?:please )?(?:how\b|walk me through\b)", compact):
+        return "procedure"
+    if re.match(
+        r"^(?:please )?(?:is|are|am|was|were|do|does|did|can|could|would|"
+        r"should|will|shall|may|might|have|has|had|what|how|why|when|where|"
+        r"who|which)\b",
+        compact,
+    ):
+        # An interrogative whose semantics are not one of the safe classes
+        # above must not inherit a personal/story answer through a shorthand
+        # alias. It can still match an explicitly authored question alias.
+        return "question"
+    return None
+
+
+def _has_unresolved_reference(text: str) -> bool:
+    words = {
+        token.casefold()
+        for token in _TOKEN_RE.findall(text.translate(_APOSTROPHE_TRANSLATION))
+    }
+    return bool(words & _UNRESOLVED_REFERENCE_WORDS)
+
+
+def _compatible_exact_phrasing(
+    query: str,
+    query_tokens: frozenset[str],
+    entry: "KnowledgeEntry",
+    *,
+    grounding: bool = False,
+) -> bool:
+    """Require one exact subject match whose intent agrees with the query."""
+    query_intent = _intent(query)
+    canonical_intent = _intent(entry.question)
+    phrasings = (
+        (entry.question, entry._question_tokens),
+        *zip(entry.aliases, entry._alias_tokens),
+    )
+    for phrase, tokens in phrasings:
+        comparable = tokens - _GROUNDING_SCAFFOLD if grounding else tokens
+        if query_tokens != comparable:
+            continue
+        if query_intent is None:
+            # The gate can pass topic-first spoken questions whose intent words
+            # arrive late ("HIPAA, what does that mean?"). Treating an unknown
+            # intent as a wildcard lets those collide with personal-story
+            # aliases. Cache performance is optional; an unclassified form must
+            # take the safe live path.
+            if _surface_form(query) == _surface_form(phrase):
+                return True
+            continue
+        phrase_intent = _intent(phrase)
+        if query_intent == canonical_intent:
+            return True
+        if (
+            query_intent == phrase_intent
+            and _surface_form(query) == _surface_form(phrase)
+        ):
+            # An alias may deliberately offer a different framing from its
+            # canonical (for example, a procedure-shaped interview prompt for
+            # a personal incident story). Trust that cross-intent bridge only
+            # for the exact authored alias, never for a same-subject paraphrase.
+            return True
+    return False
 
 
 def _normalize_token(token: str) -> str:
@@ -79,6 +254,14 @@ def _content_tokens(text: str) -> frozenset[str]:
         if normalized and normalized not in _STOPWORDS:
             tokens.add(normalized)
     return frozenset(tokens)
+
+
+def _surface_form(text: str) -> tuple[str, ...]:
+    """Normalized ordered words without dropping intent/scaffolding."""
+    return tuple(
+        _normalize_token(token.casefold())
+        for token in _TOKEN_RE.findall(text.translate(_APOSTROPHE_TRANSLATION))
+    )
 
 
 def _phrasing_score(query: frozenset[str], phrasing: frozenset[str]) -> float:
@@ -257,7 +440,25 @@ class KnowledgeIndex:
         """
         if len(_TOKEN_RE.findall(query)) < max(1, min_words):
             return None
+        if _has_unresolved_reference(query):
+            return None
+        query_tokens = _content_tokens(query)
+        if not query_tokens:
+            return None
         ranked = self._ranked(query)
+        if not ranked:
+            return None
+        # Verbatim cache answers must be materially safer than prompt
+        # grounding. Broad asks used to subset-match much narrower entries at
+        # scores as high as 0.99 ("delete a KMS key" selected a tenant-offboard
+        # crypto-shredding scenario). Require an exact normalized token set in
+        # one human-authored canonical/alias phrasing. Stopword and light plural
+        # normalization still accept natural variants; a miss is cheap and safe
+        # because it falls through to the live answer path.
+        def is_specific(entry: KnowledgeEntry) -> bool:
+            return _compatible_exact_phrasing(query, query_tokens, entry)
+
+        ranked = [item for item in ranked if is_specific(item[1])]
         if not ranked:
             return None
         best_score, best_entry = ranked[0]
@@ -266,22 +467,46 @@ class KnowledgeIndex:
         if len(ranked) > 1:
             second_score, second_entry = ranked[1]
             # A near-tie between two DIFFERENT answers is genuine ambiguity:
-            # serving one confidently would be a coin flip. An essentially exact
-            # match (>= 0.97) is trusted anyway, so a real question that happens
-            # to sit near a paraphrase of a different entry is still answered.
+            # serving one confidently would be a coin flip. Even two exact
+            # aliases can collide in a large pack, so exactness does not waive
+            # this guard; falling through to the live path is always safer.
             if (
                 best_entry.answer != second_entry.answer
-                and best_score < 0.97
                 and (best_score - second_score) < margin
             ):
                 return None
         return KnowledgeHit(best_entry, best_score)
 
-    def grounding(self, query: str, k: int) -> list[str]:
-        """Top-k entries rendered as reference material for a live answer."""
+    def grounding(self, query: str, k: int, min_score: float = 0.0) -> list[str]:
+        """Top-k entries rendered as reference material for a live answer.
+
+        Ranking is useful only after subject specificity is established. An
+        unrelated or conflicting question can otherwise share several generic
+        words ("access control", "public access") with a narrow domain entry
+        and poison the prompt labelled as authoritative. Grounding therefore
+        requires one exact normalized canonical/alias token set. This remains
+        useful for non-cue styles and ambiguous exact cache hits, while fuzzy
+        misses safely receive no reference rather than the wrong reference.
+        """
         if k <= 0:
             return []
-        return [entry.as_reference() for _score, entry in self._ranked(query)[:k]]
+        if _has_unresolved_reference(query):
+            return []
+        query_tokens = _content_tokens(query) - _GROUNDING_SCAFFOLD
+        if not query_tokens:
+            return []
+        references: list[str] = []
+        for score, entry in self._ranked(query):
+            if score < min_score:
+                continue
+            if not _compatible_exact_phrasing(
+                query, query_tokens, entry, grounding=True
+            ):
+                continue
+            references.append(entry.as_reference())
+            if len(references) >= k:
+                break
+        return references
 
 
 def load_pack(

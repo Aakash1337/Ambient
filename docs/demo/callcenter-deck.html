@@ -51,8 +51,8 @@
   <h1>Ambient</h1>
   <p class="sub">Real-time agent assist for live calls. It hears both sides, ignores
   everything that isn't a real question, and puts a glanceable answer in front of
-  the agent about four seconds after the customer finishes asking.</p>
-  <div class="statusbar">● listening&nbsp;&nbsp;mic:<b>on</b> sys:<b>on</b>&nbsp;&nbsp;whisper:<b>cuda</b>&nbsp;&nbsp;gate:<b>balanced</b>&nbsp;&nbsp;instances:<b>1</b>&nbsp;&nbsp;profile:<b>support-queue</b></div>
+  the agent as the external answer model responds. Timing varies by host and network.</p>
+  <div class="statusbar">● Linux demo&nbsp;&nbsp;mic:<b>on</b> sys:<b>on</b>&nbsp;&nbsp;whisper:<b>cuda</b>&nbsp;&nbsp;gate:<b>balanced</b>&nbsp;&nbsp;instances:<b>1</b>&nbsp;&nbsp;profile:<b>support-queue</b></div>
 </section>
 
 <section class="slide">
@@ -69,23 +69,23 @@
   <h2>What it does</h2>
   <div class="flow">
     <span>customer + agent audio</span> →
-    <span>local transcription <em>~0.3&thinsp;s</em></span> →
+    <span>local transcription <em>host-dependent</em></span> →
     <span>question gate <em>filters noise</em></span> →
-    <span>answer card <em>~4&thinsp;s</em></span> →
-    <span>self-audit <em>revises if wrong</em></span>
+    <span>answer card <em>streams from Claude</em></span> →
+    <span>optional audit <em>revises if wrong</em></span>
   </div>
   <ul>
     <li><b>Passive.</b> It never prompts, never interrupts, never needs a click during a call.</li>
     <li><b>Selective.</b> Statements, small talk and rhetoric produce nothing. Only real questions become cards.</li>
-    <li><b>Private.</b> All speech processing runs on the agent's machine. Call audio never leaves it.</li>
+    <li><b>Defined boundary.</b> Raw audio/STT/primary gating are local; transcript context goes to Claude for answers and recovery.</li>
   </ul>
 </section>
 
 <section class="slide">
   <h2>Hears both sides — no telephony integration</h2>
   <ul>
-    <li>The customer is <b>whatever the machine plays</b>: any softphone, WebRTC dialer, or embedded CRM caller. Captured from the OS audio layer (PipeWire monitors / WASAPI loopback).</li>
-    <li>The agent is the microphone — with <b>noise suppression and auto-gain</b> in front of transcription.</li>
+    <li>The customer is <b>whatever the configured capture input receives</b>: PipeWire monitors, WASAPI loopback, or a virtual CoreAudio input such as BlackHole.</li>
+    <li>The agent is the microphone. The validated Linux host adds <b>noise suppression and auto-gain</b>; that processing is not a macOS claim.</li>
     <li>Every output endpoint is watched at once; the one carrying speech <b>wins automatically</b> when the call moves between headset and speakers.</li>
     <li>A channel that goes deaf shows <b>SILENT ⚠</b> instead of pretending to work.</li>
   </ul>
@@ -95,9 +95,9 @@
 <section class="slide">
   <h2>The question gate is the product</h2>
   <ul>
-    <li>Free heuristics answer explicit questions <b>instantly</b> and drop filler, rhetorical tags ("…right?"), and talk aimed at someone else.</li>
-    <li>Uncertain speech goes to a <b>local LLM judge</b> (~0.5&thinsp;s) that catches indirect asks: <span class="dim">"I was wondering whether my plan covers roaming."</span></li>
-    <li>Command-form asks count: <span class="dim">"Talk me through the cancellation policy."</span></li>
+    <li>Free heuristics answer explicit interrogatives <b>instantly</b> and drop filler, rhetorical tags ("…right?"), and talk aimed at someone else.</li>
+    <li>Uncertain speech goes to a <b>local LLM judge</b> (~0.5&thinsp;s on the original RTX host; unmeasured on Mac) that catches indirect asks: <span class="dim">"I was wondering whether my plan covers roaming."</span></li>
+    <li>Command-form asks count: <span class="dim">"Talk me through the cancellation policy."</span> Operator-channel commands fast-accept; permissive customer-channel commands require the local semantic judge.</li>
     <li>Per-channel rules: the <b>customer channel is mined freely</b>; the agent's own narration is never mined.</li>
   </ul>
   <table>
@@ -119,7 +119,7 @@
   </div>
   <ul>
     <li>First line is <b>sayable verbatim</b>; bullets are keyword prompts, not paragraphs.</li>
-    <li>Streams in word by word, <b>~4&thinsp;s</b> after the question ends.</li>
+    <li>Streams word by word as Claude responds; a live audit observed <b>3.8–21.8&thinsp;s</b> first-pass end to end.</li>
     <li>Follow-ups resolve against earlier answers: <span class="dim">"and the second option?"</span> A scenario stated before the question <b>constrains the answer</b>.</li>
     <li>Pricing/version questions trigger a <b>live lookup</b> instead of trusting model memory.</li>
   </ul>
@@ -127,25 +127,26 @@
 
 <section class="slide">
   <h2>It checks its own work</h2>
-  <h3>Answer audit — runs behind every card</h3>
+  <h3>Answer audit — optional, default off</h3>
   <ul>
     <li>A second pass with a wider context window re-reads each delivered answer.</li>
     <li>Replaces the card (marked <b>revised</b>) only when materially wrong — missed constraint, misheard question, factual error. Correct cards never flicker.</li>
   </ul>
   <h3>Missed-question sweeper — every 25&thinsp;s</h3>
   <ul>
-    <li>Everything the gate rejected gets a second look with full context.</li>
-    <li>Genuine asks come back as late cards. <b>Nothing the customer asks stays silently dropped.</b></li>
+    <li>Judgment-stage rejections get a best-effort second look with wider context.</li>
+    <li>A pre-cap audit saw <b>~44–210&thinsp;s</b> recoveries; the current release discards candidates older than <b>60&thinsp;s</b>. Neither number is a delivery SLA, and misses remain possible.</li>
   </ul>
 </section>
 
 <section class="slide">
   <h2>Privacy &amp; compliance posture</h2>
   <ul>
-    <li><b>Transcription: local.</b> Whisper on the agent's GPU (~0.3&thinsp;s/utterance).</li>
-    <li><b>Question gating: local.</b> Small LLM via Ollama, on-box.</li>
-    <li><b>Answer generation:</b> the only external call — receives the gated question plus a short text window, <b>never audio</b>. The endpoint is swappable for an approved one.</li>
-    <li><b>Session logs stay local</b>, are replayable inside the app for QA review and coaching, and record the reason behind every decision — including every rejection.</li>
+    <li><b>Local:</b> raw audio, Whisper transcription, and the primary Ollama gate. Claude receives no raw audio.</li>
+    <li><b>External:</b> primary answers receive the accepted turn, recent transcript/history, profile context, and grounding. The default sweep also sends rejected candidates and wider context; optional verification sends more.</li>
+    <li><b>Web lookup:</b> when triggered, adds outbound search queries and results.</li>
+    <li><b>Session logs:</b> local plaintext, replayable for QA; git-ignore is not encryption or retention control.</li>
+    <li><b>Consent:</b> every participant must agree to capture, transcription, logging, and external processing before use.</li>
   </ul>
 </section>
 
@@ -154,12 +155,14 @@
   <table>
     <tr><th>Transcription (warm, GPU)</th><td>~0.2–0.3 s per utterance</td></tr>
     <tr><th>Question gate (LLM stage)</th><td>~0.5–0.6 s</td></tr>
-    <tr><th>Question → readable card</th><td>~3.5–4.5 s</td></tr>
+    <tr><th>Controlled answer process</th><td>~3.5–9 s on original host</td></tr>
+    <tr><th>Later live first pass</th><td>3.8–21.8 s; 6/12 over 10 s</td></tr>
     <tr><th>Audit correction, when needed</th><td>~8 s behind the card</td></tr>
-    <tr><th>Missed-question recovery</th><td>≤ 25 s</td></tr>
-    <tr><th>Automated tests</th><td>345 passing, gate eval fails CI on any false positive</td></tr>
+    <tr><th>Historical recovery, before cap</th><td>~44–210 s in later audit</td></tr>
+    <tr><th>Current candidate lifetime</th><td>60 s maximum; not a delivery SLA</td></tr>
+    <tr><th>Apple-Silicon macOS</th><td>No real-hardware latency table yet</td></tr>
   </table>
-  <p class="dim" style="margin-top:1.2em">Runs on Windows and Linux from one codebase. Multiple concurrent instances supported — the status bar counts them live.</p>
+  <p class="dim" style="margin-top:1.2em">RTX-host observations, not SLAs. macOS 14+ on Apple Silicon is a release candidate; Intel/Rosetta is unsupported; one live instance is supported.</p>
 </section>
 
 <section class="slide">
@@ -170,7 +173,7 @@
     <li><b>Audio:</b> desktop capture today → SIP/CTI taps for hard-phone floors; speaker diarization for speakerphone.</li>
     <li><b>Models:</b> answer endpoint is one config line — point it at the approved deployment.</li>
   </ul>
-  <p style="margin-top:1.4em">The hard parts — hearing both sides, deciding what deserves an answer, and correcting itself — <b>are the parts already built and measured.</b></p>
+  <p style="margin-top:1.4em">The core paths are built and measured on the named development host; each release machine and call route still needs acceptance.</p>
 </section>
 
 <section class="slide">
@@ -178,7 +181,7 @@
   <p class="sub">One machine, one launcher script, a real call playing through the speakers.</p>
   <ul style="margin-top:1em">
     <li>Watch the agent talk — <b>nothing happens</b>. The gate is the product.</li>
-    <li>Watch the customer ask — <b>a card appears in ~4 seconds</b>.</li>
+    <li>Watch the customer ask — <b>the card streams when Claude responds</b>; do not promise a fixed time.</li>
     <li><kbd>a</kbd> force-answer &nbsp; <kbd>p</kbd> pause &nbsp; <kbd>x</kbd> switch knowledge profile &nbsp; <kbd>l</kbd> replay a past call</li>
   </ul>
 </section>

@@ -11,9 +11,11 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+import logging
 import socket
 import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
@@ -373,13 +375,26 @@ def running_app(tmp_path: Path):
     assert not thread.is_alive()
 
 
-def _get(app: WebUIApp, path: str) -> tuple[int, bytes]:
+def _get(
+    app: WebUIApp, path: str, *, authorized: bool = True
+) -> tuple[int, bytes]:
     url = f"http://127.0.0.1:{app.port}{path}"
+    request = urllib.request.Request(
+        url,
+        headers=(
+            {"X-Ambient-Access-Token": app._access_token} if authorized else {}
+        ),
+    )
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
+        with urllib.request.urlopen(request, timeout=5) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as err:  # type: ignore[attr-defined]
         return err.code, err.read()
+
+
+def _get_url(url: str) -> tuple[int, bytes]:
+    with urllib.request.urlopen(url, timeout=5) as response:
+        return response.status, response.read()
 
 
 def _post(app: WebUIApp, path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -387,7 +402,11 @@ def _post(app: WebUIApp, path: str, payload: dict[str, Any]) -> dict[str, Any]:
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "X-Ambient-Access-Token": app._access_token,
+            "X-Ambient-CSRF-Token": app._csrf_token,
+        },
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=5) as response:
@@ -396,8 +415,14 @@ def _post(app: WebUIApp, path: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 def test_serves_console_and_state(running_app) -> None:
     app, _ = running_app
-    status, body = _get(app, "/")
+    capability_path = "/?access=" + urllib.parse.quote(app._access_token, safe="")
+    status, body = _get(app, capability_path, authorized=False)
     assert status == 200 and b"AMBIENT" in body
+    assert app._access_token.encode() in body
+    assert app._csrf_token.encode() in body
+    assert app._access_token != app._csrf_token
+    assert b"__AMBIENT_ACCESS_TOKEN__" not in body
+    assert b"__AMBIENT_CSRF_TOKEN__" not in body
     assert b"Ambient Q&amp;A" not in body
     assert b"Ambient Q&A" not in body
     assert b'id="btn-voice"' in body
@@ -408,17 +433,20 @@ def test_serves_console_and_state(running_app) -> None:
     assert b'id="btn-input-mic"' in body
     assert b'id="btn-input-sys"' in body
     assert b'id="agent-chip"' in body
-    status, body = _get(app, "/static/app.js")
+    status, body = _get(app, "/static/app.js", authorized=False)
     assert status == 200 and b"EventSource" in body
+    assert b"X-Ambient-Access-Token" in body
+    assert b"X-Ambient-CSRF-Token" in body
+    assert app._access_token.encode() not in body
     assert b"quitAndClose" in body and b"window.close()" in body
     assert b"AMBIENT REPLIES" in body
     assert b'toggleInput("mic")' in body
     assert b'case "g": runVoiceCommand("agent")' in body
     assert b'case "r": runVoiceCommand("conversation")' in body
     assert b"Ambient Q&A" not in body
-    status, body = _get(app, "/static/app.css")
+    status, body = _get(app, "/static/app.css", authorized=False)
     assert status == 200 and b"--paper" in body
-    status, body = _get(app, "/api/health")
+    status, body = _get(app, "/api/health", authorized=False)
     assert status == 200
     health = json.loads(body)
     assert health == {"service": "ambientqa", "status": "ok", "port": app.port}
@@ -429,6 +457,165 @@ def test_serves_console_and_state(running_app) -> None:
     assert snap["profiles"] == ["profiles/demo.md"]
     status, _ = _get(app, "/../ambientqa/webui.py")
     assert status == 404
+
+
+def test_sensitive_http_surfaces_reject_unauthenticated_local_clients(
+    running_app,
+) -> None:
+    app, controller = running_app
+    for path in (
+        "/",
+        "/?access=wrong",
+        "/api/state",
+        "/api/sessions",
+        "/api/session/session-20260828-120000.jsonl",
+        "/events",
+    ):
+        status, body = _get(app, path, authorized=False)
+        assert status == 403, path
+        assert json.loads(body) == {"error": "forbidden"}
+
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{app.port}/api/command",
+        data=b'{"action":"pause"}',
+        headers={
+            "Content-Type": "application/json",
+            # Possessing CSRF alone must not cross the local-user boundary.
+            "X-Ambient-CSRF-Token": app._csrf_token,
+        },
+        method="POST",
+    )
+    with pytest.raises(urllib.error.HTTPError) as raised:  # type: ignore[attr-defined]
+        urllib.request.urlopen(request, timeout=5)
+    assert raised.value.code == 403
+    assert controller.calls == []
+
+
+def test_capability_query_is_never_written_to_web_logs(
+    running_app, caplog: pytest.LogCaptureFixture
+) -> None:
+    app, _ = running_app
+    caplog.set_level(logging.DEBUG, logger="ambientqa.webui")
+    path = "/?access=" + urllib.parse.quote(app._access_token, safe="")
+    status, _ = _get(app, path, authorized=False)
+    assert status == 200
+    assert app._access_token not in caplog.text
+
+
+def test_command_endpoint_rejects_cross_site_and_untrusted_requests(
+    running_app,
+) -> None:
+    app, controller = running_app
+    url = f"http://127.0.0.1:{app.port}/api/command"
+
+    def attempt(headers: dict[str, str]) -> int:
+        request = urllib.request.Request(
+            url,
+            data=b'{"action":"pause"}',
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status
+        except urllib.error.HTTPError as err:  # type: ignore[attr-defined]
+            return err.code
+
+    access_header = {"X-Ambient-Access-Token": app._access_token}
+    token_header = {
+        **access_header,
+        "X-Ambient-CSRF-Token": app._csrf_token,
+    }
+    assert attempt({"Content-Type": "text/plain", **access_header}) == 415
+    assert attempt({"Content-Type": "application/json", **access_header}) == 403
+    assert (
+        attempt(
+            {
+                "Content-Type": "application/json",
+                "X-Ambient-CSRF-Token": "not-the-session-token",
+                **access_header,
+            }
+        )
+        == 403
+    )
+    assert (
+        attempt(
+            {
+                "Content-Type": "application/json",
+                "Origin": "https://attacker.example",
+                **token_header,
+            }
+        )
+        == 403
+    )
+    assert (
+        attempt(
+            {
+                "Content-Type": "application/json",
+                "Origin": f"http://127.0.0.1:{app.port + 1}",
+                **token_header,
+            }
+        )
+        == 403
+    )
+    assert (
+        attempt(
+            {
+                "Content-Type": "application/json",
+                "Host": f"attacker.example:{app.port}",
+                **token_header,
+            }
+        )
+        == 403
+    )
+    assert controller.calls == []
+
+
+def test_command_endpoint_accepts_exact_localhost_origin(running_app) -> None:
+    app, controller = running_app
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{app.port}/api/command",
+        data=b'{"action":"pause"}',
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Host": f"localhost:{app.port}",
+            "Origin": f"http://localhost:{app.port}",
+            "X-Ambient-Access-Token": app._access_token,
+            "X-Ambient-CSRF-Token": app._csrf_token,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        assert response.status == 200
+        assert json.loads(response.read())["paused"] is True
+    assert controller.calls == ["pause"]
+
+
+def test_http_surface_rejects_dns_rebinding_host(running_app) -> None:
+    app, _ = running_app
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{app.port}/api/state",
+        headers={
+            "Host": f"attacker.example:{app.port}",
+            "X-Ambient-Access-Token": app._access_token,
+        },
+    )
+    with pytest.raises(urllib.error.HTTPError) as raised:  # type: ignore[attr-defined]
+        urllib.request.urlopen(request, timeout=5)
+    assert raised.value.code == 403
+
+
+def test_console_response_blocks_cross_origin_framing(running_app) -> None:
+    app, _ = running_app
+    url = (
+        f"http://127.0.0.1:{app.port}/?access="
+        + urllib.parse.quote(app._access_token, safe="")
+    )
+    with urllib.request.urlopen(url, timeout=5) as response:
+        assert response.headers["X-Frame-Options"] == "DENY"
+        assert response.headers["Content-Security-Policy"] == "frame-ancestors 'none'"
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
+        assert response.headers["Referrer-Policy"] == "no-referrer"
 
 
 def test_commands_reach_the_controller(running_app) -> None:
@@ -507,7 +694,10 @@ def test_web_cards_snapshot_agent_role_at_creation(tmp_path: Path) -> None:
 
 def test_sse_stream_sends_hello_then_events(running_app) -> None:
     app, _ = running_app
-    url = f"http://127.0.0.1:{app.port}/events"
+    url = (
+        f"http://127.0.0.1:{app.port}/events?access="
+        + urllib.parse.quote(app._access_token, safe="")
+    )
     with urllib.request.urlopen(url, timeout=5) as stream:
         first = stream.readline().decode()
         assert first.startswith("data: ")
@@ -543,7 +733,52 @@ def test_open_browser_flag_opens_the_console_url(
         await task
 
     asyncio.run(run_briefly())
-    assert opened == [f"http://127.0.0.1:{app.port}"]
+    assert opened == [
+        f"http://127.0.0.1:{app.port}/?access="
+        + urllib.parse.quote(app._access_token, safe="")
+    ]
+
+
+def test_readiness_probe_bypasses_environment_http_proxies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _ = make_app(tmp_path)
+    captured: dict[str, object] = {}
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps({"service": "ambientqa"}).encode()
+
+    class Opener:
+        def open(self, url: str, *, timeout: float):
+            captured["url"] = url
+            captured["timeout"] = timeout
+            return Response()
+
+    def fake_build_opener(*handlers):
+        captured["handlers"] = handlers
+        return Opener()
+
+    monkeypatch.setattr(urllib.request, "build_opener", fake_build_opener)
+    try:
+        assert app._wait_until_ready(timeout_s=0.1) is True
+    finally:
+        app._server.server_close()
+
+    handlers = captured["handlers"]
+    assert len(handlers) == 1
+    assert isinstance(handlers[0], urllib.request.ProxyHandler)
+    assert handlers[0].proxies == {}
+    assert captured["url"] == f"http://127.0.0.1:{app.port}/api/health"
+    assert captured["timeout"] == 0.25
 
 
 def test_busy_default_falls_back_and_opens_our_actual_console(
@@ -570,7 +805,7 @@ def test_busy_default_falls_back_and_opens_our_actual_console(
         deadline = time.time() + 5
         while not opened and time.time() < deadline:
             await asyncio.sleep(0.02)
-        status, body = await asyncio.to_thread(_get, app, "/")
+        status, body = await asyncio.to_thread(_get_url, opened[0])
         assert status == 200 and b"AMBIENT" in body
         app.exit()
         await task
@@ -578,7 +813,10 @@ def test_busy_default_falls_back_and_opens_our_actual_console(
     try:
         asyncio.run(run_briefly())
         assert app.port != busy_port
-        assert opened == [f"http://127.0.0.1:{app.port}"]
+        assert opened == [
+            f"http://127.0.0.1:{app.port}/?access="
+            + urllib.parse.quote(app._access_token, safe="")
+        ]
         assert blocker.getsockname()[1] == busy_port, "foreign service was disturbed"
         assert controller.warnings == [
             f"Web console port {busy_port} is busy; using {app.port} instead"
@@ -605,7 +843,9 @@ def test_explicit_busy_port_remains_fail_fast(tmp_path: Path) -> None:
 
 
 def test_browser_does_not_open_without_the_flag(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     import webbrowser
 
@@ -622,6 +862,12 @@ def test_browser_does_not_open_without_the_flag(
 
     asyncio.run(run_briefly())
     assert opened == []
+    printed = capsys.readouterr().out
+    expected = (
+        f"http://127.0.0.1:{app.port}/?access="
+        + urllib.parse.quote(app._access_token, safe="")
+    )
+    assert expected in printed
 
 
 def test_quit_command_stops_run_async(running_app) -> None:
@@ -634,3 +880,28 @@ def test_quit_command_stops_run_async(running_app) -> None:
     while app.is_running and time.time() < deadline:
         time.sleep(0.02)
     assert not app.is_running
+
+
+def test_exit_and_schedulers_are_safe_after_event_loop_closes(tmp_path: Path) -> None:
+    app, _controller = make_app(tmp_path)
+    loop = asyncio.new_event_loop()
+
+    async def run_briefly() -> None:
+        task = asyncio.create_task(app.run_async())
+        await asyncio.sleep(0)
+        app.exit()
+        await task
+
+    try:
+        loop.run_until_complete(run_briefly())
+    finally:
+        loop.close()
+
+    called: list[str] = []
+    app.exit()
+    app.call_from_thread(called.append, "thread")
+    app.call_later(called.append, "later")
+
+    assert called == ["thread", "later"]
+    assert app._loop is None
+    assert app._exit_event is None

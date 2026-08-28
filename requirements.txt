@@ -1,3 +1,6 @@
+# Cross-platform dependency input. macOS release installs use the generated,
+# hash-locked requirements-macos-arm64.txt file; do not install this input
+# directly from setup-macos.sh.
 pyaudiowpatch; sys_platform == "win32"
 sounddevice; sys_platform == "darwin"
 soxr

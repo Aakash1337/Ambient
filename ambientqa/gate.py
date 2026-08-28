@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -12,13 +15,22 @@ import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Iterable
+from urllib.parse import urlsplit
 
 from .bus import GateResult, Transcript
-from .config import GateConfig
-from .context import token_set_ratio
+from .config import GateConfig, validate_ollama_url
+from .context import token_set_ratio, transcript_quality_reason
 from .profile import Profile
 
 WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+_APOSTROPHE_TRANSLATION = str.maketrans(
+    {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u02bc": "'",
+        "\uff07": "'",
+    }
+)
 FILLERS = {"uh", "um", "hmm", "hm", "yeah", "okay", "ok", "right"}
 # Function/discourse words that carry no topic. An utterance made only of these
 # is a trailing-off fragment ("uh, um, so, the thing is") with nothing to answer.
@@ -105,7 +117,7 @@ _IMPERATIVE_IDIOMS = {
 # whole, so those need their own entries.
 _PLAN_MARKERS = {
     "i", "we", "i'll", "we'll", "i'm", "we're", "gonna", "going",
-    "later", "tomorrow",
+    "let", "let's", "lets", "later", "tomorrow",
 }
 _REQUEST_BIGRAMS = (("talk", "about"), ("tell", "me"), ("walk", "me"))
 _SENTENCE_SPLIT_RE = re.compile(r"[.?!;:]+")
@@ -159,6 +171,8 @@ SCHEMA = {
     "additionalProperties": False,
 }
 
+_MAX_OLLAMA_RESPONSE_BYTES = 1024 * 1024
+
 
 @dataclass(frozen=True, slots=True)
 class StageADecision:
@@ -167,7 +181,10 @@ class StageADecision:
 
 
 def words(text: str) -> list[str]:
-    return WORD_RE.findall(text)
+    # Whisper and pasted transcripts routinely use smart apostrophes. Treat
+    # them exactly like ASCII apostrophes so "let’s talk about..." remains a
+    # narrated plan instead of being split into ``let``/``s`` and fast-accepted.
+    return WORD_RE.findall(text.translate(_APOSTROPHE_TRANSLATION))
 
 
 def _question_start(lowered: list[str]) -> int:
@@ -286,7 +303,9 @@ def is_complete_imperative_request(text: str) -> bool:
         and request[1] in {"me", "us"}
     ):
         return False
-    compact = re.sub(r"\s+", " ", text.strip().lower())
+    compact = re.sub(
+        r"\s+", " ", text.translate(_APOSTROPHE_TRANSLATION).strip().lower()
+    )
     return _is_imperative_request(text, compact)
 
 
@@ -332,6 +351,10 @@ def heuristic_decision(
     recent_answered: Iterable[str] = (),
     dedupe_ratio: float = 0.85,
 ) -> StageADecision:
+    if transcript_quality_reason(text) is not None:
+        # Run this before every heuristic fast-path. A request verb buried in
+        # Whisper word-salad must not turn corrupted audio into a question.
+        return StageADecision("reject", "garbled_transcript")
     tokens = words(text)
     lowered = [token.lower() for token in tokens]
     complete_imperative = is_complete_imperative_request(text)
@@ -544,6 +567,12 @@ class OllamaGate:
         self.profile = profile
         self.available = True
         self._warming: asyncio.Task[bool] | None = None
+        # A timed-out daemon may remain in a blocked OS read briefly. Bound
+        # those detached requests so a broken local service cannot accumulate
+        # threads without limit across repeated gate attempts.
+        self._request_slots = threading.BoundedSemaphore(
+            max(1, config.max_concurrent)
+        )
 
     def set_profile(self, profile: Profile | None) -> None:
         self.profile = profile
@@ -641,17 +670,109 @@ class OllamaGate:
     def _post(
         self, body: dict[str, object], timeout: float | None = None
     ) -> dict[str, object]:
+        validate_ollama_url(self.config.ollama_url)
+        self._require_owned_macos_listener()
         request = urllib.request.Request(
             self.config.ollama_url,
             data=json.dumps(body).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(
+        # Never inherit HTTP(S)_PROXY for the supposedly local privacy boundary.
+        # A corporate proxy must not receive transcript/profile data even when
+        # NO_PROXY is absent or misconfigured.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(
             request,
             timeout=self.config.request_timeout_s if timeout is None else timeout,
         ) as response:
-            return json.loads(response.read().decode("utf-8"))
+            raw = response.read(_MAX_OLLAMA_RESPONSE_BYTES + 1)
+            if len(raw) > _MAX_OLLAMA_RESPONSE_BYTES:
+                raise ValueError("Ollama response exceeded 1 MiB")
+            return json.loads(raw.decode("utf-8"))
+
+    def _require_owned_macos_listener(self) -> None:
+        """Fail before sending data unless the launcher-owned child has the port."""
+        if os.environ.get("AMBIENTQA_REQUIRE_MANAGED_OLLAMA") != "1":
+            return
+        if sys.platform != "darwin":
+            raise OSError("managed Ollama listener verification requires macOS")
+        raw_pid = os.environ.get("AMBIENTQA_OLLAMA_PID", "")
+        try:
+            expected_pid = int(raw_pid)
+        except ValueError as exc:
+            raise OSError("managed Ollama PID is invalid") from exc
+        if expected_pid <= 0:
+            raise OSError("managed Ollama is unavailable")
+        try:
+            port = urlsplit(self.config.ollama_url).port
+            completed = subprocess.run(
+                [
+                    "/usr/sbin/lsof",
+                    "-nP",
+                    "-a",
+                    "-p",
+                    str(expected_pid),
+                    f"-iTCP:{port}",
+                    "-sTCP:LISTEN",
+                    "-t",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            raise OSError("unable to verify the managed Ollama listener") from exc
+        owners = {line.strip() for line in completed.stdout.splitlines()}
+        if completed.returncode != 0 or owners != {str(expected_pid)}:
+            raise OSError("managed Ollama no longer owns its private listener")
+
+    async def _request(
+        self,
+        body: dict[str, object],
+        timeout: float,
+    ) -> dict[str, object]:
+        """Run blocking local HTTP on a daemon with a real async deadline."""
+        loop = asyncio.get_running_loop()
+        done = asyncio.Event()
+        results: list[dict[str, object]] = []
+        failures: list[BaseException] = []
+        if not self._request_slots.acquire(blocking=False):
+            raise OSError("too many unfinished Ollama requests")
+
+        def send() -> None:
+            try:
+                results.append(self._post(body, timeout))
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                try:
+                    loop.call_soon_threadsafe(done.set)
+                except RuntimeError:
+                    # The timed-out/cancelled caller may already have closed
+                    # its loop. The daemon must never pin interpreter exit.
+                    pass
+                self._request_slots.release()
+
+        try:
+            threading.Thread(
+                target=send, name="ollama-request", daemon=True
+            ).start()
+        except BaseException:
+            self._request_slots.release()
+            raise
+        try:
+            await asyncio.wait_for(done.wait(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                "Ollama request exceeded its wall-clock deadline"
+            ) from exc
+        if failures:
+            raise failures[0]
+        if not results:
+            raise RuntimeError("Ollama request ended without a result")
+        return results[0]
 
     async def warmup(self) -> bool:
         current = asyncio.current_task()
@@ -661,38 +782,11 @@ class OllamaGate:
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": "Classify: hello there"},
         ]
-        # The verified first model load takes about 67 seconds. Normal gate
-        # requests retain the short configurable timeout; startup warmup does
-        # not. That long request must NOT run via to_thread: Task.cancel cannot
-        # interrupt a running executor future, and asyncio.run joins the default
-        # executor on exit, so quitting during a cold Ollama load would keep the
-        # process alive for up to the full 90s after the UI is gone. A daemon
-        # thread signalling back into the loop keeps this await cancellable, and
-        # a daemon cannot block interpreter exit.
-        loop = asyncio.get_running_loop()
-        done = asyncio.Event()
-        failures: list[BaseException] = []
-
-        def _request() -> None:
-            try:
-                self._post(self._body(messages), 90.0)
-            except BaseException as exc:
-                failures.append(exc)
-            finally:
-                try:
-                    loop.call_soon_threadsafe(done.set)
-                except RuntimeError:
-                    # Loop already closed: warmup was cancelled and the process
-                    # is exiting. Nobody is waiting on this result any more.
-                    pass
-
         try:
-            threading.Thread(
-                target=_request, name="ollama-warmup", daemon=True
-            ).start()
-            await done.wait()
-            if failures:
-                raise failures[0]
+            # The verified first model load takes about 67 seconds. The shared
+            # daemon-thread request wrapper keeps cancellation and the 90 s
+            # wall-clock deadline from pinning interpreter shutdown.
+            await self._request(self._body(messages), 90.0)
             self.available = True
             return True
         except (OSError, urllib.error.URLError, TimeoutError, ValueError) as exc:
@@ -711,14 +805,14 @@ class OllamaGate:
             f"{context_block}\n\nCURRENT UTTERANCE (judge only this):\n{text}"
         )
         try:
-            payload = await asyncio.to_thread(
-                self._post,
+            payload = await self._request(
                 self._body(
                     [
                         {"role": "system", "content": self.system_prompt},
                         {"role": "user", "content": user},
                     ]
                 ),
+                self.config.request_timeout_s,
             )
             message = payload.get("message", {})
             content = message.get("content", "") if isinstance(message, dict) else ""
@@ -828,10 +922,18 @@ class QuestionGate:
         elif stage_a.outcome == "reject":
             accepted, query = False, ""
         elif stage_a.outcome == "accept":
-            # An explicit interrogative is deliberately exempt: if the user really
-            # does ask a question, answer it even when it echoes a recent answer.
-            # Verbatim re-asking is already caught by near-duplicate dedupe.
-            accepted, query = True, transcript.text
+            if stage_a.reason == "imperative_request" and policy == "full":
+                # The other-speaker channel is intentionally permissive, but
+                # request verbs also occur in incoherent STT word salad. Give
+                # command-form asks semantic judgment there. The operator's
+                # explicit channel keeps its zero-call fast path for deliberate
+                # commands such as "Explain RAG."
+                accepted, query, stage_a = await self._semantic(transcript, context)
+            else:
+                # Explicit interrogatives are deliberately exempt: if the user
+                # really does ask a question, answer it even when it echoes a
+                # recent answer. Verbatim re-asking is already caught by dedupe.
+                accepted, query = True, transcript.text
         elif policy == "explicit" and not is_question_shaped(transcript.text):
             if (
                 self.answered.best_ratio(

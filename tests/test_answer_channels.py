@@ -74,7 +74,11 @@ class Recorder:
         controller.app = App()  # type: ignore[assignment]
         controller.gate = Gate()  # type: ignore[assignment]
 
-        async def log_rejection(item: Transcript, reason: str) -> None:
+        async def log_rejection(
+            item: Transcript,
+            reason: str,
+            _stage_latencies: dict[str, float] | None = None,
+        ) -> None:
             outer.rejections.append((item.text, reason))
 
         async def enqueue(_job: Any) -> None:
@@ -137,6 +141,23 @@ def test_the_other_speaker_is_answered() -> None:
     assert recorder.gated == [question]
     assert recorder.answered == [question]
     assert recorder.rejections == []
+
+
+def test_garbled_transcript_is_visible_but_never_enters_context_or_gate() -> None:
+    recorder = Recorder({"mic": "explicit", "sys": "full"})
+    controller = recorder.build()
+    garble = "IAM IAM IAM IAM IAM"
+
+    process(controller, transcript(garble, "sys"))
+
+    assert recorder.shown == [garble]
+    assert recorder.gated == []
+    assert recorder.answered == []
+    assert recorder.rejections == [(garble, "garbled_transcript")]
+    assert controller.context.rendered() == []
+    assert controller.last_transcript is not None
+    assert controller.last_transcript.text == garble
+    assert controller._last_transcript_in_context is False
 
 
 def test_full_policy_answers_that_channel_freely() -> None:

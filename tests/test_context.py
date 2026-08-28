@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from ambientqa.bus import Transcript
-from ambientqa.context import TranscriptContext, token_set_ratio
+import pytest
+
+from ambientqa.context import (
+    TranscriptContext,
+    token_set_ratio,
+    transcript_quality_reason,
+)
 
 
 def transcript(channel: str, text: str, timestamp: float) -> Transcript:
@@ -43,3 +49,49 @@ def test_rendered_context_limits_and_excludes_latest() -> None:
     rendered = context.rendered(3, exclude_latest=True)
     assert rendered == ["[mic] line number 4", "[mic] line number 5", "[mic] line number 6"]
 
+
+@pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        (
+            "…. …. List or should games … algún … questionnaire … GOD … "
+            "Agent …!!!! … aldль … don't mess … … … …",
+            "punctuation_noise",
+        ),
+        ("IAM IAM IAM IAM IAM", "repetition_loop"),
+        ("client assurance \ufffd PMIP", "invalid_unicode"),
+    ],
+)
+def test_high_confidence_recognition_garble_is_identified(
+    text: str, reason: str
+) -> None:
+    assert transcript_quality_reason(text) == reason
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "How should we evaluate the retrieval pipeline?",
+        "¿Cómo funciona la configuración de audio?",
+        "Compare IAM, KMS, STS, and S3 controls.",
+        "Wait... should we retry now?",
+        "No no no no, do not delete that.",
+        "Stop stop stop stop the deployment.",
+        "Very very very very important.",
+        "Please translate this 日本語の質問 for the customer.",
+        "Help help help help!",
+        "Stop! Stop! Stop! Stop!",
+        "No no no no!",
+        "Fire fire fire fire!",
+        "Wait wait wait wait!",
+        "Help help help help help help help help help help help help!",
+        "Wait... Wait... Wait... Wait... Wait... Wait...",
+        "Help... Help... Help... Help... Help... Help...",
+        "Stop!!! Stop!!! Stop!!! Stop!!!",
+        "Fire!!! Fire!!! Fire!!! Fire!!!",
+        "Help me! Help me! Help me! Help me! Help me! Help me!",
+        "Please help me!!! Please help me!!! Please help me!!! Please help me!!! Please help me!!!",
+    ],
+)
+def test_quality_filter_preserves_plausible_speech(text: str) -> None:
+    assert transcript_quality_reason(text) is None

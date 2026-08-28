@@ -151,7 +151,7 @@ Access Analyzer uses automated reasoning to flag external access, surface unused
 • Provable security (Zelkova)
 
 ## How would you use condition keys and tags to scale permissions?
-Aliases: condition keys | ABAC | tag-based access control | aws:PrincipalTag
+Aliases: condition keys | ABAC | what is attribute-based access control | tag-based access control | aws:PrincipalTag
 Tags: condition-keys, abac, tags, aws-principaltag, least-privilege
 Attribute-based access control matches principal tags to resource tags, so one policy scales across teams without editing it per resource.
 

@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import tempfile
 import time
 from typing import Callable
 
@@ -17,6 +19,11 @@ from .profile import Profile
 log = logging.getLogger(__name__)
 
 AnswerDeltaCallback = Callable[[str, str], None]
+
+# Claude stream-json puts a complete event on one line. Web-search metadata can
+# exceed asyncio's 64 KiB default; keep a generous but finite parsing bound and
+# make every exceptional path reap the child.
+_CLAUDE_STREAM_LIMIT = 4 * 1024 * 1024
 
 # Questions whose answer moved since the model was trained. On these the model is
 # not merely unsure -- it is confidently wrong, which is worse than silence.
@@ -66,6 +73,106 @@ class ClaudeAnswerer:
         )
         self._semaphore = asyncio.Semaphore(config.max_concurrent)
         self.in_flight = 0
+        # Even a no-tool Claude invocation otherwise discovers the application's
+        # repository as its workspace. Safe/restricted mode below blocks project
+        # customizations and tools; an empty private cwd removes the repository
+        # and its local transcript directory from ambient process context too.
+        self._claude_workspace = tempfile.TemporaryDirectory(
+            prefix="ambientqa-claude-"
+        )
+
+    @staticmethod
+    def _isolation_args(tools: str = "") -> list[str]:
+        """Fail-closed CLI policy shared by answers, audits, and sweeps."""
+        return [
+            "--tools",
+            tools,
+            "--allowed-tools",
+            tools,
+            "--permission-mode",
+            "dontAsk",
+            "--no-session-persistence",
+            "--setting-sources",
+            "",
+            "--safe-mode",
+            "--restricted",
+            "--strict-mcp-config",
+            "--mcp-config",
+            json.dumps({"mcpServers": {}}),
+        ]
+
+    def _subprocess_kwargs(self) -> dict[str, object]:
+        return {
+            "cwd": self._claude_workspace.name,
+            "limit": _CLAUDE_STREAM_LIMIT,
+            "stdin": asyncio.subprocess.PIPE,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+        }
+
+    def _write_system_prompt(self, prompt: str) -> str:
+        """Put sensitive system/profile context in a private short-lived file."""
+        descriptor, path = tempfile.mkstemp(
+            prefix="system-prompt-",
+            suffix=".txt",
+            dir=self._claude_workspace.name,
+            text=True,
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(prompt)
+        except BaseException:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            raise
+        return path
+
+    @staticmethod
+    def _remove_system_prompt(path: str | None) -> None:
+        if path is None:
+            return
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+    @staticmethod
+    async def _write_prompt(
+        stdin: asyncio.StreamWriter,
+        prompt: str,
+    ) -> None:
+        """Feed private conversation data over stdin, never process argv."""
+        try:
+            stdin.write(prompt.encode("utf-8"))
+            await stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            # The CLI may reject a flag/model before reading stdin. Its normal
+            # exit code and stderr carry the useful error in that case.
+            pass
+        finally:
+            stdin.close()
+            # Do not await wait_closed() here. If the child never reads stdin,
+            # a full pipe can keep that await blocked even after this task is
+            # cancelled by the answer deadline, preventing the outer finally
+            # block from killing and reaping the child.
+
+    @staticmethod
+    async def _terminate_process(
+        process: asyncio.subprocess.Process | None,
+    ) -> None:
+        """Kill and reap a still-running one-shot process on every exit path."""
+        if process is None or process.returncode is not None:
+            return
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await process.wait()
+        except (OSError, ProcessLookupError):
+            pass
 
     ACCURACY = (
         "If uncertain, say so plainly rather than guessing. Never present an "
@@ -194,7 +301,12 @@ class ClaudeAnswerer:
         "- If the person says goodbye, close warmly and stop."
     )
 
-    def system_prompt_for(self, style: str | None = None) -> str:
+    def system_prompt_for(
+        self,
+        style: str | None = None,
+        *,
+        include_profile: bool = True,
+    ) -> str:
         """Build the prompt for one answer without mutating shared config.
 
         Voice conversation mode can coexist with already-queued normal-mode
@@ -202,19 +314,20 @@ class ClaudeAnswerer:
         from changing the format of work that was queued under the old mode.
         """
         selected = self.config.style if style is None else style
+        profile_context = self._profile_context() if include_profile else ""
         if selected == "cue":
             return (
                 self.CUE.format(max_words=self.config.max_words)
                 + "\n"
                 + self.ACCURACY
-                + self._profile_context()
+                + profile_context
             )
         if selected == "terse":
             return (
                 "Answer directly with no preamble in at most "
                 f"{self.config.max_words} words. Be terse and useful. "
                 + self.ACCURACY
-                + self._profile_context()
+                + profile_context
             )
         if selected == "agent":
             # A short ceiling improves time-to-first-audio and prevents a voice
@@ -224,7 +337,7 @@ class ClaudeAnswerer:
                 self.AGENT.format(max_words=max_words)
                 + "\n"
                 + self.ACCURACY
-                + self._profile_context()
+                + profile_context
             )
         # Interview style: what a person SAYS out loud, not what documentation
         # says. Two failure modes to avoid, and they pull in opposite directions:
@@ -263,7 +376,7 @@ class ClaudeAnswerer:
             "or Llama without managing any infrastructure, and it layers on "
             'extras like knowledge bases for RAG, guardrails, and agents."\n'
             + self.ACCURACY
-            + self._profile_context()
+            + profile_context
         )
 
     @property
@@ -436,6 +549,32 @@ class ClaudeAnswerer:
             f"{query}"
         )
 
+    def _lookup_prompt(
+        self,
+        query: str,
+        channel: str,
+        style: str | None,
+    ) -> str:
+        """Give a tool-enabled process only the current audible question.
+
+        Transcript history, earlier answers, standing profile data, and local
+        grounding are intentionally absent. Spoken content can trigger an
+        automatic lookup, so including those private blocks would let an
+        untrusted speaker induce the model to copy them into outbound search
+        queries. A context-dependent lookup may therefore fail closed rather
+        than exporting unrelated conversation data.
+        """
+        return (
+            "CURRENT QUESTION (the only conversation data available to this "
+            "web lookup):\n"
+            "-----\n"
+            f"{query}\n"
+            "-----\n"
+            + self._stance_for_style(style, channel)
+            + "Answer only this question. Do not search for or infer any prior "
+            "conversation, profile, files, or session history."
+        )
+
     # The audit persona. The bar is deliberately high: a correction lands ~8s
     # after the user may already be speaking from the first card, so it is only
     # worth the distraction when the delivered answer would have misled.
@@ -503,26 +642,25 @@ class ClaudeAnswerer:
             "-----"
         )
         process: asyncio.subprocess.Process | None = None
+        system_prompt_path: str | None = None
         await self._semaphore.acquire()
         try:
+            system_prompt_path = self._write_system_prompt(
+                self.VERIFY + self.system_prompt_for(style)
+            )
             process = await asyncio.create_subprocess_exec(
                 "claude",
                 "-p",
-                prompt,
                 "--model",
                 self.config.answer_model,
-                "--system-prompt",
-                self.VERIFY + self.system_prompt_for(style),
-                "--allowed-tools",
-                "",
-                "--strict-mcp-config",
-                "--mcp-config",
-                json.dumps({"mcpServers": {}}),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                "--system-prompt-file",
+                system_prompt_path,
+                *self._isolation_args(),
+                **self._subprocess_kwargs(),
             )
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=self.config.answer_timeout_s
+                process.communicate(prompt.encode("utf-8")),
+                timeout=self.config.answer_timeout_s,
             )
             if process.returncode != 0:
                 log.warning(
@@ -538,19 +676,15 @@ class ClaudeAnswerer:
             selected = self.config.style if style is None else style
             return guard_agent_answer(text) if selected == "agent" else text
         except asyncio.TimeoutError:
-            if process is not None and process.returncode is None:
-                process.kill()
-                await process.wait()
             return None
         except asyncio.CancelledError:
-            if process is not None and process.returncode is None:
-                process.kill()
-                await process.wait()
             raise
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             log.warning("Answer audit for %s unavailable: %s", question_id, exc)
             return None
         finally:
+            await self._terminate_process(process)
+            self._remove_system_prompt(system_prompt_path)
             self._semaphore.release()
 
     # The miss detector. Most gate rejections are correct -- the prompt's job
@@ -611,26 +745,23 @@ class ClaudeAnswerer:
             f"{candidate_block}"
         )
         process: asyncio.subprocess.Process | None = None
+        system_prompt_path: str | None = None
         await self._semaphore.acquire()
         try:
+            system_prompt_path = self._write_system_prompt(self.SWEEP)
             process = await asyncio.create_subprocess_exec(
                 "claude",
                 "-p",
-                prompt,
                 "--model",
                 self.config.sweep_model or self.config.answer_model,
-                "--system-prompt",
-                self.SWEEP,
-                "--allowed-tools",
-                "",
-                "--strict-mcp-config",
-                "--mcp-config",
-                json.dumps({"mcpServers": {}}),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                "--system-prompt-file",
+                system_prompt_path,
+                *self._isolation_args(),
+                **self._subprocess_kwargs(),
             )
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=self.config.answer_timeout_s
+                process.communicate(prompt.encode("utf-8")),
+                timeout=self.config.answer_timeout_s,
             )
             if process.returncode != 0:
                 log.warning(
@@ -663,19 +794,15 @@ class ClaudeAnswerer:
                     results.append((index, question.strip()))
             return results
         except asyncio.TimeoutError:
-            if process is not None and process.returncode is None:
-                process.kill()
-                await process.wait()
             return None
         except asyncio.CancelledError:
-            if process is not None and process.returncode is None:
-                process.kill()
-                await process.wait()
             raise
         except (OSError, RuntimeError, json.JSONDecodeError, ValueError) as exc:
             log.warning("Missed-question sweep unavailable: %s", exc)
             return None
         finally:
+            await self._terminate_process(process)
+            self._remove_system_prompt(system_prompt_path)
             self._semaphore.release()
 
     @staticmethod
@@ -806,32 +933,54 @@ class ClaudeAnswerer:
         channel: str = "sys",
         style: str | None = None,
         grounding: list[str] | None = None,
+        lookup_query: str | None = None,
     ) -> AnswerResult:
         async with self._semaphore:
             self.in_flight += 1
             started = time.perf_counter()
             process: asyncio.subprocess.Process | None = None
+            system_prompt_path: str | None = None
             # Bound before the try so every exit path -- including timeout and
             # CLI failure -- can record searched=lookup. The searched flag exists
             # to explain outlier latency in the log, and a timed-out web lookup
             # is precisely the record that needs it.
-            lookup = self._wants_lookup(query)
+            # The gate may rewrite a context-dependent utterance into a
+            # self-contained query. That rewrite is useful for a no-tool answer
+            # but may copy private antecedents from transcript context. Tool
+            # selection and the WebSearch prompt therefore use only the literal
+            # current utterance supplied by the controller.
+            literal_query = query if lookup_query is None else lookup_query
+            lookup = self._wants_lookup(literal_query)
             try:
                 # One fresh process per question is intentional. A persistent stream-json
                 # session merges concurrent messages and must never be used.
+                prompt = (
+                    self._lookup_prompt(literal_query, channel, style)
+                    if lookup
+                    else self._prompt(
+                        query,
+                        context,
+                        history,
+                        channel,
+                        style,
+                        grounding,
+                    )
+                )
+                system_prompt_path = self._write_system_prompt(
+                    self.system_prompt_for(
+                        style,
+                        include_profile=not lookup,
+                    )
+                    + (self.LOOKUP if lookup else "")
+                )
                 command = [
                     "claude",
                     "-p",
-                    self._prompt(query, context, history, channel, style, grounding),
                     "--model",
                     self.config.answer_model,
-                    "--system-prompt",
-                    self.system_prompt_for(style) + (self.LOOKUP if lookup else ""),
-                    "--allowed-tools",
-                    "WebSearch" if lookup else "",
-                    "--strict-mcp-config",
-                    "--mcp-config",
-                    json.dumps({"mcpServers": {}}),
+                    "--system-prompt-file",
+                    system_prompt_path,
+                    *self._isolation_args("WebSearch" if lookup else ""),
                 ]
                 if self.config.stream:
                     command.extend(
@@ -844,14 +993,15 @@ class ClaudeAnswerer:
                     )
                 process = await asyncio.create_subprocess_exec(
                     *command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    **self._subprocess_kwargs(),
                 )
                 if self.config.stream:
+                    assert process.stdin is not None
                     assert process.stdout is not None
                     assert process.stderr is not None
-                    (stdout, answer), stderr, _returncode = await asyncio.wait_for(
+                    _, (stdout, answer), stderr, _returncode = await asyncio.wait_for(
                         asyncio.gather(
+                            self._write_prompt(process.stdin, prompt),
                             self._read_stream(process.stdout, question_id),
                             process.stderr.read(),
                             process.wait(),
@@ -860,7 +1010,8 @@ class ClaudeAnswerer:
                     )
                 else:
                     stdout, stderr = await asyncio.wait_for(
-                        process.communicate(), timeout=self.config.answer_timeout_s
+                        process.communicate(prompt.encode("utf-8")),
+                        timeout=self.config.answer_timeout_s,
                     )
                     answer = stdout.decode("utf-8", errors="replace").strip()
                 latency = (time.perf_counter() - started) * 1000
@@ -901,9 +1052,6 @@ class ClaudeAnswerer:
                     searched=lookup,
                 )
             except asyncio.TimeoutError:
-                if process is not None and process.returncode is None:
-                    process.kill()
-                    await process.wait()
                 latency = (time.perf_counter() - started) * 1000
                 return AnswerResult(
                     question_id,
@@ -914,11 +1062,8 @@ class ClaudeAnswerer:
                     searched=lookup,
                 )
             except asyncio.CancelledError:
-                if process is not None and process.returncode is None:
-                    process.kill()
-                    await process.wait()
                 raise
-            except (OSError, RuntimeError) as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 latency = (time.perf_counter() - started) * 1000
                 self.status_callback(f"Claude CLI unavailable: {exc}")
                 return AnswerResult(
@@ -930,4 +1075,6 @@ class ClaudeAnswerer:
                     searched=lookup,
                 )
             finally:
+                await self._terminate_process(process)
+                self._remove_system_prompt(system_prompt_path)
                 self.in_flight -= 1

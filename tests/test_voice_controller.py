@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+import ambientqa.__main__ as main_module
 from ambientqa.__main__ import AmbientController, _AnswerJob
-from ambientqa.bus import AnswerResult, DropOldestQueue, Transcript
+from ambientqa.bus import AnswerResult, DropOldestQueue, GateResult, Transcript
 from ambientqa.config import default_config
 from ambientqa.context import TranscriptContext
 from ambientqa.continuity import ContinuityMerger
@@ -99,9 +101,15 @@ def build_controller(*, verify: str = "off") -> AmbientController:
     controller._agent_had_customer_turn = False
     controller._agent_awaiting_reply = False
     controller._last_agent_turn = None
+    controller._session_generation = 0
+    controller._profile_selection_revision = 0
+    controller._profile_write_lock = asyncio.Lock()
+    controller._force_lock = asyncio.Lock()
+    controller._ui_tasks = set()
     controller.paused = False
     controller.input_channels_enabled = {"mic": True, "sys": True}
     controller._input_after = {"mic": 0.0, "sys": 0.0}
+    controller._ignore_before = 0.0
     controller._voice_ignore_before = 0.0
     controller.stop = asyncio.Event()
     controller.speech = FakeSpeech()
@@ -112,16 +120,22 @@ def build_controller(*, verify: str = "off") -> AmbientController:
     controller.answer_count = 0
     controller.estimated_tokens = 0
     controller._qa_history = deque(maxlen=8)
+    controller._gate_tasks = set()
     controller._verify_tasks = set()
     controller._verify_semaphore = asyncio.Semaphore(1)
     controller._open_answer_jobs = {}
+    controller._answer_request_tasks = {}
     controller.answers = DropOldestQueue(controller.config.answer.queue_size)
     controller._recent_rejections = deque(maxlen=24)
     controller._sweep_ready_at = {}
     controller._sweep_stage_latencies = {}
+    controller._sweep_request_task = None
     controller._continuity_arrived_at = {}
     controller._last_completed_answer = None
     controller._last_voice_answer = None
+    controller.knowledge = None
+    controller.last_transcript = None
+    controller._last_transcript_in_context = False
     return controller
 
 
@@ -299,6 +313,26 @@ def test_profile_interaction_metadata_does_not_enable_agent_role() -> None:
     assert controller.agent_mode is False
     assert controller._agent_customer_channel == "sys"
     assert transcriber.agent_mode is False
+    assert boundaries == ["boundary"]
+
+
+def test_initial_profile_apply_does_not_require_partially_initialized_runtime() -> None:
+    controller = AmbientController.__new__(AmbientController)
+    controller.agent_mode = False
+    controller.profile = None
+    controller.transcriber = FakeProfileTarget()  # type: ignore[assignment]
+    controller.gate = FakeProfileTarget()  # type: ignore[assignment]
+    controller.answerer = FakeProfileTarget()  # type: ignore[assignment]
+    boundaries: list[str] = []
+    controller._start_agent_session_boundary = (  # type: ignore[method-assign]
+        lambda: boundaries.append("boundary")
+    )
+    profile = Profile("Startup profile", "Support", "", [], "")
+
+    controller._apply_profile(profile)
+
+    assert controller.profile is profile
+    assert controller.transcriber.profile is profile
     assert boundaries == []
 
 
@@ -370,6 +404,772 @@ def test_edited_same_name_profile_still_starts_clean_agent_session() -> None:
     assert controller.agent_mode is True
     assert controller.profile is edited
     assert boundaries == ["boundary"]
+
+
+def test_switching_profile_in_assist_isolates_queued_and_in_flight_work() -> None:
+    controller = build_controller()
+    controller.transcriber = FakeProfileTarget()  # type: ignore[assignment]
+    controller.gate = FakeProfileTarget()  # type: ignore[assignment]
+    controller.answerer = FakeProfileTarget()  # type: ignore[assignment]
+    controller.continuity = ContinuityMerger(controller.config.merge)
+    controller._pending_system = deque()
+    original = Profile("Support", "Customer support", "Old account data.", [], "")
+    replacement = Profile("Security", "Security review", "New tenant.", [], "")
+    controller.profile = original
+    controller.context.add(
+        Transcript("mic", "old private context", time.time() - 2.0, "old-context")
+    )
+    controller._qa_history.append(("old question", "old answer"))
+    controller._recent_rejections.append(
+        Transcript("mic", "old rejected turn", time.time() - 1.0, "old-reject")
+    )
+    controller.last_transcript = Transcript(
+        "mic", "old last turn", time.time() - 1.0, "old-last"
+    )
+    controller._last_transcript_in_context = True
+    queued = _AnswerJob(
+        Transcript("mic", "old queued", time.time() - 1.0, "old-queued"),
+        "old queued",
+        [],
+        "explicit_interrogative",
+        0.0,
+    )
+    in_flight = _AnswerJob(
+        Transcript("mic", "old running", time.time() - 1.0, "old-running"),
+        "old running",
+        [],
+        "explicit_interrogative",
+        0.0,
+    )
+    controller._open_answer_jobs = {
+        "old-queued": queued,
+        "old-running": in_flight,
+    }
+    controller.answers.put_nowait(queued)
+
+    controller._apply_profile(replacement)
+
+    assert controller.profile is replacement
+    assert controller.transcriber.profile is replacement
+    assert controller.gate.profile is replacement
+    assert controller.answerer.profile is replacement
+    assert controller.context.rendered() == []
+    assert list(controller._qa_history) == []
+    assert list(controller._recent_rejections) == []
+    assert controller.answers.empty()
+    assert controller._open_answer_jobs == {}
+    assert "old-running" in controller._obsolete_answer_ids
+    assert {
+        result.question_id: result.status for result in controller.app.resolved
+    } == {"old-queued": "cancelled", "old-running": "cancelled"}
+    assert controller.last_transcript is None
+    assert controller._last_transcript_in_context is False
+
+    resolved_before_ack = list(controller.app.resolved)
+    records_before_ack = list(controller.logger.records)
+    asyncio.run(
+        controller._complete_answer(
+            in_flight,
+            AnswerResult(
+                "old-running",
+                in_flight.query,
+                "This old-profile answer must not surface.",
+                "ok",
+                12.0,
+            ),
+        )
+    )
+
+    assert controller.app.resolved == resolved_before_ack
+    assert controller.logger.records == records_before_ack
+    assert controller.speech.queued == []
+    assert list(controller._qa_history) == []
+    assert controller._open_answer_jobs == {}
+
+
+def test_profile_boundary_cancels_active_request_and_worker_serves_new_job() -> None:
+    async def run() -> tuple[AmbientController, bool, list[tuple[str, str]], bool]:
+        controller = build_controller()
+        old_profile = Profile("Old", "Old domain", "", [], "")
+        new_profile = Profile("New", "New domain", "", [], "")
+        controller.profile = old_profile
+        controller.transcriber = FakeProfileTarget()  # type: ignore[assignment]
+        gate = FakeGate()
+        gate.profile = old_profile  # type: ignore[attr-defined]
+        gate.set_profile = lambda profile: setattr(  # type: ignore[attr-defined]
+            gate, "profile", profile
+        )
+        controller.gate = gate
+        old_started = asyncio.Event()
+        old_cancelled = False
+        sent: list[tuple[str, str]] = []
+
+        class Answerer:
+            profile = old_profile
+
+            def set_profile(self, profile: Profile | None) -> None:
+                self.profile = profile
+
+            async def answer(
+                self, _question_id: str, query: str, *_args: Any, **_kwargs: Any
+            ) -> AnswerResult:
+                nonlocal old_cancelled
+                if query == "old query":
+                    old_started.set()
+                    try:
+                        # Represents an old request waiting for Claude's shared
+                        # semaphore before it reads the mutable profile/sends.
+                        await asyncio.sleep(10.0)
+                    except asyncio.CancelledError:
+                        old_cancelled = True
+                        raise
+                    raise AssertionError("old request crossed the profile boundary")
+                active_name = self.profile.name if self.profile is not None else "none"
+                sent.append((query, active_name))
+                return AnswerResult(
+                    _question_id, query, "new-profile answer", "ok", 1.0
+                )
+
+        controller.answerer = Answerer()  # type: ignore[assignment]
+        old_job = _AnswerJob(
+            Transcript("mic", "old query", time.time(), "old-request"),
+            "old query",
+            ["old private context"],
+            "explicit_interrogative",
+            0.0,
+        )
+        await controller._enqueue_answer(old_job)
+        worker = asyncio.create_task(controller._answer_worker())
+        await asyncio.wait_for(old_started.wait(), timeout=1.0)
+        assert set(controller._answer_request_tasks) == {"old-request"}
+
+        controller._apply_profile(new_profile)
+        new_job = _AnswerJob(
+            Transcript("mic", "new query", time.time(), "new-request"),
+            "new query",
+            [],
+            "explicit_interrogative",
+            0.0,
+        )
+        await controller._enqueue_answer(new_job)
+        deadline = time.monotonic() + 1.0
+        while not any(
+            result.question_id == "new-request" for result in controller.app.resolved
+        ) and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        worker_survived = not worker.done()
+        controller.stop.set()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        return controller, old_cancelled, sent, worker_survived
+
+    controller, old_cancelled, sent, worker_survived = asyncio.run(run())
+
+    assert old_cancelled is True
+    assert worker_survived is True
+    assert sent == [("new query", "New")]
+    assert {
+        result.question_id: result.status for result in controller.app.resolved
+    } == {"old-request": "cancelled", "new-request": "ok"}
+    assert [record["answer_status"] for record in controller.logger.records] == [
+        "cancelled",
+        "ok",
+    ]
+    assert controller._answer_request_tasks == {}
+    assert controller._open_answer_jobs == {}
+
+
+def test_profile_boundary_during_transcript_ui_wait_never_reaches_new_gate() -> None:
+    async def run() -> tuple[AmbientController, list[tuple[str, str]]]:
+        controller = build_controller()
+        old = Profile("Old", "Old domain", "", [], "")
+        new = Profile("New", "New domain", "", [], "")
+        controller.profile = old
+        controller.transcriber = FakeProfileTarget()  # type: ignore[assignment]
+        gate_calls: list[tuple[str, str]] = []
+
+        class Gate(FakeGate):
+            profile: Profile | None = old
+
+            def set_profile(self, profile: Profile | None) -> None:
+                self.profile = profile
+
+            async def evaluate(
+                self, transcript: Transcript, *_args: Any, **_kwargs: Any
+            ) -> GateResult:
+                profile_name = self.profile.name if self.profile is not None else "none"
+                gate_calls.append((transcript.text, profile_name))
+                return GateResult(
+                    transcript, True, "explicit_interrogative", transcript.text, 1.0
+                )
+
+        controller.gate = Gate()
+        controller.answerer = FakeProfileTarget()  # type: ignore[assignment]
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class App(FakeApp):
+            async def add_transcript(self, transcript: Transcript) -> None:
+                self.transcripts.append(transcript)
+                entered.set()
+                await release.wait()
+
+        controller.app = App()
+        old_turn = Transcript(
+            "mic", "What is the old secret?", time.time(), "old-transcript", 2.0
+        )
+        processing = asyncio.create_task(controller._process_transcript(old_turn))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        controller._apply_profile(new, force_boundary=True)
+        release.set()
+        await processing
+        return controller, gate_calls
+
+    controller, gate_calls = asyncio.run(run())
+
+    assert gate_calls == []
+    assert controller.context.rendered() == []
+    assert controller.last_transcript is None
+    assert controller.answers.empty()
+    assert controller._open_answer_jobs == {}
+    assert controller.app.questions == []
+
+
+def test_input_reenable_during_agent_transcript_ui_wait_discards_old_turn() -> None:
+    async def run() -> AmbientController:
+        controller = build_controller()
+        enable_agent(controller)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class App(FakeApp):
+            async def add_transcript(self, transcript: Transcript) -> None:
+                self.transcripts.append(transcript)
+                entered.set()
+                await release.wait()
+
+        controller.app = App()
+        old_turn = Transcript(
+            "mic",
+            "My private pre-mute request",
+            time.time(),
+            "pre-mute-agent-turn",
+            2.0,
+        )
+        processing = asyncio.create_task(controller._process_transcript(old_turn))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        # Muting and re-enabling advances the channel's privacy boundary even
+        # though the final enabled state is true. The blocked pre-mute turn must
+        # not resume into Agent's gate-bypass answer path.
+        controller.input_channels_enabled["mic"] = False
+        controller._input_after["mic"] = time.time()
+        controller.input_channels_enabled["mic"] = True
+        release.set()
+        await processing
+        return controller
+
+    controller = asyncio.run(run())
+
+    assert controller.context.rendered() == []
+    assert controller.last_transcript is None
+    assert controller.answers.empty()
+    assert controller._open_answer_jobs == {}
+    assert controller.app.questions == []
+
+
+def test_profile_boundary_during_force_card_wait_cancels_without_enqueue() -> None:
+    async def run() -> AmbientController:
+        controller = build_controller()
+        old = Profile("Old", "Old domain", "", [], "")
+        new = Profile("New", "New domain", "", [], "")
+        controller.profile = old
+        controller.transcriber = FakeProfileTarget()  # type: ignore[assignment]
+        controller.gate = FakeProfileTarget()  # type: ignore[assignment]
+        controller.answerer = FakeProfileTarget()  # type: ignore[assignment]
+        controller.last_transcript = Transcript(
+            "mic", "Force the old secret", time.time(), "old-force", 2.0
+        )
+        controller._last_transcript_in_context = False
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class App(FakeApp):
+            async def add_question(self, question_id: str, question: str) -> None:
+                self.questions.append((question_id, question))
+                entered.set()
+                await release.wait()
+
+        controller.app = App()
+        forcing = asyncio.create_task(controller.force_answer_last())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        controller._apply_profile(new, force_boundary=True)
+        release.set()
+        await forcing
+        return controller
+
+    controller = asyncio.run(run())
+
+    assert controller.answers.empty()
+    assert controller._open_answer_jobs == {}
+    assert len(controller.app.resolved) == 1
+    assert controller.app.resolved[0].status == "cancelled"
+    assert controller.app.resolved[0].question_id.startswith("old-force-forced-")
+
+
+def test_profile_boundary_during_local_repeat_wait_cancels_old_reply() -> None:
+    async def run() -> tuple[AmbientController, bool]:
+        controller = build_controller()
+        seed = answer_job(timestamp=time.time())
+        await controller._complete_answer(
+            seed, AnswerResult("q1", seed.query, "Old profile answer.", "ok", 1.0)
+        )
+        controller.speech.queued.clear()
+        old = Profile("Old", "Old domain", "", [], "")
+        new = Profile("New", "New domain", "", [], "")
+        controller.profile = old
+        controller.transcriber = FakeProfileTarget()  # type: ignore[assignment]
+        gate = controller.gate
+        gate.set_profile = lambda _profile: None  # type: ignore[attr-defined]
+        controller.answerer = FakeProfileTarget()  # type: ignore[assignment]
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class App(FakeApp):
+            async def add_question(self, question_id: str, question: str) -> None:
+                self.questions.append((question_id, question))
+                entered.set()
+                await release.wait()
+
+        controller.app = App()
+        repeat = Transcript("mic", "Repeat that.", time.time(), "old-repeat", 2.0)
+        repeating = asyncio.create_task(controller._handle_local_repeat(repeat))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        controller._apply_profile(new, force_boundary=True)
+        release.set()
+        handled = await repeating
+        return controller, handled
+
+    controller, handled = asyncio.run(run())
+
+    assert handled is True
+    assert controller.answer_count == 1
+    assert list(controller._qa_history) == []
+    assert controller.speech.queued == []
+    assert [(item.question_id, item.status) for item in controller.app.resolved] == [
+        ("old-repeat", "cancelled")
+    ]
+
+
+def test_profile_boundary_during_agent_local_reply_wait_cancels_old_turn() -> None:
+    async def run() -> AmbientController:
+        controller = build_controller()
+        enable_agent(controller)
+        old = controller.profile
+        assert old is not None
+        new = Profile("New support", "New domain", "", [], "")
+        controller.transcriber = FakeProfileTarget(agent_mode=True)  # type: ignore[assignment]
+        gate = controller.gate
+        gate.set_profile = lambda _profile: None  # type: ignore[attr-defined]
+        controller.answerer = FakeProfileTarget()  # type: ignore[assignment]
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class App(FakeApp):
+            async def add_question(self, question_id: str, question: str) -> None:
+                self.questions.append((question_id, question))
+                entered.set()
+                await release.wait()
+
+        controller.app = App()
+        hello = Transcript("mic", "Hello.", time.time(), "old-hello", 2.0)
+        processing = asyncio.create_task(controller._process_transcript(hello))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        controller._apply_profile(new, force_boundary=True)
+        release.set()
+        await processing
+        return controller
+
+    controller = asyncio.run(run())
+
+    assert controller.answer_count == 0
+    assert list(controller._qa_history) == []
+    assert controller.speech.queued == []
+    assert controller.answers.empty()
+    assert [(item.question_id, item.status) for item in controller.app.resolved] == [
+        ("old-hello", "cancelled")
+    ]
+
+
+def test_slow_obsolete_knowledge_load_cannot_overwrite_new_profile(
+    monkeypatch: Any,
+) -> None:
+    async def run() -> tuple[AmbientController, dict[str, str]]:
+        controller = build_controller()
+        controller.config_path = main_module.Path("config.toml")
+        controller.config.context.enabled = True
+        controller.transcriber = FakeProfileTarget()  # type: ignore[assignment]
+        controller.gate = FakeProfileTarget()  # type: ignore[assignment]
+        controller.answerer = FakeProfileTarget()  # type: ignore[assignment]
+        old = Profile("Old", "Old", "", [], "", knowledge="old-pack")
+        first = Profile("First", "First", "", [], "", knowledge="first-pack")
+        second = Profile("Second", "Second", "", [], "", knowledge="second-pack")
+        controller.profile = old
+        controller.knowledge = "old knowledge"  # type: ignore[assignment]
+        profiles = {"first.md": first, "second.md": second}
+        persisted = {"value": "old.md"}
+        first_load_started = threading.Event()
+        release_first_load = threading.Event()
+
+        def fake_load_profile(path: Any, _report: Any) -> Profile:
+            return profiles[main_module.Path(path).name]
+
+        def fake_set_profile(_path: Any, value: str) -> None:
+            persisted["value"] = value
+
+        def fake_load_knowledge(
+            profile: Profile | None, _report: Any = None
+        ) -> Any:
+            if profile is first:
+                first_load_started.set()
+                assert release_first_load.wait(1.0)
+                return "first knowledge"
+            if profile is second:
+                return "second knowledge"
+            return None
+
+        monkeypatch.setattr(main_module, "load_profile", fake_load_profile)
+        monkeypatch.setattr(main_module, "set_context_profile", fake_set_profile)
+        controller._load_knowledge_for_profile = (  # type: ignore[method-assign]
+            fake_load_knowledge
+        )
+
+        first_task = asyncio.create_task(controller.select_profile("first.md"))
+        assert await asyncio.to_thread(first_load_started.wait, 1.0)
+        assert controller.profile is old
+        assert controller.knowledge == "old knowledge"
+        assert persisted["value"] == "old.md"
+
+        assert await controller.select_profile("second.md") == "Second"
+        assert controller.profile is second
+        assert controller.knowledge == "second knowledge"
+        release_first_load.set()
+        assert await first_task == "Second"
+        return controller, persisted
+
+    controller, persisted = asyncio.run(run())
+
+    assert controller.profile is not None
+    assert controller.profile.name == "Second"
+    assert controller.knowledge == "second knowledge"
+    assert controller.config.context.profile == "second.md"
+    assert persisted["value"] == "second.md"
+    assert controller.status_note == "Profile active: Second"
+
+
+def test_obsolete_profile_and_pack_warnings_are_never_published(
+    monkeypatch: Any,
+) -> None:
+    async def run(source: str) -> tuple[list[str], AmbientController]:
+        controller = build_controller()
+        controller.config_path = main_module.Path("config.toml")
+        controller.config.context.enabled = True
+        controller.config.context.profile = "old.md"
+        controller.transcriber = FakeProfileTarget()  # type: ignore[assignment]
+        controller.gate = FakeProfileTarget()  # type: ignore[assignment]
+        controller.answerer = FakeProfileTarget()  # type: ignore[assignment]
+        old = Profile("Old", "Old", "", [], "")
+        first = Profile("First", "First", "", [], "", knowledge="missing-pack")
+        valid = Profile("Valid", "Valid", "", [], "", knowledge="valid-pack")
+        controller.profile = old
+        controller.knowledge = "old knowledge"  # type: ignore[assignment]
+        published: list[str] = []
+        controller._report = published.append  # type: ignore[method-assign]
+        stale_started = threading.Event()
+        release_stale = threading.Event()
+
+        def fake_load_profile(path: Any, report: Any) -> Profile | None:
+            name = main_module.Path(path).name
+            if name == "first.md" and source == "profile":
+                stale_started.set()
+                assert release_stale.wait(1.0)
+                report("stale invalid-profile warning")
+                return None
+            return first if name == "first.md" else valid
+
+        def fake_load_knowledge(
+            profile: Profile | None, report: Any = None
+        ) -> Any:
+            if profile is first and source == "pack":
+                stale_started.set()
+                assert release_stale.wait(1.0)
+                assert report is not None
+                report("stale missing-pack warning")
+                return None
+            if profile is valid:
+                return "valid knowledge"
+            return None
+
+        monkeypatch.setattr(main_module, "load_profile", fake_load_profile)
+        monkeypatch.setattr(
+            main_module, "set_context_profile", lambda _path, _value: None
+        )
+        controller._load_knowledge_for_profile = (  # type: ignore[method-assign]
+            fake_load_knowledge
+        )
+
+        stale = asyncio.create_task(controller.select_profile("first.md"))
+        assert await asyncio.to_thread(stale_started.wait, 1.0)
+        assert await controller.select_profile("valid.md") == "Valid"
+        release_stale.set()
+        assert await stale == "Valid"
+        return published, controller
+
+    for source in ("profile", "pack"):
+        published, controller = asyncio.run(run(source))
+        assert published == ["Profile active: Valid"]
+        assert controller.profile is not None
+        assert controller.profile.name == "Valid"
+        assert controller.knowledge == "valid knowledge"
+
+
+def test_cancelling_profile_selection_during_pack_load_keeps_old_pair(
+    monkeypatch: Any,
+) -> None:
+    async def run() -> tuple[AmbientController, list[str], BaseException]:
+        controller = build_controller()
+        controller.config_path = main_module.Path("config.toml")
+        controller.config.context.enabled = True
+        controller.config.context.profile = "old.md"
+        controller.transcriber = FakeProfileTarget()  # type: ignore[assignment]
+        controller.gate = FakeProfileTarget()  # type: ignore[assignment]
+        controller.answerer = FakeProfileTarget()  # type: ignore[assignment]
+        old = Profile("Old", "Old", "", [], "", knowledge="old-pack")
+        new = Profile("New", "New", "", [], "", knowledge="new-pack")
+        controller.profile = old
+        controller.knowledge = "old knowledge"  # type: ignore[assignment]
+        load_started = threading.Event()
+        release_load = threading.Event()
+        load_finished = threading.Event()
+        writes: list[str] = []
+
+        monkeypatch.setattr(
+            main_module,
+            "load_profile",
+            lambda _path, _report: new,
+        )
+        monkeypatch.setattr(
+            main_module,
+            "set_context_profile",
+            lambda _path, value: writes.append(value),
+        )
+
+        def slow_load(profile: Profile | None, _report: Any = None) -> Any:
+            assert profile is new
+            load_started.set()
+            try:
+                assert release_load.wait(1.0)
+                return "new knowledge"
+            finally:
+                load_finished.set()
+
+        controller._load_knowledge_for_profile = slow_load  # type: ignore[method-assign]
+        selection = asyncio.create_task(controller.select_profile("new.md"))
+        assert await asyncio.to_thread(load_started.wait, 1.0)
+        selection.cancel()
+        release_load.set()
+        result = (await asyncio.gather(selection, return_exceptions=True))[0]
+        assert await asyncio.to_thread(load_finished.wait, 1.0)
+        return controller, writes, result
+
+    controller, writes, result = asyncio.run(run())
+
+    assert isinstance(result, asyncio.CancelledError)
+    assert writes == []
+    assert controller.config.context.profile == "old.md"
+    assert controller.profile is not None
+    assert controller.profile.name == "Old"
+    assert controller.knowledge == "old knowledge"
+
+
+def test_same_profile_pack_refresh_is_a_session_boundary(monkeypatch: Any) -> None:
+    async def run() -> AmbientController:
+        controller = build_controller()
+        controller.config_path = main_module.Path("config.toml")
+        controller.config.context.enabled = True
+        profile = Profile(
+            "Support", "Support", "", [], "same raw", knowledge="support-pack"
+        )
+        controller.profile = profile
+        controller.knowledge = "old pack"  # type: ignore[assignment]
+        controller.transcriber = FakeProfileTarget()  # type: ignore[assignment]
+        controller.gate = FakeProfileTarget()  # type: ignore[assignment]
+        controller.answerer = FakeProfileTarget()  # type: ignore[assignment]
+        controller.context.add(
+            Transcript("mic", "old context", time.time(), "old-context")
+        )
+        old_job = _AnswerJob(
+            Transcript("mic", "old grounded query", time.time(), "old-grounding"),
+            "old grounded query",
+            [],
+            "explicit_interrogative",
+            0.0,
+            grounding=["old pack grounding"],
+        )
+        controller._open_answer_jobs["old-grounding"] = old_job
+        controller.answers.put_nowait(old_job)
+        monkeypatch.setattr(
+            main_module, "load_profile", lambda _path, _report: profile
+        )
+        monkeypatch.setattr(
+            main_module, "set_context_profile", lambda _path, _value: None
+        )
+        controller._load_knowledge_for_profile = (  # type: ignore[method-assign]
+            lambda _profile, _report=None: "refreshed pack"
+        )
+
+        assert await controller.select_profile("support.md") == "Support"
+        return controller
+
+    controller = asyncio.run(run())
+
+    assert controller._session_generation == 1
+    assert controller.context.rendered() == []
+    assert controller.answers.empty()
+    assert controller._open_answer_jobs == {}
+    assert controller.app.resolved[-1].question_id == "old-grounding"
+    assert controller.app.resolved[-1].status == "cancelled"
+    assert controller.knowledge == "refreshed pack"
+
+
+def test_cancelled_current_profile_write_commits_matching_runtime_pair(
+    monkeypatch: Any,
+) -> None:
+    async def run() -> tuple[
+        AmbientController, dict[str, str], list[str], BaseException
+    ]:
+        controller = build_controller()
+        controller.config_path = main_module.Path("config.toml")
+        controller.config.context.enabled = True
+        controller.config.context.profile = "old.md"
+        controller.transcriber = FakeProfileTarget()  # type: ignore[assignment]
+        controller.gate = FakeProfileTarget()  # type: ignore[assignment]
+        controller.answerer = FakeProfileTarget()  # type: ignore[assignment]
+        old = Profile("Old", "Old", "", [], "")
+        new = Profile("New", "New", "", [], "", knowledge="new-pack")
+        controller.profile = old
+        controller.knowledge = "old knowledge"  # type: ignore[assignment]
+        persisted = {"value": "old.md"}
+        published: list[str] = []
+        controller._report = published.append  # type: ignore[method-assign]
+        write_started = threading.Event()
+        release_write = threading.Event()
+
+        def fake_load_profile(_path: Any, report: Any) -> Profile:
+            report("candidate profile note")
+            return new
+
+        def fake_load_knowledge(
+            profile: Profile | None, report: Any = None
+        ) -> Any:
+            assert profile is new
+            assert report is not None
+            report("candidate pack note")
+            return "new knowledge"
+
+        def slow_set_profile(_path: Any, value: str) -> None:
+            write_started.set()
+            assert release_write.wait(1.0)
+            persisted["value"] = value
+
+        monkeypatch.setattr(main_module, "load_profile", fake_load_profile)
+        monkeypatch.setattr(main_module, "set_context_profile", slow_set_profile)
+        controller._load_knowledge_for_profile = (  # type: ignore[method-assign]
+            fake_load_knowledge
+        )
+
+        selection = asyncio.create_task(controller.select_profile("new.md"))
+        assert await asyncio.to_thread(write_started.wait, 1.0)
+        selection.cancel()
+        release_write.set()
+        result = (await asyncio.gather(selection, return_exceptions=True))[0]
+        return controller, persisted, published, result
+
+    controller, persisted, published, result = asyncio.run(run())
+
+    assert isinstance(result, asyncio.CancelledError)
+    assert persisted["value"] == "new.md"
+    assert controller.config.context.profile == "new.md"
+    assert controller.profile is not None
+    assert controller.profile.name == "New"
+    assert controller.knowledge == "new knowledge"
+    assert published == [
+        "candidate profile note",
+        "candidate pack note",
+        "Profile active: New",
+    ]
+
+
+def test_cancelled_slow_profile_write_cannot_land_after_newer_selection(
+    monkeypatch: Any,
+) -> None:
+    async def run() -> tuple[AmbientController, dict[str, str], list[str]]:
+        controller = build_controller()
+        controller.config_path = main_module.Path("config.toml")
+        controller.config.context.enabled = True
+        controller.transcriber = FakeProfileTarget()  # type: ignore[assignment]
+        controller.gate = FakeProfileTarget()  # type: ignore[assignment]
+        controller.answerer = FakeProfileTarget()  # type: ignore[assignment]
+        profiles = {
+            "first.md": Profile("First", "First", "", [], ""),
+            "second.md": Profile("Second", "Second", "", [], ""),
+        }
+        persisted = {"value": "old.md"}
+        writes: list[str] = []
+        first_write_started = threading.Event()
+        release_first_write = threading.Event()
+
+        def fake_load_profile(path: Any, _report: Any) -> Profile:
+            return profiles[main_module.Path(path).name]
+
+        def slow_set_profile(_path: Any, value: str) -> None:
+            if value == "first.md":
+                first_write_started.set()
+                assert release_first_write.wait(1.0)
+            persisted["value"] = value
+            writes.append(value)
+
+        monkeypatch.setattr(main_module, "load_profile", fake_load_profile)
+        monkeypatch.setattr(main_module, "set_context_profile", slow_set_profile)
+        controller._load_knowledge_for_profile = (  # type: ignore[method-assign]
+            lambda _profile, _report=None: None
+        )
+
+        first_task = asyncio.create_task(controller.select_profile("first.md"))
+        assert await asyncio.to_thread(first_write_started.wait, 1.0)
+        first_task.cancel()
+        second_task = asyncio.create_task(controller.select_profile("second.md"))
+        await asyncio.sleep(0.01)
+        assert writes == []
+        release_first_write.set()
+        first_result, second_result = await asyncio.gather(
+            first_task, second_task, return_exceptions=True
+        )
+        assert isinstance(first_result, asyncio.CancelledError)
+        assert second_result == "Second"
+        return controller, persisted, writes
+
+    controller, persisted, writes = asyncio.run(run())
+
+    assert writes == ["first.md", "second.md"]
+    assert persisted["value"] == "second.md"
+    assert controller.config.context.profile == "second.md"
+    assert controller.profile is not None
+    assert controller.profile.name == "Second"
 
 
 def test_agent_role_cannot_be_enabled_without_voice() -> None:
@@ -647,6 +1447,41 @@ def test_voice_waits_for_audit_and_speaks_only_the_revision() -> None:
     assert received["style"] == "interview"
 
 
+def test_recovered_answer_deadline_also_bounds_deferred_voice_audit() -> None:
+    async def run() -> tuple[AmbientController, bool]:
+        controller = build_controller(verify="always")
+        cancelled = False
+
+        class Answerer:
+            async def verify(self, *_args: Any, **_kwargs: Any) -> str:
+                nonlocal cancelled
+                try:
+                    await asyncio.sleep(10.0)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    raise
+                return "A late revision."
+
+        controller.answerer = Answerer()  # type: ignore[assignment]
+        job = answer_job(timestamp=time.time())
+        job.reason = "second_pass_recovery"
+        job.expires_at = time.perf_counter() + 0.03
+        await controller._complete_answer(
+            job, AnswerResult("q1", job.query, "An on-time answer.", "ok", 1.0)
+        )
+        await asyncio.gather(*list(controller._verify_tasks))
+        return controller, cancelled
+
+    controller, cancelled = asyncio.run(run())
+
+    assert cancelled is True
+    assert controller.speech.queued == []
+    assert [item.status for item in controller.app.resolved] == ["ok"]
+    assert [record["answer_status"] for record in controller.logger.records] == [
+        "ok"
+    ]
+
+
 def test_error_and_pre_mute_answers_are_never_spoken() -> None:
     controller = build_controller()
     job = answer_job(timestamp=100.0)
@@ -668,7 +1503,9 @@ def test_sweep_keeps_failed_batch_but_clears_successful_no_miss_batch() -> None:
         controller.config.answer.sweep_interval_s = 0.001
         controller.paused = False
         controller.stop = asyncio.Event()
-        candidate = Transcript("mic", "possible request", 100.0, "candidate")
+        candidate = Transcript(
+            "mic", "possible request", time.time(), "candidate"
+        )
         controller._recent_rejections = deque([candidate], maxlen=24)
         controller._qa_history = deque(maxlen=8)
         controller._open_answer_jobs = {}
@@ -689,6 +1526,253 @@ def test_sweep_keeps_failed_batch_but_clears_successful_no_miss_batch() -> None:
 
     assert [item.utterance_id for item in retained] == ["candidate"]
     assert cleared == []
+
+
+def test_sweep_discards_candidates_older_than_the_recovery_window() -> None:
+    async def run() -> tuple[list[Transcript], int]:
+        controller = AmbientController.__new__(AmbientController)
+        controller.config = default_config()
+        controller.config.answer.sweep_interval_s = 0.001
+        controller.config.answer.sweep_max_age_s = 0.01
+        controller.paused = False
+        controller.stop = asyncio.Event()
+        # The sweep-ready sidecar is fresh: expiry must be anchored to the
+        # audio/transcript timestamp, including all upstream pipeline delay.
+        candidate = Transcript(
+            "mic", "possible request", time.time() - 1.0, "expired"
+        )
+        controller._recent_rejections = deque([candidate], maxlen=24)
+        controller._sweep_ready_at = {
+            candidate.utterance_id: time.perf_counter()
+        }
+        controller._sweep_stage_latencies = {candidate.utterance_id: {}}
+        controller._qa_history = deque(maxlen=8)
+        controller._open_answer_jobs = {}
+        controller.context = TranscriptContext()
+        calls = 0
+
+        class Answerer:
+            async def detect_missed(self, *_args, **_kwargs):
+                nonlocal calls
+                calls += 1
+                return []
+
+        controller.answerer = Answerer()
+        controller._report = lambda _message: None  # type: ignore[method-assign]
+
+        async def stop_soon() -> None:
+            await asyncio.sleep(0.005)
+            controller.stop.set()
+
+        await asyncio.gather(controller._sweep_worker(), stop_soon())
+        return list(controller._recent_rejections), calls
+
+    candidates, calls = asyncio.run(run())
+    assert candidates == []
+    assert calls == 0
+
+
+def test_profile_switch_during_sweep_cannot_resurrect_old_candidate() -> None:
+    async def run() -> tuple[AmbientController, bool]:
+        controller = build_controller()
+        controller.config.answer.sweep_interval_s = 0.001
+        controller.profile = Profile("Old", "Old domain", "", [], "")
+        controller.transcriber = FakeProfileTarget()  # type: ignore[assignment]
+        controller.gate = FakeProfileTarget()  # type: ignore[assignment]
+        entered = asyncio.Event()
+        cancelled = False
+
+        class Answerer(FakeProfileTarget):
+            async def detect_missed(self, *_args: Any, **_kwargs: Any):
+                nonlocal cancelled
+                entered.set()
+                try:
+                    await asyncio.sleep(10.0)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    raise
+                raise AssertionError("old sweep request was not cancelled")
+
+        controller.answerer = Answerer()  # type: ignore[assignment]
+        controller._recent_rejections.append(
+            Transcript("mic", "old-domain candidate", time.time(), "old-candidate")
+        )
+        controller._sweep_ready_at["old-candidate"] = time.perf_counter()
+        worker = asyncio.create_task(controller._sweep_worker())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        controller._apply_profile(Profile("New", "New domain", "", [], ""))
+        controller.stop.set()
+        await worker
+        return controller, cancelled
+
+    controller, cancelled = asyncio.run(run())
+
+    assert cancelled is True
+    assert controller.profile is not None
+    assert controller.profile.name == "New"
+    assert controller.app.questions == []
+    assert controller.answers.empty()
+    assert controller._open_answer_jobs == {}
+    assert controller._sweep_request_task is None
+
+
+def test_profile_switch_during_recovered_card_wait_cancels_without_enqueue() -> None:
+    async def run() -> AmbientController:
+        controller = build_controller()
+        controller.config.answer.sweep_interval_s = 0.001
+        old = Profile("Old", "Old domain", "", [], "")
+        new = Profile("New", "New domain", "", [], "")
+        controller.profile = old
+        controller.transcriber = FakeProfileTarget()  # type: ignore[assignment]
+        controller.gate = FakeProfileTarget()  # type: ignore[assignment]
+
+        class Answerer(FakeProfileTarget):
+            async def detect_missed(self, *_args: Any, **_kwargs: Any):
+                return [(0, "What is the old private answer?")]
+
+        controller.answerer = Answerer(profile=old)  # type: ignore[assignment]
+        controller._recent_rejections.append(
+            Transcript(
+                "mic",
+                "old private candidate",
+                time.time(),
+                "old-sweep-card",
+            )
+        )
+        controller._sweep_ready_at["old-sweep-card"] = time.perf_counter()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class App(FakeApp):
+            async def add_question(self, question_id: str, question: str) -> None:
+                self.questions.append((question_id, question))
+                entered.set()
+                await release.wait()
+
+        controller.app = App()
+        worker = asyncio.create_task(controller._sweep_worker())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        controller._apply_profile(new, force_boundary=True)
+        controller.stop.set()
+        release.set()
+        await worker
+        return controller
+
+    controller = asyncio.run(run())
+
+    assert controller.answers.empty()
+    assert controller._open_answer_jobs == {}
+    assert controller.app.questions == [
+        (
+            "old-sweep-card-recovered",
+            "What is the old private answer?",
+        )
+    ]
+    assert [(item.question_id, item.status) for item in controller.app.resolved] == [
+        ("old-sweep-card-recovered", "cancelled")
+    ]
+
+
+def test_cancelled_audio_selection_waits_for_write_close_and_restart(
+    monkeypatch: Any,
+) -> None:
+    async def run() -> tuple[
+        AmbientController, dict[str, str], list[str], list[str], BaseException
+    ]:
+        controller = build_controller()
+        controller.config_path = main_module.Path("config.toml")
+        controller.config.audio.mic_device = "Old microphone"
+        controller._device_lock = asyncio.Lock()
+        await controller._device_lock.acquire()
+        controller._capture_loop = asyncio.get_running_loop()
+        controller.frames = DropOldestQueue(2)
+        published: list[str] = []
+        controller._report = published.append  # type: ignore[method-assign]
+
+        write_started = threading.Event()
+        release_write = threading.Event()
+        close_started = threading.Event()
+        release_close = threading.Event()
+        restarted = threading.Event()
+        persisted = {"mic_device": "Old microphone"}
+        events: list[str] = []
+
+        def slow_set_audio_device(
+            _path: Any, key: str, selected_name: str
+        ) -> None:
+            events.append("write-start")
+            write_started.set()
+            assert release_write.wait(1.0)
+            persisted[key] = selected_name
+            events.append("write-done")
+
+        class Session:
+            def close(self) -> None:
+                # The persisted and runtime values must already agree before
+                # meter teardown starts, even after write-wait cancellation.
+                assert persisted["mic_device"] == "New microphone"
+                assert controller.config.audio.mic_device == "New microphone"
+                events.append("close-start")
+                close_started.set()
+                assert release_close.wait(1.0)
+                events.append("close-done")
+
+        class Capture:
+            def start(
+                self,
+                _loop: asyncio.AbstractEventLoop,
+                _frames: Any,
+                *,
+                enabled: bool,
+            ) -> None:
+                assert enabled is True
+                events.append("restart")
+                restarted.set()
+
+        monkeypatch.setattr(main_module, "set_audio_device", slow_set_audio_device)
+        controller.capture = Capture()  # type: ignore[assignment]
+        selected = main_module.CaptureDevice(
+            "new-mic",
+            "New microphone",
+            "mic",
+            1,
+            48_000,
+        )
+        closing = asyncio.create_task(
+            controller.close_audio_devices(Session(), selected)  # type: ignore[arg-type]
+        )
+        assert await asyncio.to_thread(write_started.wait, 1.0)
+        closing.cancel()
+        assert controller._device_lock.locked()
+        release_write.set()
+        assert await asyncio.to_thread(close_started.wait, 1.0)
+
+        # A second cancellation while session.close() is blocked must not let
+        # capture restart or the picker ownership lock escape early either.
+        closing.cancel()
+        await asyncio.sleep(0.01)
+        assert controller._device_lock.locked()
+        assert not restarted.is_set()
+        release_close.set()
+        result = (await asyncio.gather(closing, return_exceptions=True))[0]
+        return controller, persisted, published, events, result
+
+    controller, persisted, published, events, result = asyncio.run(run())
+
+    assert isinstance(result, asyncio.CancelledError)
+    assert persisted["mic_device"] == "New microphone"
+    assert controller.config.audio.mic_device == "New microphone"
+    assert published == ["Audio device selected: New microphone"]
+    assert events == [
+        "write-start",
+        "write-done",
+        "close-start",
+        "close-done",
+        "restart",
+    ]
+    assert controller._device_lock.locked() is False
 
 
 def test_continuity_residence_is_carried_as_a_stage_latency() -> None:
@@ -727,7 +1811,13 @@ def test_recovered_answer_records_wait_sweep_and_answer_stages() -> None:
         controller.paused = False
         controller.stop = asyncio.Event()
         controller.interaction_mode = "normal"
-        candidate = Transcript("mic", "what should I improve,", 100.0, "candidate", 824.0)
+        candidate = Transcript(
+            "mic",
+            "what should I improve,",
+            time.time() - 0.02,
+            "candidate",
+            824.0,
+        )
         controller._recent_rejections = deque([candidate], maxlen=24)
         controller._sweep_ready_at = {
             candidate.utterance_id: time.perf_counter() - 0.02
@@ -744,7 +1834,10 @@ def test_recovered_answer_records_wait_sweep_and_answer_stages() -> None:
             async def detect_missed(self, *_args, **_kwargs):
                 await asyncio.sleep(0.002)
                 controller.stop.set()
-                return [(0, "What should I improve?")]
+                return [
+                    (0, "What should I improve?"),
+                    (0, "How should I improve?"),
+                ]
 
         class App:
             async def add_question(self, _question_id: str, _question: str) -> None:
@@ -759,6 +1852,7 @@ def test_recovered_answer_records_wait_sweep_and_answer_stages() -> None:
         controller._report = lambda _message: None  # type: ignore[method-assign]
         await controller._sweep_worker()
 
+        assert len(queued) == 1
         job = queued[0]
         recorder = build_controller()
         await recorder._complete_answer(
@@ -772,12 +1866,78 @@ def test_recovered_answer_records_wait_sweep_and_answer_stages() -> None:
     assert job.stage_latencies_ms["continuity"] == 13_000.0
     assert job.stage_latencies_ms["sweep_wait"] >= 20.0
     assert job.stage_latencies_ms["sweep"] >= 2.0
+    assert job.expires_at is not None
+    assert 0.0 < job.expires_at - time.perf_counter() < 60.0
     assert record["latencies_ms"] == {
         "stt": 824.0,
         **job.stage_latencies_ms,
         "gate": 0.0,
         "answer": 5_300.0,
     }
+
+
+def test_recovered_answer_deadline_cancels_slow_generation_without_delivery() -> None:
+    async def run() -> tuple[AmbientController, bool]:
+        controller = build_controller()
+        cancelled = False
+
+        class SlowAnswerer:
+            async def answer(self, *_args: Any, **_kwargs: Any) -> AnswerResult:
+                nonlocal cancelled
+                try:
+                    await asyncio.sleep(10.0)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    raise
+                raise AssertionError("deadline did not cancel slow generation")
+
+        controller.answerer = SlowAnswerer()  # type: ignore[assignment]
+        job = answer_job(timestamp=time.time())
+        job.reason = "second_pass_recovery"
+        job.expires_at = time.perf_counter() + 0.03
+        await controller._enqueue_answer(job)
+        worker = asyncio.create_task(controller._answer_worker())
+        deadline = time.monotonic() + 1.0
+        while not controller.app.resolved and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        controller.stop.set()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        return controller, cancelled
+
+    controller, cancelled = asyncio.run(run())
+
+    assert cancelled is True
+    assert controller.app.resolved[-1].status == "cancelled"
+    assert controller.app.resolved[-1].answer == "expired before delivery"
+    assert controller.speech.queued == []
+    assert controller.gate.answered == []
+    assert controller.gate.answer_text == []
+    assert list(controller._qa_history) == []
+    assert controller.logger.records[-1]["answer_status"] == "cancelled"
+
+
+def test_recovered_answer_completion_backstop_canonicalizes_late_results() -> None:
+    for status in ("ok", "error", "timed_out"):
+        controller = build_controller()
+        job = answer_job(timestamp=time.time() - 1.0)
+        job.reason = "second_pass_recovery"
+        job.expires_at = time.perf_counter() - 0.001
+
+        asyncio.run(
+            controller._complete_answer(
+                job,
+                AnswerResult("q1", job.query, "A stale result.", status, 20.0),
+            )
+        )
+
+        assert controller.app.resolved[-1].status == "cancelled"
+        assert controller.app.resolved[-1].answer == "expired before delivery"
+        assert controller.speech.queued == []
+        assert controller.gate.answered == []
+        assert controller.gate.answer_text == []
+        assert list(controller._qa_history) == []
+        assert controller.logger.records[-1]["answer_status"] == "cancelled"
 
 
 def test_agent_statement_bypasses_question_gate_and_queues_direct_reply() -> None:
@@ -800,6 +1960,29 @@ def test_agent_statement_bypasses_question_gate_and_queues_direct_reply() -> Non
     assert job.speech_mode == "full"
     assert controller.app.questions == [
         ("agent-problem", "My account keeps signing me out.")
+    ]
+
+
+def test_agent_urgent_repeated_help_is_preserved_and_queued() -> None:
+    controller = build_controller()
+    enable_agent(controller)
+    item = Transcript(
+        "mic",
+        "Help help help help!",
+        time.time(),
+        "urgent-help",
+        2.0,
+    )
+
+    asyncio.run(controller._process_transcript(item))
+
+    job = controller.answers.get_nowait()
+    controller.answers.task_done()
+    assert job.query == "Help help help help!"
+    assert job.reason == "agent_turn"
+    assert controller.context.rendered() == ["[mic] Help help help help!"]
+    assert controller.app.questions == [
+        ("urgent-help", "Help help help help!")
     ]
 
 
@@ -1095,6 +2278,58 @@ def test_agent_answer_workers_preserve_turn_order_and_history() -> None:
     assert calls == ["first", "second"]
     assert histories[0] == []
     assert histories[1] == [("first", "reply to first")]
+
+
+def test_answer_worker_keeps_context_rewrite_out_of_lookup_input() -> None:
+    async def run() -> dict[str, object]:
+        controller = build_controller()
+        captured: dict[str, object] = {}
+
+        class Answerer:
+            in_flight = 0
+
+            async def answer(
+                self,
+                question_id: str,
+                query: str,
+                _context: list[str],
+                **kwargs: Any,
+            ) -> AnswerResult:
+                captured["query"] = query
+                captured["lookup_query"] = kwargs.get("lookup_query")
+                return AnswerResult(question_id, query, "Safe answer.", "ok", 1.0)
+
+        controller.answerer = Answerer()  # type: ignore[assignment]
+        transcript = Transcript(
+            "sys",
+            "What is its latest version?",
+            time.time(),
+            "literal-lookup",
+        )
+        await controller._enqueue_answer(
+            _AnswerJob(
+                transcript,
+                "What is the latest version used by SECRET PROJECT ZEPHYR?",
+                ["[sys] SECRET PROJECT ZEPHYR uses Library X"],
+                "semantic_gate",
+                1.0,
+            )
+        )
+        worker = asyncio.create_task(controller._answer_worker())
+        deadline = time.monotonic() + 1.0
+        while controller.answer_count < 1 and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        controller.stop.set()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        return captured
+
+    captured = asyncio.run(run())
+
+    assert captured["query"] == (
+        "What is the latest version used by SECRET PROJECT ZEPHYR?"
+    )
+    assert captured["lookup_query"] == "What is its latest version?"
 
 
 def test_new_agent_session_flushes_old_speech_history_context_and_queued_work() -> None:

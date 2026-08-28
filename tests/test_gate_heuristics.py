@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import subprocess
 import threading
 import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from ambientqa.config import GateConfig
+from ambientqa import gate as gate_module
 from ambientqa.bus import Transcript
+from ambientqa.config import GateConfig
 from ambientqa.gate import (
-    OllamaGate,
     PROMPTS,
+    OllamaGate,
     QuestionGate,
     heuristic_decision,
     is_question_shaped,
@@ -528,6 +533,129 @@ def test_warmup_cancellation_does_not_wait_for_the_request(
     assert gate._warming is None
 
 
+def test_normal_gate_timeout_does_not_join_a_stuck_http_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = OllamaGate(GateConfig(request_timeout_s=0.01))
+    release = threading.Event()
+
+    def blocking_post(_body, _timeout=None):
+        release.wait(timeout=30.0)
+        return {"message": {"content": '{"q":false,"query":""}'}}
+
+    monkeypatch.setattr(gate, "_post", blocking_post)
+    started = time.perf_counter()
+    try:
+        assert asyncio.run(gate.classify("What about this?", [])) == (False, "")
+    finally:
+        release.set()
+    assert time.perf_counter() - started < 1.0
+
+
+def test_ollama_request_bypasses_environment_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    direct_bodies: list[bytes] = []
+    proxy_bodies: list[bytes] = []
+
+    def handler_for(destination: list[bytes]):
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                destination.append(self.rfile.read(length))
+                payload = json.dumps(
+                    {
+                        "message": {
+                            "content": json.dumps({"q": False, "query": ""})
+                        }
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return None
+
+        return Handler
+
+    direct = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(direct_bodies))
+    proxy = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(proxy_bodies))
+    threads = [
+        threading.Thread(target=server.serve_forever, daemon=True)
+        for server in (direct, proxy)
+    ]
+    for thread in threads:
+        thread.start()
+    monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{proxy.server_port}")
+    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{proxy.server_port}")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    gate = OllamaGate(
+        GateConfig(ollama_url=f"http://127.0.0.1:{direct.server_port}/api/chat")
+    )
+    try:
+        assert asyncio.run(
+            gate.classify("PRIVATE CURRENT UTTERANCE", ["PRIVATE CONTEXT"])
+        ) == (False, "")
+    finally:
+        for server in (direct, proxy):
+            server.shutdown()
+            server.server_close()
+
+    assert len(direct_bodies) == 1
+    assert b"PRIVATE CURRENT UTTERANCE" in direct_bodies[0]
+    assert b"PRIVATE CONTEXT" in direct_bodies[0]
+    assert proxy_bodies == []
+
+
+def test_ollama_response_is_size_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, limit: int) -> bytes:
+            assert limit == 1024 * 1024 + 1
+            return b"x" * limit
+
+    class Opener:
+        def open(self, *_args: object, **_kwargs: object) -> Response:
+            return Response()
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_args: Opener())
+    with pytest.raises(ValueError, match="exceeded 1 MiB"):
+        OllamaGate(GateConfig())._post({"private": "text"})
+
+
+def test_managed_macos_listener_must_be_owned_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AMBIENTQA_REQUIRE_MANAGED_OLLAMA", "1")
+    monkeypatch.setenv("AMBIENTQA_OLLAMA_PID", "4242")
+    monkeypatch.setattr(gate_module.sys, "platform", "darwin")
+    seen: list[list[str]] = []
+
+    def wrong_owner(command, **_kwargs):
+        seen.append(command)
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(gate_module.subprocess, "run", wrong_owner)
+    monkeypatch.setattr(
+        urllib.request,
+        "build_opener",
+        lambda *_args: pytest.fail("HTTP opened before listener ownership passed"),
+    )
+
+    with pytest.raises(OSError, match="no longer owns"):
+        OllamaGate(GateConfig())._post({"private": "SECRET TRANSCRIPT"})
+    assert seen and "4242" in seen[0]
+    assert "-iTCP:11434" in seen[0]
+
+
 def test_empty_self_contained_rewrite_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     gate = OllamaGate(GateConfig())
 
@@ -864,6 +992,100 @@ def test_imperative_requests_are_accepted(text: str) -> None:
 )
 def test_imperative_lookalikes_are_not_accepted(text: str) -> None:
     assert heuristic_decision(text).outcome != "accept"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Okay, let's talk about that, yeah.",
+        "Okay, let’s talk about that, yeah.",
+        "Okay, let us talk about that, yeah.",
+    ],
+)
+def test_reported_lets_talk_narration_does_not_fast_accept(text: str) -> None:
+    decision = heuristic_decision(text)
+    assert (decision.outcome, decision.reason) == ("llm", "needs_semantic_gate")
+
+
+def test_reported_word_salad_cannot_reach_an_imperative_fast_path() -> None:
+    text = (
+        "…. …. List or should games … algún … … And direct information "
+        "questionnaire … is result of a word … you can submit … GOD … "
+        "Agent …!!!! … aldль … don't mess… … …"
+    )
+    decision = heuristic_decision(text)
+    assert (decision.outcome, decision.reason) == (
+        "reject",
+        "garbled_transcript",
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "List or should games and direct information questionnaire result word submit GOD Agent mess",
+        "Describe potato security wonder station violet architecture window system",
+        "Tell me airplane IAM orange limitation professor questionnaire.",
+    ],
+)
+def test_full_policy_semantically_judges_imperative_shaped_word_salad(
+    text: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = QuestionGate(GateConfig())
+    calls: list[str] = []
+
+    async def reject_word_salad(value: str, _context: list[str]) -> tuple[bool, str]:
+        calls.append(value)
+        return False, ""
+
+    monkeypatch.setattr(gate.ollama, "classify", reject_word_salad)
+    result = asyncio.run(
+        gate.evaluate(Transcript("sys", text, 100.0, "salad"), [], policy="full")
+    )
+
+    assert calls == [text]
+    assert result.accepted is False
+
+
+def test_explicit_policy_keeps_clear_imperative_zero_call_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = QuestionGate(GateConfig())
+
+    async def must_not_run(_text: str, _context: list[str]) -> tuple[bool, str]:
+        raise AssertionError("explicit command reached semantic gate")
+
+    monkeypatch.setattr(gate.ollama, "classify", must_not_run)
+    result = asyncio.run(
+        gate.evaluate(
+            Transcript("mic", "Explain the CAP theorem.", 100.0, "command"),
+            [],
+            policy="explicit",
+        )
+    )
+
+    assert (result.accepted, result.reason) == (True, "imperative_request")
+
+
+def test_full_policy_imperative_fails_closed_when_semantic_gate_is_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = QuestionGate(GateConfig())
+
+    async def unavailable(_text: str, _context: list[str]) -> tuple[bool, str]:
+        gate.ollama.available = False
+        return False, ""
+
+    monkeypatch.setattr(gate.ollama, "classify", unavailable)
+    result = asyncio.run(
+        gate.evaluate(
+            Transcript("sys", "Tell me about yourself.", 100.0, "outage"),
+            [],
+            policy="full",
+        )
+    )
+
+    assert (result.accepted, result.reason) == (False, "ollama_unavailable")
 
 
 # --- question shape: an interrogative START counts, not just the '?' ---

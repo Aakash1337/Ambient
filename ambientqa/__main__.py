@@ -17,7 +17,7 @@ from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from textual._context import active_app
@@ -32,11 +32,11 @@ from .bus import AnswerResult, AudioFrame, DropOldestQueue, Transcript, Utteranc
 from .config import Config, load_config
 from .config_write import set_audio_device, set_context_profile
 from .continuity import ContinuityMerger
-from .context import TranscriptContext, token_set_ratio
+from .context import TranscriptContext, token_set_ratio, transcript_quality_reason
 from .gate import QuestionGate
 from .instances import InstanceRegistry
 from .knowledge import KnowledgeHit, KnowledgeIndex, load_pack
-from .logging_ import SessionLogger
+from .logging_ import PrivateFileHandler, SessionLogger, prepare_log_directory
 from .profile import Profile, load_profile
 from .segmenter import UtteranceSegmenter, segment_worker
 from .stt import WhisperTranscriber, stt_worker
@@ -77,6 +77,10 @@ class _AnswerJob:
     # when the question was a weak cache match. Empty in the common case; kept
     # last so existing positional _AnswerJob construction stays source-stable.
     grounding: list[str] = field(default_factory=list)
+    # Monotonic hard deadline for time-sensitive jobs such as second-pass
+    # recovery. Optional and last so every existing positional constructor
+    # remains source-compatible.
+    expires_at: float | None = None
 
 
 @dataclass(slots=True)
@@ -185,6 +189,7 @@ class AmbientController:
         self._agent_awaiting_reply = False
         self._last_agent_turn: tuple[str, float] | None = None
         self._obsolete_answer_ids: set[str] = set()
+        self._session_generation = 0
         self.paused = False
         self.stop = asyncio.Event()
         self.frames: DropOldestQueue[AudioFrame] = DropOldestQueue(
@@ -277,12 +282,15 @@ class AmbientController:
         self.knowledge: KnowledgeIndex | None = None
         self._reload_knowledge_for_profile(self.profile)
         self.last_transcript: Transcript | None = None
+        self._last_transcript_in_context = False
         self.answer_count = 0
         self.estimated_tokens = 0
         self._tasks: list[asyncio.Task[Any]] = []
         self._ui_tasks: set[asyncio.Task[Any]] = set()
         self._force_lock = asyncio.Lock()
         self._device_lock = asyncio.Lock()
+        self._profile_write_lock = asyncio.Lock()
+        self._profile_selection_revision = 0
         self._capture_loop: asyncio.AbstractEventLoop | None = None
         self._pending_system: deque[_PendingSystem] = deque()
         # Completed (query, answer) pairs, oldest first. This -- not the raw
@@ -293,6 +301,7 @@ class AmbientController:
             maxlen=config.answer.history_turns
         )
         self._open_answer_jobs: dict[str, _AnswerJob] = {}
+        self._answer_request_tasks: dict[str, asyncio.Task[AnswerResult]] = {}
         # Unlike _last_voice_answer, this exists in Assist as well as Voice and
         # therefore gives every surface the same deterministic repeat command.
         self._last_completed_answer: _RecentAnswer | None = None
@@ -313,6 +322,9 @@ class AmbientController:
         self._continuity_arrived_at: dict[str, float] = {}
         self._sweep_ready_at: dict[str, float] = {}
         self._sweep_stage_latencies: dict[str, dict[str, float]] = {}
+        self._sweep_request_task: asyncio.Task[
+            list[tuple[int, str]] | None
+        ] | None = None
         # Audits run strictly after their answer is on screen and never more
         # than one at a time. ClaudeAnswerer applies the shared aggregate CLI
         # process limit across primary answers, audits, and sweeps.
@@ -438,11 +450,11 @@ class AmbientController:
     async def _restart_capture(self) -> None:
         loop = self._capture_loop or asyncio.get_running_loop()
         self._capture_loop = loop
-        # Shielded: a worker cancellation arriving while the executor call is
-        # still queued would otherwise silently discard the restart and leave
-        # capture off. The start itself is serialised by the capture's own
-        # lifecycle lock, so letting it finish unobserved is always safe.
-        await asyncio.shield(
+        # A shield alone returns control to the cancelled caller immediately;
+        # the capture start would then continue on an unowned executor thread.
+        # Wait through cancellation so a device-picker owner cannot release its
+        # lock (or report completion) before capture has actually restarted.
+        restarting = asyncio.create_task(
             asyncio.to_thread(
                 self.capture.start,
                 loop,
@@ -450,6 +462,32 @@ class AmbientController:
                 enabled=not self.paused,
             )
         )
+        _, cancellation = await self._await_task_completion(restarting)
+        if cancellation is not None:
+            raise cancellation
+
+    @staticmethod
+    async def _await_task_completion(
+        task: asyncio.Task[Any],
+    ) -> tuple[Any, asyncio.CancelledError | None]:
+        """Wait for an irreversible child operation before surfacing cancellation.
+
+        ``asyncio.to_thread`` cannot stop the underlying filesystem/device
+        operation after it starts. This helper remembers cancellation while
+        continuing to shield the child, returning only after its real result is
+        available so callers can commit matching runtime state and release
+        ownership in the correct order.
+        """
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(task)
+                break
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+                if task.done():
+                    break
+        return task.result(), cancellation
 
     async def open_audio_devices(self) -> MeterSession:
         await self._device_lock.acquire()
@@ -499,29 +537,53 @@ class AmbientController:
         session: MeterSession,
         selected: CaptureDevice | None,
     ) -> None:
+        cancellation: asyncio.CancelledError | None = None
+        failure: BaseException | None = None
         try:
             if selected is not None:
                 key = "mic_device" if selected.kind == "mic" else "output_device"
-                await asyncio.to_thread(
-                    set_audio_device,
-                    self.config_path,
-                    key,
-                    selected.name,
+                writing = asyncio.create_task(
+                    asyncio.to_thread(
+                        set_audio_device,
+                        self.config_path,
+                        key,
+                        selected.name,
+                    )
                 )
+                _, write_cancellation = await self._await_task_completion(writing)
+                cancellation = write_cancellation or cancellation
+                # The write really succeeded, so publish its matching runtime
+                # value even if the picker task was cancelled while it ran.
                 setattr(self.config.audio, key, selected.name)
                 self._report(f"Audio device selected: {selected.name}")
+        except BaseException as exc:
+            failure = exc
+
+        try:
+            # Closing joins reader threads and reaps child processes. Do not
+            # restart capture until that work has actually completed: a shield
+            # by itself would let cancellation resume this coroutine early.
+            closing = asyncio.create_task(asyncio.to_thread(session.close))
+            _, close_cancellation = await self._await_task_completion(closing)
+            cancellation = close_cancellation or cancellation
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+
+        try:
+            await self._restart_capture()
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
         finally:
-            try:
-                # Shielded for the same reason as the open side: a cancellation
-                # landing while close is still queued on the executor would
-                # skip it entirely, leaving every meter stream (a live parec
-                # child per endpoint) capturing for the life of the process.
-                await asyncio.shield(asyncio.to_thread(session.close))
-            finally:
-                try:
-                    await self._restart_capture()
-                finally:
-                    self._device_lock.release()
+            self._device_lock.release()
+
+        if failure is not None:
+            raise failure
+        if cancellation is not None:
+            raise cancellation
 
     def cycle_gate_mode(self) -> str:
         modes = ["strict", "balanced", "eager"]
@@ -556,15 +618,32 @@ class AmbientController:
         with no restart. Any load problem degrades to no pack rather than
         disturbing the pipeline.
         """
+        self.knowledge = self._load_knowledge_for_profile(profile)
+
+    def _load_knowledge_for_profile(
+        self,
+        profile: Profile | None,
+        report: Callable[[str], None] | None = None,
+    ) -> KnowledgeIndex | None:
+        """Load one profile pack without mutating controller state.
+
+        Runtime selection performs this disk work in a thread, then commits the
+        returned value on the event-loop thread only if that selection is still
+        current. Keeping this helper pure prevents a slow obsolete load from
+        overwriting the pack for a newer profile.
+        """
         path = self._knowledge_path_for_profile(profile)
         if path is None:
-            self.knowledge = None
-            return
-        pack = load_pack(path, self._report)
-        self.knowledge = pack or None
+            return None
+        pack = load_pack(
+            path,
+            self._report if report is None else report,
+        )
+        return pack or None
 
     def _start_agent_session_boundary(self) -> None:
         """Isolate a new Agent call from every prior role/profile turn."""
+        self._session_generation = getattr(self, "_session_generation", 0) + 1
         boundary = time.time()
         self._ignore_before = boundary
         self._voice_ignore_before = boundary
@@ -574,47 +653,73 @@ class AmbientController:
 
         for task in list(getattr(self, "_gate_tasks", ())):
             task.cancel()
+        for task in list(getattr(self, "_verify_tasks", ())):
+            task.cancel()
         open_jobs = getattr(self, "_open_answer_jobs", {})
         obsolete = getattr(self, "_obsolete_answer_ids", None)
         if obsolete is None:
             obsolete = set()
             self._obsolete_answer_ids = obsolete
         obsolete.update(open_jobs)
+        # Mark every old job obsolete before cancellation can wake its worker.
+        # Cancelling the child request releases Claude's shared semaphore and
+        # prevents an old query/context from being sent under the newly mutable
+        # answerer profile. The long-lived answer workers themselves survive.
+        for question_id, task in list(
+            getattr(self, "_answer_request_tasks", {}).items()
+        ):
+            if question_id in obsolete:
+                task.cancel()
+        sweep_request = getattr(self, "_sweep_request_task", None)
+        if sweep_request is not None:
+            # A detector queued on the same semaphore already captured the old
+            # transcript/context prompt; stop it before it can launch later.
+            sweep_request.cancel()
         # New-call turns must not wait behind an obsolete Agent request that is
         # still unwinding its subprocess. Old waiters retain the old lock and
         # are discarded by the obsolete check before they call the model.
         self._agent_answer_lock = asyncio.Lock()
 
         answers = getattr(self, "answers", None)
-        if answers is not None:
-            for job in answers.drain():
+        queued_ids = {
+            job.transcript.utterance_id
+            for job in (answers.drain() if answers is not None else [])
+        }
+        # Resolve every old card immediately, including an in-flight card that
+        # may contain streamed partial prose. Removing ownership here lets the
+        # worker's later cancellation acknowledgement become a no-op, avoiding
+        # duplicate UI resolutions and JSONL records.
+        for job in list(open_jobs.values()):
+            question_id = job.transcript.utterance_id
+            if question_id in queued_ids:
+                # No worker owns a drained job, so no acknowledgement is due.
                 obsolete.discard(job.transcript.utterance_id)
-                open_jobs.pop(job.transcript.utterance_id, None)
-                cancelled = AnswerResult(
-                    job.transcript.utterance_id,
-                    job.query,
-                    "cancelled because the conversation context changed",
-                    "cancelled",
-                    0.0,
-                )
-                with suppress(Exception):
-                    self.app.resolve_answer(cancelled)
-                record = self._base_record(job.transcript)
-                record.update(
-                    {
-                        "gate": True,
-                        "gate_reason": job.reason,
-                        "query": job.query,
-                        "answer": cancelled.answer,
-                        "answer_status": "cancelled",
-                        "latencies_ms": {
-                            "stt": job.transcript.latency_ms,
-                            **job.stage_latencies_ms,
-                            "gate": job.gate_latency_ms,
-                        },
-                    }
-                )
-                self.logger.append(record)
+            open_jobs.pop(question_id, None)
+            cancelled = AnswerResult(
+                question_id,
+                job.query,
+                "cancelled because the conversation context changed",
+                "cancelled",
+                0.0,
+            )
+            with suppress(Exception):
+                self.app.resolve_answer(cancelled)
+            record = self._base_record(job.transcript)
+            record.update(
+                {
+                    "gate": True,
+                    "gate_reason": job.reason,
+                    "query": job.query,
+                    "answer": cancelled.answer,
+                    "answer_status": "cancelled",
+                    "latencies_ms": {
+                        "stt": job.transcript.latency_ms,
+                        **job.stage_latencies_ms,
+                        "gate": job.gate_latency_ms,
+                    },
+                }
+            )
+            self.logger.append(record)
 
         self.context.clear()
         history = getattr(self, "_qa_history", None)
@@ -643,6 +748,7 @@ class AmbientController:
         self._last_completed_answer = None
         self._last_voice_answer = None
         self.last_transcript = None
+        self._last_transcript_in_context = False
 
     @staticmethod
     def _agent_profile_signature(
@@ -660,6 +766,8 @@ class AmbientController:
                 profile.topic,
                 profile.background,
                 "\n".join(profile.vocabulary),
+                getattr(profile, "scope", "open"),
+                getattr(profile, "knowledge", ""),
             )
         )
         return (
@@ -669,7 +777,12 @@ class AmbientController:
             domain,
         )
 
-    def _apply_profile(self, profile: Profile | None) -> None:
+    def _apply_profile(
+        self,
+        profile: Profile | None,
+        *,
+        force_boundary: bool = False,
+    ) -> None:
         """Apply domain context without changing the operator-selected role.
 
         ``Profile.interaction`` remains parseable for old profile files, but it
@@ -677,7 +790,22 @@ class AmbientController:
         interview, and support profiles can each be used in either role.
         """
         was_agent = bool(getattr(self, "agent_mode", False))
-        previous_key = getattr(self, "_agent_profile_key", None)
+        previous_key = self._agent_profile_signature(
+            getattr(self, "profile", None)
+        )
+        # Startup applies the configured profile before the runtime task and
+        # queue state below is fully initialized. Only a live controller needs
+        # a conversation boundary; the initial empty state is already clean.
+        runtime_ready = hasattr(self, "_gate_tasks")
+        key = self._agent_profile_signature(profile)
+        boundary_needed = runtime_ready and (
+            force_boundary or key != previous_key
+        )
+        if boundary_needed and hasattr(self, "knowledge"):
+            # The old pack is part of the old context domain. Clear it before
+            # changing any profile consumer; select_profile installs the newly
+            # loaded pack only after its stale-selection guards pass.
+            self.knowledge = None
         self.profile = profile
         self.transcriber.set_profile(profile)
         self.gate.set_profile(profile)
@@ -686,9 +814,14 @@ class AmbientController:
         if callable(set_agent):
             set_agent(was_agent)
 
-        key = self._agent_profile_signature(profile)
         channel = key[1]
         self._agent_customer_channel = channel
+
+        if boundary_needed:
+            # Profiles are separate privacy/context domains in both roles.
+            # In-flight and queued work from the old profile must not complete
+            # against, or surface inside, the newly selected profile.
+            self._start_agent_session_boundary()
 
         if not was_agent:
             # No active call signature exists in Assist. Entering Agent later
@@ -698,8 +831,7 @@ class AmbientController:
 
         # A profile change during Agent mode is a new conversation with new
         # domain context, but the runtime role remains Agent.
-        if key != previous_key:
-            self._start_agent_session_boundary()
+        if boundary_needed:
             self._agent_greeting_pending = True
             self._agent_had_customer_turn = False
             self._agent_awaiting_reply = False
@@ -782,28 +914,95 @@ class AmbientController:
         return choices, active
 
     async def select_profile(self, value: str) -> str:
+        revision = getattr(self, "_profile_selection_revision", 0) + 1
+        self._profile_selection_revision = revision
+        selection_messages: list[str] = []
         profile: Profile | None = None
         if value and self.config.context.enabled:
             profile = await asyncio.to_thread(
                 load_profile,
                 self._resolve_profile_path(value),
-                self._report,
+                selection_messages.append,
             )
-        await asyncio.to_thread(set_context_profile, self.config_path, value)
-        self.config.context.profile = value
-        self._apply_profile(profile)
-        # The pack follows the profile: reload it on the switch so the picker
-        # alone is enough to change both domain context and cached answers.
-        await asyncio.to_thread(self._reload_knowledge_for_profile, profile)
+        if revision != getattr(self, "_profile_selection_revision", revision):
+            return self.profile.name if self.profile is not None else "none"
+
+        # Load the candidate pack before any persistence or runtime mutation.
+        # This work is pure-return: cancellation or a newer selection leaves
+        # the currently active profile and its pack intact, while a slow stale
+        # load cannot publish anything when it eventually finishes.
+        knowledge = await asyncio.to_thread(
+            self._load_knowledge_for_profile,
+            profile,
+            selection_messages.append,
+        )
+        if revision != self._profile_selection_revision:
+            return self.profile.name if self.profile is not None else "none"
+
+        write_lock = getattr(self, "_profile_write_lock", None)
+        if write_lock is None:
+            write_lock = asyncio.Lock()
+            self._profile_write_lock = write_lock
+        committed_cancellation: asyncio.CancelledError | None = None
+        async with write_lock:
+            if revision != self._profile_selection_revision:
+                return self.profile.name if self.profile is not None else "none"
+            # A thread-backed filesystem write cannot itself be cancelled.
+            # Keep the ordering lock until it really finishes, even if this UI
+            # task is cancelled, so an older write can never land after a newer
+            # profile selection.
+            write_task = asyncio.create_task(
+                asyncio.to_thread(set_context_profile, self.config_path, value)
+            )
+            cancellation: asyncio.CancelledError | None = None
+            while True:
+                try:
+                    await asyncio.shield(write_task)
+                    break
+                except asyncio.CancelledError as exc:
+                    cancellation = exc
+                    if write_task.done():
+                        break
+            # Retrieve and propagate a persistence failure before applying an
+            # in-memory profile that would disagree with disk.
+            write_task.result()
+            if revision != self._profile_selection_revision:
+                if cancellation is not None:
+                    raise cancellation
+                return self.profile.name if self.profile is not None else "none"
+
+            self.config.context.profile = value
+            # Profile and pack publish together without an intervening await.
+            # _apply_profile clears the old pack at a changed-domain boundary;
+            # the explicit clear also covers same-profile pack refreshes.
+            self.knowledge = None
+            # Reselecting the same profile is an explicit pack refresh. Its
+            # files may have changed in place even though the profile/path
+            # signature did not, so it is still a full session boundary.
+            self._apply_profile(profile, force_boundary=True)
+            self.knowledge = knowledge
+            # Parsing/loading ran on background threads and may have produced
+            # warnings. Publish those side effects only with the selection
+            # whose profile+pack just committed; obsolete selections discard
+            # their private buffers silently.
+            for message in selection_messages:
+                self._report(message)
+            # The disk write succeeded and this is still the current selection,
+            # so cancellation can no longer roll it back. Commit the preloaded
+            # runtime pair first, report it accurately, then preserve the task's
+            # cancellation contract below.
+            committed_cancellation = cancellation
+        outcome = "none"
         if profile is not None:
             self._report(f"Profile active: {profile.name}")
-            return profile.name
-        if value and not self.config.context.enabled:
+            outcome = profile.name
+        elif value and not self.config.context.enabled:
             self._report("Profile selected but context.enabled is false")
-            return "none"
-        if not value:
+        elif not value:
             self._report("Profile disabled")
-        return "none"
+        if committed_cancellation is not None:
+            raise committed_cancellation
+        return outcome
 
     def _source_status(self, state: Any) -> str:
         """Report a source as SILENT rather than "on" once it has gone deaf.
@@ -1045,12 +1244,26 @@ class AmbientController:
         reply: str,
         reason: str,
         stage_latencies_ms: dict[str, float] | None = None,
+        session_generation: int | None = None,
     ) -> None:
+        generation = (
+            getattr(self, "_session_generation", 0)
+            if session_generation is None
+            else session_generation
+        )
+        if not self._turn_is_current(generation, transcript):
+            return
         reply = guard_agent_answer(reply)
         try:
             await self.app.add_question(transcript.utterance_id, transcript.text)
         except Exception as exc:
-            self._report(f"Unable to add Agent conversation card: {exc}")
+            if self._turn_is_current(generation, transcript):
+                self._report(f"Unable to add Agent conversation card: {exc}")
+        if self.paused or not self._turn_is_current(generation, transcript):
+            self._cancel_uncommitted_question(
+                transcript.utterance_id, transcript.text
+            )
+            return
         result = AnswerResult(
             transcript.utterance_id,
             transcript.text,
@@ -1111,8 +1324,16 @@ class AmbientController:
         answer_context: list[str],
         stage_latencies_ms: dict[str, float] | None = None,
         kind: str | None = None,
+        session_generation: int | None = None,
     ) -> bool:
         """Route one meaningful customer turn without the question-only gate."""
+        generation = (
+            getattr(self, "_session_generation", 0)
+            if session_generation is None
+            else session_generation
+        )
+        if not self._turn_is_current(generation, transcript):
+            return True
         if not getattr(self, "agent_mode", False):
             return False
         if transcript.channel != self._agent_customer_channel:
@@ -1182,6 +1403,7 @@ class AmbientController:
                 reply,
                 f"agent_local_{kind}",
                 stage_latencies_ms,
+                generation,
             )
             return True
 
@@ -1190,7 +1412,13 @@ class AmbientController:
         try:
             await self.app.add_question(transcript.utterance_id, transcript.text)
         except Exception as exc:
-            self._report(f"Unable to add Agent conversation card: {exc}")
+            if self._turn_is_current(generation, transcript):
+                self._report(f"Unable to add Agent conversation card: {exc}")
+        if self.paused or not self._turn_is_current(generation, transcript):
+            self._cancel_uncommitted_question(
+                transcript.utterance_id, transcript.text
+            )
+            return True
         await self._enqueue_answer(
             _AnswerJob(
                 transcript,
@@ -1283,6 +1511,49 @@ class AmbientController:
             "text": transcript.text,
         }
 
+    def _turn_is_in_session(
+        self,
+        session_generation: int,
+        transcript: Transcript,
+    ) -> bool:
+        """Whether a turn belongs to the active profile/pause session."""
+        captured_from = (
+            transcript.timestamp
+            if transcript.started_at is None
+            else transcript.started_at
+        )
+        return (
+            session_generation == getattr(self, "_session_generation", 0)
+            and captured_from >= getattr(self, "_ignore_before", 0.0)
+        )
+
+    def _turn_is_current(
+        self,
+        session_generation: int,
+        transcript: Transcript,
+    ) -> bool:
+        """Whether an async turn also belongs to the live input interval."""
+        return self._turn_is_in_session(
+            session_generation, transcript
+        ) and self._transcript_input_is_live(transcript)
+
+    def _cancel_uncommitted_question(
+        self,
+        question_id: str,
+        question: str,
+    ) -> None:
+        """Close a UI card created just before a context boundary landed."""
+        with suppress(Exception):
+            self.app.resolve_answer(
+                AnswerResult(
+                    question_id,
+                    question,
+                    "cancelled because the conversation context changed",
+                    "cancelled",
+                    0.0,
+                )
+            )
+
     # Reasons meaning "this reached judgment and got voted down" -- the only
     # rejections a wrongly-dropped question can hide behind. This includes the
     # vocative heuristic because deciding who was addressed is fallible; the
@@ -1373,6 +1644,10 @@ class AmbientController:
         if (
             self.paused
             or self.speech is None
+            or (
+                job.expires_at is not None
+                and time.perf_counter() >= job.expires_at
+            )
             or job.transcript.timestamp < self._voice_ignore_before
             or (
                 not agent_customer_turn
@@ -1398,8 +1673,19 @@ class AmbientController:
 
     _VOICE_FOLLOWUP_MAX_AGE_S = 90.0
 
-    async def _handle_local_repeat(self, transcript: Transcript) -> bool:
+    async def _handle_local_repeat(
+        self,
+        transcript: Transcript,
+        session_generation: int | None = None,
+    ) -> bool:
         """Render the exact last answer again without gating or calling Claude."""
+        generation = (
+            getattr(self, "_session_generation", 0)
+            if session_generation is None
+            else session_generation
+        )
+        if not self._turn_is_current(generation, transcript):
+            return True
         repeat_channel = (
             getattr(self, "_agent_customer_channel", "mic")
             if getattr(self, "agent_mode", False)
@@ -1423,7 +1709,13 @@ class AmbientController:
         try:
             await self.app.add_question(transcript.utterance_id, transcript.text)
         except Exception as exc:
-            self._report(f"Unable to add repeated-answer card: {exc}")
+            if self._turn_is_current(generation, transcript):
+                self._report(f"Unable to add repeated-answer card: {exc}")
+        if self.paused or not self._turn_is_current(generation, transcript):
+            self._cancel_uncommitted_question(
+                transcript.utterance_id, transcript.text
+            )
+            return True
         try:
             self.app.resolve_answer(
                 AnswerResult(
@@ -1477,7 +1769,11 @@ class AmbientController:
         await self._log(record)
         return True
 
-    async def _handle_voice_followup(self, transcript: Transcript) -> bool:
+    async def _handle_voice_followup(
+        self,
+        transcript: Transcript,
+        session_generation: int | None = None,
+    ) -> bool:
         """Handle narrowly recognised repeat/continue requests without Claude.
 
         Whisper can turn "weren't you going to continue reading..." into the
@@ -1486,9 +1782,16 @@ class AmbientController:
         Repeats work in every mode; continue remains an opt-in conversational
         playback control.
         """
+        generation = (
+            getattr(self, "_session_generation", 0)
+            if session_generation is None
+            else session_generation
+        )
+        if not self._turn_is_current(generation, transcript):
+            return True
         intent = voice_followup_intent(transcript.text)
         if intent == "repeat":
-            return await self._handle_local_repeat(transcript)
+            return await self._handle_local_repeat(transcript, generation)
         if (
             getattr(self, "interaction_mode", "normal") != "conversational"
             or getattr(self, "speech", None) is None
@@ -1553,10 +1856,33 @@ class AmbientController:
         return True
 
     async def _complete_answer(self, job: _AnswerJob, result: AnswerResult) -> None:
+        # A recovered question is useful only inside its configured end-to-end
+        # age window. This final backstop catches an answer coroutine that
+        # suppressed cancellation or completed on the deadline boundary, before
+        # any successful state, history, speech, card, or log mutation occurs.
+        if (
+            job.expires_at is not None
+            and time.perf_counter() >= job.expires_at
+            and result.status != "cancelled"
+        ):
+            result = AnswerResult(
+                job.transcript.utterance_id,
+                job.query,
+                "expired before delivery",
+                "cancelled",
+                result.latency_ms,
+            )
         if job.transcript.utterance_id in getattr(
             self, "_obsolete_answer_ids", set()
         ):
             self._obsolete_answer_ids.discard(job.transcript.utterance_id)
+            # Session boundaries proactively resolve/log and remove in-flight
+            # cards. Their cancelled child requests acknowledge here later;
+            # ownership absence makes that acknowledgement intentionally quiet.
+            if job.transcript.utterance_id not in getattr(
+                self, "_open_answer_jobs", {}
+            ):
+                return
             cancelled = AnswerResult(
                 job.transcript.utterance_id,
                 job.query,
@@ -1690,10 +2016,11 @@ class AmbientController:
         speak_after: bool = False,
     ) -> None:
         final_answer = result.answer
-        try:
+
+        async def run_verification() -> tuple[float, str | None]:
             async with self._verify_semaphore:
-                started = time.perf_counter()
-                revision = await self.answerer.verify(
+                started_at = time.perf_counter()
+                verified = await self.answerer.verify(
                     job.transcript.utterance_id,
                     job.transcript.text,
                     job.query,
@@ -1706,6 +2033,23 @@ class AmbientController:
                     style=job.answer_style,
                     grounding=job.grounding,
                 )
+            return started_at, verified
+
+        try:
+            if job.expires_at is None:
+                started, revision = await run_verification()
+            else:
+                remaining_s = job.expires_at - time.perf_counter()
+                if remaining_s <= 0.0:
+                    return
+                try:
+                    started, revision = await asyncio.wait_for(
+                        run_verification(), timeout=remaining_s
+                    )
+                except asyncio.TimeoutError:
+                    return
+                if time.perf_counter() >= job.expires_at:
+                    return
             if revision is not None:
                 final_answer = revision
                 latency = (time.perf_counter() - started) * 1000
@@ -1770,17 +2114,60 @@ class AmbientController:
                 or not self._recent_rejections
             ):
                 continue
+            sweep_started = time.perf_counter()
+            sweep_started_wall = time.time()
+            session_generation = getattr(self, "_session_generation", 0)
+            ready = getattr(self, "_sweep_ready_at", {})
+            max_age = self.config.answer.sweep_max_age_s
+            expired_ids = {
+                transcript.utterance_id
+                for transcript in self._recent_rejections
+                if max(0.0, sweep_started_wall - transcript.timestamp) >= max_age
+            }
+            if expired_ids:
+                self._recent_rejections = deque(
+                    (
+                        transcript
+                        for transcript in self._recent_rejections
+                        if transcript.utterance_id not in expired_ids
+                    ),
+                    maxlen=24,
+                )
+                for transcript_id in expired_ids:
+                    ready.pop(transcript_id, None)
+                    getattr(self, "_sweep_stage_latencies", {}).pop(
+                        transcript_id, None
+                    )
             candidates = list(self._recent_rejections)
+            if not candidates:
+                continue
             try:
                 answered = [query for query, _answer in self._qa_history] + [
                     job.query for job in self._open_answer_jobs.values()
                 ]
-                sweep_started = time.perf_counter()
-                missed = await self.answerer.detect_missed(
-                    [(t.channel, t.text) for t in candidates],
-                    self.context.rendered(self.config.answer.verify_context_turns),
-                    answered,
+                detection_task = asyncio.create_task(
+                    self.answerer.detect_missed(
+                        [(t.channel, t.text) for t in candidates],
+                        self.context.rendered(
+                            self.config.answer.verify_context_turns
+                        ),
+                        answered,
+                    )
                 )
+                self._sweep_request_task = detection_task
+                try:
+                    missed = await detection_task
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+                    # A profile/role boundary cancelled only this captured
+                    # detector request. Keep the long-lived sweeper available
+                    # for rejections from the new session.
+                    continue
+                finally:
+                    if getattr(self, "_sweep_request_task", None) is detection_task:
+                        self._sweep_request_task = None
                 sweep_latency_ms = (
                     time.perf_counter() - sweep_started
                 ) * 1000
@@ -1794,8 +2181,23 @@ class AmbientController:
                     # selected cannot resurrect old Assist candidates into the
                     # new customer call.
                     continue
+                if getattr(self, "_session_generation", 0) != session_generation:
+                    # A profile/role boundary landed while detection was in
+                    # flight. The boundary already cleared the old snapshot;
+                    # never resurrect it into the new context domain.
+                    continue
+                recovered_indices: set[int] = set()
                 for index, question in missed:
+                    if index in recovered_indices:
+                        continue
+                    recovered_indices.add(index)
                     original = candidates[index]
+                    remaining_s = max_age - max(
+                        0.0, time.time() - original.timestamp
+                    )
+                    if remaining_s <= 0.0:
+                        continue
+                    expires_at = time.perf_counter() + remaining_s
                     recovered_id = f"{original.utterance_id}-recovered"
                     recovered = Transcript(
                         original.channel,
@@ -1807,7 +2209,25 @@ class AmbientController:
                     try:
                         await self.app.add_question(recovered_id, question)
                     except Exception as exc:
-                        self._report(f"Unable to add recovered answer card: {exc}")
+                        if (
+                            getattr(self, "_session_generation", 0)
+                            == session_generation
+                        ):
+                            self._report(
+                                f"Unable to add recovered answer card: {exc}"
+                            )
+                    if (
+                        self.paused
+                        or getattr(self, "agent_mode", False)
+                        or not self._turn_is_current(
+                            session_generation, original
+                        )
+                        or time.perf_counter() >= expires_at
+                    ):
+                        self._cancel_uncommitted_question(
+                            recovered_id, question
+                        )
+                        continue
                     stage_latencies = dict(
                         getattr(self, "_sweep_stage_latencies", {}).get(
                             original.utterance_id, {}
@@ -1833,8 +2253,18 @@ class AmbientController:
                             self._answer_style_for_mode(),
                             self._speech_mode_for_mode(),
                             stage_latencies,
+                            expires_at=expires_at,
                         )
                     )
+                    if (
+                        getattr(self, "_session_generation", 0)
+                        != session_generation
+                    ):
+                        # _enqueue_answer registers ownership before it can
+                        # await queue-drop completion, so the boundary already
+                        # cancelled/resolved this job. Do not perform any old
+                        # session follow-up work here.
+                        continue
                 processed_ids = {
                     transcript.utterance_id for transcript in candidates
                 }
@@ -1870,15 +2300,72 @@ class AmbientController:
                     # History is read here, at answer time, not when the job was
                     # queued: a follow-up asked seconds after an answer completes
                     # must see that answer even if it was enqueued first.
-                    result = await self.answerer.answer(
-                        job.transcript.utterance_id,
-                        job.query,
-                        job.context,
-                        history=list(self._qa_history),
-                        channel=job.transcript.channel,
-                        style=job.answer_style,
-                        grounding=job.grounding,
+                    async def request_answer() -> AnswerResult:
+                        return await self.answerer.answer(
+                            job.transcript.utterance_id,
+                            job.query,
+                            job.context,
+                            history=list(self._qa_history),
+                            channel=job.transcript.channel,
+                            style=job.answer_style,
+                            grounding=job.grounding,
+                            lookup_query=job.transcript.text,
+                        )
+
+                    answer_started = time.perf_counter()
+                    remaining_s = (
+                        None
+                        if job.expires_at is None
+                        else job.expires_at - answer_started
                     )
+                    if remaining_s is not None and remaining_s <= 0.0:
+                        result = AnswerResult(
+                            job.transcript.utterance_id,
+                            job.query,
+                            "expired before delivery",
+                            "cancelled",
+                            0.0,
+                        )
+                    else:
+                        request_task = asyncio.create_task(request_answer())
+                        requests = getattr(self, "_answer_request_tasks", None)
+                        if requests is None:
+                            requests = {}
+                            self._answer_request_tasks = requests
+                        requests[job.transcript.utterance_id] = request_task
+                        try:
+                            if remaining_s is None:
+                                result = await request_task
+                            else:
+                                result = await asyncio.wait_for(
+                                    request_task, timeout=remaining_s
+                                )
+                        except asyncio.TimeoutError:
+                            result = AnswerResult(
+                                job.transcript.utterance_id,
+                                job.query,
+                                "expired before delivery",
+                                "cancelled",
+                                (time.perf_counter() - answer_started) * 1000,
+                            )
+                        except asyncio.CancelledError:
+                            current = asyncio.current_task()
+                            if current is not None and current.cancelling():
+                                request_task.cancel()
+                                raise
+                            # A session boundary cancelled only the per-job
+                            # request. Resolve/acknowledge it without killing
+                            # this long-lived queue worker.
+                            result = AnswerResult(
+                                job.transcript.utterance_id,
+                                job.query,
+                                "cancelled because the conversation context changed",
+                                "cancelled",
+                                (time.perf_counter() - answer_started) * 1000,
+                            )
+                        finally:
+                            if requests.get(job.transcript.utterance_id) is request_task:
+                                requests.pop(job.transcript.utterance_id, None)
                     await self._complete_answer(job, result)
 
                 if job.answer_style == "agent":
@@ -1937,9 +2424,36 @@ class AmbientController:
         transcript: Transcript,
         stage_latencies_ms: dict[str, float] | None = None,
     ) -> None:
+        session_generation = getattr(self, "_session_generation", 0)
         stage_latencies = dict(stage_latencies_ms or {})
+        if (
+            self.paused
+            or not self._turn_is_in_session(session_generation, transcript)
+        ):
+            return
         if not self._transcript_input_is_live(transcript):
             await self._log_muted_transcript(transcript, stage_latencies)
+            return
+
+        if transcript_quality_reason(transcript.text) is not None:
+            # Keep the raw recognition visible and auditable, but never let
+            # high-confidence garble contaminate context, reach a fast gate
+            # path, or get resurrected by the missed-question sweep.
+            try:
+                await self.app.add_transcript(transcript)
+            except Exception as exc:
+                if self._turn_is_current(session_generation, transcript):
+                    self._report(f"Unable to update transcript pane: {exc}")
+            if (
+                self.paused
+                or not self._turn_is_current(session_generation, transcript)
+            ):
+                return
+            self.last_transcript = transcript
+            self._last_transcript_in_context = False
+            await self._log_rejection(
+                transcript, "garbled_transcript", stage_latencies
+            )
             return
 
         if getattr(self, "agent_mode", False):
@@ -1949,10 +2463,20 @@ class AmbientController:
             try:
                 await self.app.add_transcript(transcript)
             except Exception as exc:
-                self._report(f"Unable to update transcript pane: {exc}")
+                if self._turn_is_current(session_generation, transcript):
+                    self._report(f"Unable to update transcript pane: {exc}")
+            if (
+                self.paused
+                or not self._turn_is_current(session_generation, transcript)
+            ):
+                return
             if transcript.channel != self._agent_customer_channel:
                 await self._handle_agent_turn(
-                    transcript, [], stage_latencies, kind="content"
+                    transcript,
+                    [],
+                    stage_latencies,
+                    kind="content",
+                    session_generation=session_generation,
                 )
                 return
 
@@ -1969,7 +2493,11 @@ class AmbientController:
                     kind = "content"
                 else:
                     await self._handle_agent_turn(
-                        transcript, [], stage_latencies, kind=kind
+                        transcript,
+                        [],
+                        stage_latencies,
+                        kind=kind,
+                        session_generation=session_generation,
                     )
                     return
             if not self.context.add(transcript):
@@ -1978,13 +2506,25 @@ class AmbientController:
                 )
                 return
             self.last_transcript = transcript
-            if await self._handle_voice_followup(transcript):
+            self._last_transcript_in_context = True
+            if await self._handle_voice_followup(
+                transcript, session_generation
+            ):
+                return
+            if (
+                self.paused
+                or not self._turn_is_current(session_generation, transcript)
+            ):
                 return
             answer_context = self.context.rendered(
                 self.config.answer.context_turns, exclude_latest=True
             )
             await self._handle_agent_turn(
-                transcript, answer_context, stage_latencies, kind=kind
+                transcript,
+                answer_context,
+                stage_latencies,
+                kind=kind,
+                session_generation=session_generation,
             )
             return
 
@@ -1997,11 +2537,23 @@ class AmbientController:
                 await self._log_rejection(transcript, "cross_channel_echo")
             return
         self.last_transcript = transcript
+        self._last_transcript_in_context = True
         try:
             await self.app.add_transcript(transcript)
         except Exception as exc:
-            self._report(f"Unable to update transcript pane: {exc}")
-        if await self._handle_voice_followup(transcript):
+            if self._turn_is_current(session_generation, transcript):
+                self._report(f"Unable to update transcript pane: {exc}")
+        if (
+            self.paused
+            or not self._turn_is_current(session_generation, transcript)
+        ):
+            return
+        if await self._handle_voice_followup(transcript, session_generation):
+            return
+        if (
+            self.paused
+            or not self._turn_is_current(session_generation, transcript)
+        ):
             return
         policy = self.config.gate.channel_policy.get(transcript.channel, "full")
         if policy == "off":
@@ -2035,6 +2587,7 @@ class AmbientController:
                 answer_context,
                 policy,
                 stage_latencies,
+                session_generation,
             )
         )
         self._gate_tasks.add(task)
@@ -2049,7 +2602,11 @@ class AmbientController:
             or self.config.knowledge.retrieve_k <= 0
         ):
             return []
-        return knowledge.grounding(query, self.config.knowledge.retrieve_k)
+        return knowledge.grounding(
+            query,
+            self.config.knowledge.retrieve_k,
+            self.config.knowledge.grounding_threshold,
+        )
 
     async def _serve_cached_answer(
         self,
@@ -2123,11 +2680,21 @@ class AmbientController:
         answer_context: list[str],
         policy: str = "full",
         stage_latencies_ms: dict[str, float] | None = None,
+        session_generation: int | None = None,
     ) -> None:
+        generation = (
+            getattr(self, "_session_generation", 0)
+            if session_generation is None
+            else session_generation
+        )
         stage_latencies = dict(stage_latencies_ms or {})
         try:
+            if not self._turn_is_current(generation, transcript):
+                return
             async with self._gate_semaphore:
                 decision = await self.gate.evaluate(transcript, background, policy)
+            if not self._turn_is_in_session(generation, transcript):
+                return
             if self.paused:
                 if stage_latencies:
                     await self._log_rejection(
@@ -2164,8 +2731,28 @@ class AmbientController:
                 return
             try:
                 await self.app.add_question(transcript.utterance_id, decision.query)
+            except asyncio.CancelledError:
+                if not self._turn_is_current(generation, transcript):
+                    self._cancel_uncommitted_question(
+                        transcript.utterance_id, decision.query
+                    )
+                raise
             except Exception as exc:
-                self._report(f"Unable to add answer card: {exc}")
+                if self._turn_is_current(generation, transcript):
+                    self._report(f"Unable to add answer card: {exc}")
+            if self.paused or not self._turn_is_in_session(
+                generation, transcript
+            ):
+                self._cancel_uncommitted_question(
+                    transcript.utterance_id, decision.query
+                )
+                return
+            if not self._transcript_input_is_live(transcript):
+                self._cancel_uncommitted_question(
+                    transcript.utterance_id, decision.query
+                )
+                await self._log_muted_transcript(transcript, stage_latencies)
+                return
             grounding: list[str] = []
             knowledge = getattr(self, "knowledge", None)
             if knowledge is not None:
@@ -2189,6 +2776,11 @@ class AmbientController:
                     )
                     return
                 grounding = self._knowledge_grounding(decision.query)
+            if not self._turn_is_current(generation, transcript):
+                self._cancel_uncommitted_question(
+                    transcript.utterance_id, decision.query
+                )
+                return
             await self._enqueue_answer(
                 _AnswerJob(
                     transcript,
@@ -2352,6 +2944,7 @@ class AmbientController:
                 if transcript is None:
                     self.app.notify("No utterance to answer yet")
                     return
+                session_generation = getattr(self, "_session_generation", 0)
                 forced_id = f"{transcript.utterance_id}-forced-{int(time.time() * 1000)}"
                 forced = Transcript(
                     transcript.channel,
@@ -2361,12 +2954,22 @@ class AmbientController:
                     transcript.latency_ms,
                 )
                 await self.app.add_question(forced_id, transcript.text)
+                if self.paused or not self._turn_is_current(
+                    session_generation, transcript
+                ):
+                    self._cancel_uncommitted_question(
+                        forced_id, transcript.text
+                    )
+                    return
                 await self._enqueue_answer(
                     _AnswerJob(
                         forced,
                         transcript.text,
                         self.context.rendered(
-                            self.config.answer.context_turns, exclude_latest=True
+                            self.config.answer.context_turns,
+                            exclude_latest=getattr(
+                                self, "_last_transcript_in_context", True
+                            ),
                         ),
                         "forced_by_user",
                         0.0,
@@ -2534,9 +3137,8 @@ async def _main(
     # over the UI -- one component's traceback makes the whole app look dead.
     # Root logging moves to a file next to the session logs; the UI surfaces
     # what matters through the status bar and warning toasts.
-    log_dir = Path(config.ui.log_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(log_dir / "ambientqa.log", encoding="utf-8")
+    log_dir = prepare_log_directory(config.ui.log_dir)
+    handler = PrivateFileHandler(log_dir / "ambientqa.log", encoding="utf-8")
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     )
@@ -2545,20 +3147,24 @@ async def _main(
         root.removeHandler(existing)
     root.addHandler(handler)
     try:
-        controller = AmbientController(
-            config,
-            config_path,
-            voice=voice,
-            instances=instances,
-            app_factory=app_factory,
-        )
-    except BaseException:
-        instances.close()
-        raise
-    loop = asyncio.get_running_loop()
-    with suppress(NotImplementedError):
-        loop.add_signal_handler(signal.SIGINT, controller.app.exit)
-    await controller.run()
+        try:
+            controller = AmbientController(
+                config,
+                config_path,
+                voice=voice,
+                instances=instances,
+                app_factory=app_factory,
+            )
+        except BaseException:
+            instances.close()
+            raise
+        loop = asyncio.get_running_loop()
+        with suppress(NotImplementedError):
+            loop.add_signal_handler(signal.SIGINT, controller.app.exit)
+        await controller.run()
+    finally:
+        root.removeHandler(handler)
+        handler.close()
 
 
 def main() -> None:
